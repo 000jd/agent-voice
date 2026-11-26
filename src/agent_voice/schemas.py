@@ -60,6 +60,9 @@ ResponseFormat = Literal["wav", "mp3", "opus", "flac", "pcm"]
 
 QualityTier = Literal["high", "fast"]
 
+ModelMode = Literal["clone", "custom_voice", "voice_design"]
+"""What a checkpoint can do: clone a reference, speak preset timbres, or design a voice."""
+
 
 class ErrorCode(StrEnum):
     """Single error taxonomy shared by IPC, REST and MCP."""
@@ -164,6 +167,9 @@ class ModelSpec(BaseModel):
     quality_tier: QualityTier = "high"
     est_vram_gb: float = 4.4
     default: bool = False
+    mode: ModelMode = "clone"
+    supports_instruct: bool = False
+    preset_speakers: list[str] = Field(default_factory=list)
 
     @field_validator("alias")
     @classmethod
@@ -177,6 +183,9 @@ class EngineCapabilities(BaseModel):
     streaming: bool = False
     pcm_native: bool = False
     voice_clone: bool = True
+    voice_design: bool = False
+    custom_voice: bool = False
+    instruct_control: bool = False
     languages: list[str] = Field(default_factory=list)
 
 
@@ -213,6 +222,9 @@ class ModelEntry(BaseModel):
     is_default: bool = False
     downloaded_locally: bool = False
     loaded: bool = False
+    mode: ModelMode = "clone"
+    supports_instruct: bool = False
+    preset_speakers: list[str] = Field(default_factory=list)
 
 
 class EngineEntry(BaseModel):
@@ -226,6 +238,9 @@ class EngineEntry(BaseModel):
     venv_python: str | None = None
     streaming: bool = False
     pcm_native: bool = False
+    custom_voice: bool = False
+    voice_design: bool = False
+    instruct_control: bool = False
     models: list[ModelEntry] = Field(default_factory=list)
     why_unavailable: str | None = None
 
@@ -244,6 +259,10 @@ class VoiceMetadata(BaseModel):
     duration_sec: float
     created_at: float
     warnings: list[str] = Field(default_factory=list)
+    source: Literal["cloned", "designed"] = "cloned"
+    """Where the reference came from: a user clip or a VoiceDesign render."""
+    design_instruct: str = ""
+    """The natural-language description used when source == "designed"."""
 
 
 class CloneVoiceRequest(BaseModel):
@@ -255,6 +274,38 @@ class CloneVoiceRequest(BaseModel):
 
 class VoiceListResponse(BaseModel):
     voices: list[VoiceMetadata]
+
+
+DEFAULT_DESIGN_SAMPLE_TEXT = (
+    "Welcome! Today we are going to break down this concept step by step, "
+    "clearly and intuitively."
+)
+"""The 5-8 s anchor used when a caller does not supply its own sentence."""
+
+
+class DesignVoiceRequest(BaseModel):
+    name: str
+    instruct: str
+    sample_text: str = DEFAULT_DESIGN_SAMPLE_TEXT
+    language: str = "English"
+    save_as_clone: bool = True
+    take: int | None = Field(default=None, ge=1)
+    seed: int | None = None
+    overwrite: bool = False
+    engine: str | None = None
+    model: str | None = None
+    quality: QualityTier = "high"
+
+
+class DesignVoiceResult(BaseModel):
+    voice_id: str | None = None
+    name: str
+    preview_file_path: str
+    duration_sec: float
+    source: Literal["designed"] = "designed"
+    design_instruct: str
+    engine_id: str
+    model_alias: str
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +338,8 @@ class SetBindingRequest(BaseModel):
 class SpeakRequest(BaseModel):
     text: str
     voice: str | None = None
+    speaker: str | None = None
+    instruct: str = ""
     engine: str | None = None
     model: str | None = None
     quality: QualityTier = "high"
@@ -321,6 +374,8 @@ class SynthesisResult(BaseModel):
     backend_name: str
     backend_version: str
     voice_id: str | None = None
+    mode: ModelMode = "clone"
+    speaker: str | None = None
     cached: bool = False
     streaming_mode: Literal["native", "emulated"] | None = None
     download_url: str = ""
@@ -343,6 +398,8 @@ class SynthesisResult(BaseModel):
 class BeatSpec(BaseModel):
     text: str
     voice: str | None = None
+    speaker: str | None = None
+    instruct: str = ""
     engine: str | None = None
     model: str | None = None
     quality: QualityTier = "high"
@@ -383,6 +440,9 @@ class BeatTiming(BaseModel):
     voice_id: str | None = None
     """Which voice actually spoke this beat, so a multi-speaker script is
     auditable from the result alone."""
+    mode: ModelMode = "clone"
+    speaker: str | None = None
+    instruct: str = ""
     cached: bool = False
     """True when re-rendering an edited script reused this beat from disk.
     Editing one beat of twelve should show eleven instant hits."""

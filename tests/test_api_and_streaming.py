@@ -69,6 +69,7 @@ def test_openapi_documents_all_routes(client):
         "/v1/jobs/{job_id}/cancel",
         "/v1/voices",
         "/v1/voices/{voice_id}",
+        "/v1/voices/design",
         "/v1/engines",
         "/v1/engines/{engine_id}/install",
         "/v1/models",
@@ -353,6 +354,230 @@ def test_speak_with_unknown_voice_fails_loudly(client):
 
 
 # ---------------------------------------------------------------------------
+# v0.3: designed voices and preset speakers over REST
+# ---------------------------------------------------------------------------
+
+
+DESIGN_INSTRUCT = "a calm, low, unhurried narrator"
+
+
+def test_design_voice_endpoint_saves_a_designed_voice(client):
+    """POST /v1/voices/design needs no reference clip, only a description."""
+    response = client.post(
+        "/v1/voices/design", json={"name": "rest-designer", "instruct": DESIGN_INSTRUCT}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == "designed"
+    assert body["design_instruct"] == DESIGN_INSTRUCT
+    assert body["name"] == "rest-designer"
+    assert body["engine_id"] == "mock"
+    assert body["model_alias"] == "mock-design"
+    assert body["voice_id"]
+    assert Path(body["preview_file_path"]).is_file()
+
+    listed = client.get("/v1/voices").json()["voices"]
+    saved = next(v for v in listed if v["voice_id"] == body["voice_id"])
+    assert saved["source"] == "designed"
+    assert saved["design_instruct"] == DESIGN_INSTRUCT
+    assert saved["ref_text"], "the anchor sentence is the design's transcript"
+
+
+def test_designed_voice_is_speakable_afterwards(client):
+    """The saved render is an ordinary reference clip: speak() clones it."""
+    designed = client.post(
+        "/v1/voices/design", json={"name": "reusable", "instruct": DESIGN_INSTRUCT}
+    ).json()
+
+    spoken = client.post(
+        "/v1/agent/speak",
+        json={"text": "Now in the designed voice.", "voice": designed["voice_id"]},
+    )
+    assert spoken.status_code == 200
+    body = spoken.json()
+    assert body["mode"] == "clone"
+    assert body["voice_id"] == designed["voice_id"]
+    assert Path(body["file_path"]).is_file()
+
+
+def test_agent_speak_with_preset_speaker_is_custom_voice(client):
+    body = client.post(
+        "/v1/agent/speak", json={"text": "A preset speaks.", "speaker": "Ryan"}
+    ).json()
+    assert body["mode"] == "custom_voice"
+    assert body["speaker"] == "Ryan"
+    assert body["voice_id"] is None, "a preset speaker has no reference clip"
+    assert body["model_alias"] == "mock-custom"
+    assert Path(body["file_path"]).is_file()
+
+
+def test_agent_speak_with_instruct_only_designs_a_voice(client):
+    """An instruction with no reference voice means 'design one on the fly'."""
+    body = client.post(
+        "/v1/agent/speak",
+        json={"text": "Describe me a voice.", "instruct": DESIGN_INSTRUCT},
+    ).json()
+    assert body["mode"] == "voice_design"
+    assert body["model_alias"] == "mock-design"
+    assert body["speaker"] is None
+    assert body["voice_id"] is None
+    assert Path(body["file_path"]).is_file()
+
+    # A cache hit must still report how the audio was produced, not "clone".
+    repeat = client.post(
+        "/v1/agent/speak",
+        json={"text": "Describe me a voice.", "instruct": DESIGN_INSTRUCT},
+    ).json()
+    assert repeat["cached"] is True
+    assert repeat["mode"] == "voice_design"
+
+
+def test_agent_speak_rejects_voice_and_speaker_together(client):
+    # Synthesising in whichever of the two won would be a silent guess.
+    response = client.post(
+        "/v1/agent/speak",
+        json={"text": "Conflicted.", "voice": "any-voice", "speaker": "Ryan"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error_code"] == "BAD_REQUEST"
+
+
+def test_agent_speak_rejects_unknown_preset_speaker(client):
+    response = client.post(
+        "/v1/agent/speak", json={"text": "Who?", "speaker": "Nobody"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error_code"] == "BAD_REQUEST"
+    # The error has to say which speakers this machine can actually voice.
+    assert "Ryan" in response.json()["suggestion"]
+
+
+def test_agent_speak_custom_voice_model_requires_a_speaker(client):
+    response = client.post(
+        "/v1/agent/speak", json={"text": "Which timbre?", "model": "mock-custom"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error_code"] == "BAD_REQUEST"
+
+
+def test_agent_speak_voice_design_model_requires_instruct(client):
+    response = client.post(
+        "/v1/agent/speak", json={"text": "Which voice?", "model": "mock-design"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error_code"] == "BAD_REQUEST"
+
+
+def test_speaker_and_instruct_isolate_the_cache(client):
+    """Same text, different timbre or delivery => different audio, so no hit.
+
+    The mock engine derives its pitch from (mode, speaker, instruct), which is
+    exactly the trio the cache key must also carry.
+    """
+    request = {"text": "Cache keys cover timbre.", "speaker": "Ryan", "instruct": "slow"}
+    first = client.post("/v1/agent/speak", json=request).json()
+    repeat = client.post("/v1/agent/speak", json=request).json()
+    assert first["cached"] is False
+    assert repeat["cached"] is True
+    assert repeat["artifact_id"] == first["artifact_id"]
+    # A hit reports the timbre that produced the audio, not a bare default.
+    assert repeat["mode"] == "custom_voice"
+    assert repeat["speaker"] == "Ryan"
+
+    other_speaker = client.post(
+        "/v1/agent/speak", json={**request, "speaker": "Serena"}
+    ).json()
+    assert other_speaker["cached"] is False
+    assert other_speaker["artifact_id"] != first["artifact_id"]
+    assert other_speaker["speaker"] == "Serena"
+
+    other_instruct = client.post(
+        "/v1/agent/speak", json={**request, "instruct": "bright and quick"}
+    ).json()
+    assert other_instruct["cached"] is False
+    assert other_instruct["artifact_id"] != first["artifact_id"]
+
+
+def test_speaker_spelling_is_canonicalised(client):
+    """``ryan`` and ``Ryan`` are one timbre, so they must share one cache entry."""
+    lower = client.post(
+        "/v1/agent/speak", json={"text": "Spelling.", "speaker": "ryan"}
+    ).json()
+    assert lower["speaker"] == "Ryan", "report the manifest spelling"
+
+    canonical = client.post(
+        "/v1/agent/speak", json={"text": "Spelling.", "speaker": "Ryan"}
+    ).json()
+    assert canonical["cached"] is True
+    assert canonical["artifact_id"] == lower["artifact_id"]
+
+
+def test_design_voice_overwrite_flag_is_honoured(client):
+    """Re-designing a name with a new description needs overwrite=true."""
+    first = client.post(
+        "/v1/voices/design", json={"name": "mutable", "instruct": DESIGN_INSTRUCT}
+    ).json()
+
+    clash = client.post(
+        "/v1/voices/design", json={"name": "mutable", "instruct": "a bright, quick voice"}
+    )
+    assert clash.status_code == 400
+    assert clash.json()["error_code"] == "BAD_REQUEST"
+
+    replaced = client.post(
+        "/v1/voices/design",
+        json={"name": "mutable", "instruct": "a bright, quick voice", "overwrite": True},
+    )
+    assert replaced.status_code == 200
+    assert replaced.json()["voice_id"] != first["voice_id"]
+    listed = client.get("/v1/voices").json()["voices"]
+    assert [v["voice_id"] for v in listed] == [replaced.json()["voice_id"]]
+
+
+# ---------------------------------------------------------------------------
+# v0.3: builtin OpenAI voice names fall back to preset speakers
+# ---------------------------------------------------------------------------
+
+
+def test_openai_builtin_voice_maps_to_a_preset_speaker(client):
+    """A stock OpenAI client asks for alloy; a fresh install has no voice.
+
+    A preset timbre needs no reference clip, so this is the one way the request
+    can produce audio instead of 404-ing the client.
+    """
+    response = client.post(
+        "/v1/audio/speech",
+        json={"model": "tts-1", "input": "Alloy speaks.", "voice": "alloy"},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-agent-voice-model"] == "mock-custom"
+    assert response.headers["x-agent-voice-speaker"] == "Ryan"
+    assert response.content[:4] == b"RIFF"
+
+
+def test_openai_nova_maps_to_serena(client):
+    response = client.post(
+        "/v1/audio/speech",
+        json={"model": "tts-1", "input": "Nova speaks.", "voice": "nova"},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-agent-voice-speaker"] == "Serena"
+
+
+def test_openai_non_builtin_unknown_voice_still_fails(client):
+    """Substitution is strictly for the hard-coded OpenAI names.
+
+    A typo must not be papered over with some other timbre.
+    """
+    response = client.post(
+        "/v1/audio/speech",
+        json={"model": "tts-1", "input": "Typo.", "voice": "not-a-real-voice"},
+    )
+    assert response.status_code == 404
+    assert response.json()["error_code"] == "VOICE_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
 # Bindings
 # ---------------------------------------------------------------------------
 
@@ -424,6 +649,20 @@ def test_pcm_stream_returns_raw_audio_with_metadata(client):
     assert response.status_code == 200
     assert response.headers["x-agent-voice-sample-rate"] == "24000"
     assert response.headers["x-agent-voice-streaming-mode"] == "native"
+    assert len(response.content) > 0
+    assert len(response.content) % 2 == 0, "int16 frames are two bytes"
+
+
+def test_pcm_stream_with_preset_speaker_returns_audio_and_headers(client):
+    """A preset timbre streams too: the body is raw PCM, so name it in a header."""
+    response = client.post(
+        "/v1/audio/speech/pcm-stream",
+        json={"input": "Stream a preset voice.", "speaker": "Ryan"},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-agent-voice-streaming-mode"] == "native"
+    assert response.headers["x-agent-voice-model"] == "mock-custom"
+    assert response.headers["x-agent-voice-speaker"] == "Ryan"
     assert len(response.content) > 0
     assert len(response.content) % 2 == 0, "int16 frames are two bytes"
 

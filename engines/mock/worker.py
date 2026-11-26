@@ -3,7 +3,9 @@
 
 Purpose: prove the whole IPC contract, the lifecycle manager, streaming and
 cancellation **without a GPU or torch**. It emits a shaped tone whose length is
-derived from the input text, so tests can assert on duration deterministically.
+derived from the input text and whose pitch is derived from
+``mode``/``speaker``/``instruct``, so tests can assert on duration and tell two
+renders apart deterministically.
 
 This file is also the reference implementation for `engines/ADDING_AN_ENGINE.md`:
 * a dedicated reader thread so `cancel` is honoured while "inference" runs
@@ -14,6 +16,7 @@ This file is also the reference implementation for `engines/ADDING_AN_ENGINE.md`
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import math
 import os
@@ -36,6 +39,45 @@ PROTOCOL_VERSION = 1
 BACKEND_NAME = "mock"
 BACKEND_VERSION = "1"
 SAMPLE_RATE = 24_000
+MODES = ("clone", "custom_voice", "voice_design")
+
+
+class _BadRequest(ValueError):
+    """A caller mistake. Answered as BAD_REQUEST, never as an engine failure."""
+
+    def __init__(self, message: str, suggestion: str) -> None:
+        super().__init__(message)
+        self.suggestion = suggestion
+
+
+def _voice_params(msg: dict) -> tuple[str, str | None, str]:
+    """Validate and normalise ``(mode, speaker, instruct)`` from a request.
+
+    Absent keys mean v1 behaviour: clone with no preset speaker and no
+    instruction.
+    """
+    mode = msg.get("mode") or "clone"
+    if mode not in MODES:
+        raise _BadRequest(
+            f"unknown mode: {mode!r}",
+            "Use mode='clone' (reference voice), 'custom_voice' (preset speaker) "
+            "or 'voice_design' (describe the voice in instruct).",
+        )
+    speaker = (msg.get("speaker") or "").strip() or None
+    instruct = (msg.get("instruct") or "").strip()
+    if mode == "custom_voice" and speaker is None:
+        raise _BadRequest(
+            "custom_voice requires a speaker",
+            "Pass speaker=<preset name>; list_models() reports preset_speakers "
+            "for each model.",
+        )
+    if mode == "voice_design" and not instruct:
+        raise _BadRequest(
+            "voice_design requires a non-empty instruct",
+            "Describe the target voice in instruct, e.g. 'A warm, low-pitched "
+            "male narrator'.",
+        )
+    return mode, speaker, instruct
 
 
 def _parent_death_watchdog() -> None:
@@ -117,7 +159,7 @@ class MockEngine:
         base = max(0.4, min(20.0, words / 2.6))
         return max(0.1, base / max(0.25, min(4.0, speed)))
 
-    def _render_pcm(self, seconds: float, freq: float = 220.0) -> bytes:
+    def _render_pcm(self, seconds: float, freq: float) -> bytes:
         frames = int(seconds * SAMPLE_RATE)
         samples = array("h")
         amplitude = 6000
@@ -127,6 +169,19 @@ class MockEngine:
             value = amplitude * envelope * math.sin(2 * math.pi * freq * i / SAMPLE_RATE)
             samples.append(int(value))
         return samples.tobytes()
+
+    @staticmethod
+    def _tone_hz(mode: str, speaker: str | None, instruct: str) -> float:
+        """Deterministic pitch for this ``clone``/``custom_voice``/``voice_design`` request.
+
+        Every distinct (mode, speaker, instruct) must render different bytes —
+        that is what makes a cache-isolation test fail loudly when the cache key
+        forgets one of the three.
+        """
+        digest = hashlib.sha256(f"{mode}:{speaker or ''}:{instruct}".encode()).hexdigest()
+        # 180-420 Hz in 0.1 Hz steps: always audible, ~2400 distinct pitches, so
+        # two real requests colliding on a pitch is negligible.
+        return 180.0 + (int(digest[:8], 16) % 2400) / 10.0
 
     def _write_wav(self, path: Path, pcm: bytes) -> None:
         data_size = len(pcm)
@@ -145,7 +200,13 @@ class MockEngine:
                 "engine_id": "mock",
                 "backend_name": BACKEND_NAME,
                 "backend_version": BACKEND_VERSION,
-                "capabilities": {"streaming": True, "pcm_native": True},
+                "capabilities": {
+                    "streaming": True,
+                    "pcm_native": True,
+                    "custom_voice": True,
+                    "voice_design": True,
+                    "instruct_control": True,
+                },
                 "loaded_models": self.loaded_models,
                 "gpu_vram_mb": 0,
                 "pid": os.getpid(),
@@ -198,6 +259,11 @@ class MockEngine:
 
     def synthesize(self, msg: dict) -> None:
         request_id = msg["id"]
+        try:
+            mode, speaker, instruct = _voice_params(msg)
+        except _BadRequest as exc:
+            self._bad_request(request_id, exc)
+            return
         event = threading.Event()
         self.cancel_events[request_id] = event
         with self._state_lock:
@@ -211,7 +277,7 @@ class MockEngine:
                 self._cancelled(request_id)
                 return
 
-            pcm = self._render_pcm(seconds)
+            pcm = self._render_pcm(seconds, self._tone_hz(mode, speaker, instruct))
             output = Path(msg.get("wav_path") or f"/tmp/mock-{request_id}.wav")
             self._write_wav(output, pcm)
             self.conn.send_json(
@@ -233,6 +299,11 @@ class MockEngine:
     def stream_pcm(self, msg: dict) -> None:
         request_id = msg["id"]
         stream_id = uuid.UUID(msg["stream_id"])
+        try:
+            mode, speaker, instruct = _voice_params(msg)
+        except _BadRequest as exc:
+            self._bad_request(request_id, exc)
+            return
         event = threading.Event()
         self.cancel_events[request_id] = event
         with self._state_lock:
@@ -241,7 +312,7 @@ class MockEngine:
             text = msg.get("text") or ""
             speed = float(msg.get("speed") or 1.0)
             seconds = self._text_duration(text, speed)
-            pcm = self._render_pcm(seconds)
+            pcm = self._render_pcm(seconds, self._tone_hz(mode, speaker, instruct))
 
             chunk_frames = SAMPLE_RATE // 10  # 100 ms
             chunk_bytes = chunk_frames * 2
@@ -276,6 +347,16 @@ class MockEngine:
                 "error_code": "JOB_CANCELLED",
                 "message": "request was cancelled",
                 "suggestion": "Retry without cancelling, or reduce the text length.",
+            }
+        )
+
+    def _bad_request(self, request_id: str, exc: _BadRequest) -> None:
+        self.conn.send_json(
+            {
+                "id": request_id,
+                "error_code": "BAD_REQUEST",
+                "message": str(exc),
+                "suggestion": exc.suggestion,
             }
         )
 

@@ -32,8 +32,12 @@ from fastmcp.server.dependencies import get_http_headers, get_http_request
 from mcp_types import ToolAnnotations
 
 from .schemas import (
+    DEFAULT_DESIGN_SAMPLE_TEXT,
     AgentVoiceError,
     BeatSpec,
+    DesignVoiceRequest,
+    DesignVoiceResult,
+    EngineEntry,
     ErrorCode,
     ErrorResponse,
     QualityTier,
@@ -46,6 +50,7 @@ from .schemas import (
 )
 from .security import is_loopback_client
 from .services.script_service import render_script
+from .services.voice_design_service import render_design
 from .settings_types import SettingsLike
 
 AGENT_ID_HEADER = "x-agent-id"
@@ -142,6 +147,38 @@ def _with_default_pause(beats: list[BeatSpec], pause_after_sec: float) -> list[B
     ]
 
 
+def _preset_speech_surface(
+    entries: list[EngineEntry], default_engine: str
+) -> tuple[list[str], bool]:
+    """Preset speakers and voice-design availability, from manifests only.
+
+    Both answers are read from the installed engines' model metadata, never from
+    a worker, which is what keeps ``server_info()`` free and GPU-free. A model
+    counts as usable when its weights are downloaded or it ships as a ``local/``
+    repo; a listed-but-absent checkpoint cannot speak, so it must not advertise
+    a speaker the caller cannot actually use.
+
+    Scoped to the default engine on purpose: ``speak(speaker=...)`` without an
+    explicit engine resolves there, so advertising a speaker from another engine
+    would be rejected by the very call this list is meant to enable.
+    """
+    speakers: list[str] = []
+    design_available = False
+    for entry in entries:
+        if not entry.installed or entry.engine_id != default_engine:
+            continue
+        for model in entry.models:
+            if not (model.downloaded_locally or model.hf_repo.startswith("local/")):
+                continue
+            if model.mode == "custom_voice":
+                for name in model.preset_speakers:
+                    if name not in speakers:
+                        speakers.append(name)
+            elif model.mode == "voice_design":
+                design_available = True
+    return speakers, design_available
+
+
 def _guide_text() -> str:
     """Read the agent guide, falling back to a short summary when it is absent.
 
@@ -231,6 +268,11 @@ def build_mcp_server(ctx) -> FastMCP:
             default_engine, default_voice: what speak() uses when you pass neither.
             voices_count: 0 means you must clone_voice() before you can speak.
             voices[]: voice_id, name, duration_sec for every registered voice.
+            preset_speakers[]: names speak(speaker=...) accepts on the default
+                engine right now; empty means only a cloned voice or
+                design_voice() can produce audio.
+            voice_design_available: whether design_voice() can run on the
+                default engine without a download.
             installed_engines[]: ids of engines that can run right now.
             engines[]: engine_id, installed, streaming, why_unavailable — the last
                 is the concrete reason an engine cannot be used.
@@ -240,6 +282,9 @@ def build_mcp_server(ctx) -> FastMCP:
 
         entries = ctx.registry.list_entries(loaded=ctx.workers.loaded_models())
         voices = ctx.voices.list()
+        preset_speakers, voice_design_available = _preset_speech_surface(
+            entries, settings.default_engine
+        )
         default_voice = settings.default_voice_id or None
         if default_voice is None and len(voices) == 1:
             # A single registered voice is unambiguous: use it rather than
@@ -259,6 +304,8 @@ def build_mcp_server(ctx) -> FastMCP:
                 for voice in voices
             ],
             "installed_engines": [e.engine_id for e in entries if e.installed],
+            "preset_speakers": preset_speakers,
+            "voice_design_available": voice_design_available,
             "engines": [
                 {
                     "engine_id": e.engine_id,
@@ -276,6 +323,8 @@ def build_mcp_server(ctx) -> FastMCP:
     async def speak(
         text: str,
         voice: str | None = None,
+        speaker: str | None = None,
+        instruct: str = "",
         engine: str | None = None,
         model: str | None = None,
         quality: QualityTier = "high",
@@ -293,6 +342,8 @@ def build_mcp_server(ctx) -> FastMCP:
         Args:
             text: What to say.
             voice: Voice id or name. Defaults to the agent binding, then the server default.
+            speaker: Preset speaker on a custom_voice model (see server_info()).
+            instruct: Delivery/style instruction, e.g. "slow, warm and calm".
             engine: Engine id, e.g. qwen3_tts_fast. Defaults to the configured engine.
             model: Model alias, or `engine:model`. Overrides `quality`.
             quality: "high" (1.7B, better) or "fast" (0.6B, quicker and smaller).
@@ -309,6 +360,8 @@ def build_mcp_server(ctx) -> FastMCP:
             download_url: HTTP URL for the same artifact, if you would rather hand a
                 URL to another process than copy bytes yourself.
             duration_sec, format, engine_id, model_alias, voice_id: what was produced.
+            mode, speaker: which routing mode actually spoke — "clone" when a
+                reference voice was used, else the preset speaker name.
             cached: true when the deterministic disk cache answered. The audio is
                 byte-identical to the original render and nothing touched the GPU,
                 so a repeat call is free — do not pre-render out of fear of cost.
@@ -327,6 +380,8 @@ def build_mcp_server(ctx) -> FastMCP:
             request = SpeakRequest(
                 text=text,
                 voice=voice,
+                speaker=speaker,
+                instruct=instruct,
                 engine=engine,
                 model=model,
                 quality=quality,
@@ -350,6 +405,8 @@ def build_mcp_server(ctx) -> FastMCP:
                 bindings=ctx.bindings,
                 agent_id=_agent_id(),
                 voice=request.voice,
+                speaker=request.speaker,
+                instruct=request.instruct,
                 engine=request.engine,
                 model=request.model,
                 quality=request.quality,
@@ -361,6 +418,12 @@ def build_mcp_server(ctx) -> FastMCP:
                 voice_id=target.voice_id,
                 ref_text=target.ref_text,
                 x_vector_only=target.x_vector_only,
+                # Resolved values: the canonical speaker spelling, and no instruct
+                # when a clone checkpoint spoke (it has no instruct channel, so
+                # carrying one would only widen the cache key).
+                mode=target.mode,
+                speaker=target.speaker,
+                instruct=target.instruct,
                 language=request.language,
                 seed=request.seed,
                 speed=request.speed,
@@ -384,9 +447,10 @@ def build_mcp_server(ctx) -> FastMCP:
 
         Use this when timing matters downstream (video, slides, subtitles) or the
         content has several beats. Each beat is a BeatSpec; `pause_after_sec`
-        inserts real silence and is included in the timings, per-beat `voice`
-        enables multi-speaker scripts, and `target_duration_sec` + `fit_mode` pin
-        a beat to a fixed slot. For one line, prefer speak().
+        inserts real silence and is included in the timings, per-beat `voice`,
+        `speaker` and `instruct` enable multi-speaker scripts, and
+        `target_duration_sec` + `fit_mode` pin a beat to a fixed slot. For one
+        line, prefer speak().
 
         Returns `file_path`, `duration_sec`, `beats[]` (start_sec, end_sec,
         voice_id, cached, artifact_id) and, when export_srt, `srt_path` and
@@ -422,7 +486,7 @@ def build_mcp_server(ctx) -> FastMCP:
         idempotent — reuse the job_id instead of re-submitting. Takes exactly the
         same `beats` and the same call-level `pause_after_sec` default as
         speak_script (see BeatSpec for per-beat `pause_after_sec`, `voice`,
-        `fit_mode` and `take`).
+        `speaker`, `instruct`, `fit_mode` and `take`).
 
         Read:
             job_id: pass it to get_job(). Progress advances beat by beat, and the
@@ -551,6 +615,56 @@ def build_mcp_server(ctx) -> FastMCP:
         except AgentVoiceError as exc:
             _raise_tool_error(exc)
 
+    @tool(annotations=ToolAnnotations(idempotent_hint=False, destructive_hint=False))
+    async def design_voice(
+        name: str,
+        instruct: str,
+        sample_text: str = DEFAULT_DESIGN_SAMPLE_TEXT,
+        language: str = "English",
+        save_as_clone: bool = True,
+        take: int | None = None,
+        seed: int | None = None,
+        overwrite: bool = False,
+        engine: str | None = None,
+        model: str | None = None,
+        quality: QualityTier = "high",
+    ) -> DesignVoiceResult:
+        """Design a new voice from a written description; no reference clip needed.
+
+        Use it when no preset speaker or cloned voice fits: the engine renders
+        `sample_text` in the timbre you describe and, with save_as_clone, registers
+        the result as a voice you can pass as `voice`. Each call is a fresh render.
+
+        Args:
+            name: Name to register the designed voice under.
+            instruct: The voice itself, e.g. "a calm middle-aged British narrator".
+            sample_text: 5-8 s of text to speak; the default line works everywhere.
+            save_as_clone: Register the render as a reusable voice.
+            overwrite: Replace an existing voice with this name.
+            take, seed: Alternate/repeatable deliveries, as in speak().
+            engine, model, quality: Which checkpoint does the designing.
+        """
+        try:
+            return await render_design(
+                ctx,
+                DesignVoiceRequest(
+                    name=name,
+                    instruct=instruct,
+                    sample_text=sample_text,
+                    language=language,
+                    save_as_clone=save_as_clone,
+                    take=take,
+                    seed=seed,
+                    overwrite=overwrite,
+                    engine=engine,
+                    model=model,
+                    quality=quality,
+                ),
+                agent_id=_agent_id(),
+            )
+        except AgentVoiceError as exc:
+            _raise_tool_error(exc)
+
     @tool(annotations=read_only)
     async def list_voices() -> VoiceListResponse:
         """List every registered voice. Use it when a voice id or name is unknown.
@@ -558,6 +672,8 @@ def build_mcp_server(ctx) -> FastMCP:
         Read:
             voices[].voice_id: pass as `voice`; voices[].name is the human label.
             voices[].duration_sec: reference length; very short clips clone worse.
+            voices[].source: "cloned" from your clip, or "designed" by design_voice().
+            voices[].design_instruct: the description a designed voice was built from.
             voices[].warnings[]: what to fix about the reference audio.
             voices[].ref_text, voices[].x_vector_only_mode: how the voice was
                 registered, which explains a quality difference between two voices.
@@ -650,6 +766,9 @@ def build_mcp_server(ctx) -> FastMCP:
         Read:
             models[].alias: pass as `model`, or as "engine_id:alias".
             models[].engine_id: which engine serves it.
+            models[].mode: "clone" (needs a voice), "custom_voice" (preset speakers)
+                or "voice_design" (design_voice()).
+            models[].preset_speakers[]: names usable as speak(speaker=...).
             models[].quality_tier: "high" (1.7B) or "fast" (0.6B).
             models[].downloaded_locally: weights present in the local HF cache.
             models[].loaded: resident in VRAM right now.

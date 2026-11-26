@@ -9,10 +9,12 @@ from fastapi import APIRouter, Request
 from ..schemas import (
     AgentVoiceError,
     CloneVoiceRequest,
+    DesignVoiceRequest,
     ErrorCode,
     VoiceListResponse,
 )
 from ..security import ensure_within_base
+from ..services.voice_design_service import render_design
 
 router = APIRouter(tags=["voices"])
 
@@ -77,6 +79,24 @@ async def create_voice(payload: CloneVoiceRequest, request: Request, overwrite: 
     return await create_voice_from_payload(
         payload.model_dump(), request, overwrite=overwrite
     )
+
+
+@router.post("/v1/voices/design")
+async def design_voice(payload: DesignVoiceRequest, request: Request):
+    """Design a voice from a natural-language description.
+
+    No reference clip is needed: the engine renders ``sample_text`` in the
+    described timbre and, with ``save_as_clone``, registers that render as a
+    normal voice. The preview is an ordinary artifact, so its path is playable
+    immediately and ``voice_id`` can be passed as ``voice`` to any later call.
+    """
+    return (
+        await render_design(
+            request.app.state.ctx,
+            payload,
+            agent_id=request.headers.get("x-agent-id"),
+        )
+    ).model_dump(mode="json")
 
 
 @router.get("/v1/voices")

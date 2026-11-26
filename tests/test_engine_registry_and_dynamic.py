@@ -16,7 +16,7 @@ from agent_voice.engine_registry import (
     EngineRegistry,
     hf_model_downloaded,
 )
-from agent_voice.schemas import AgentVoiceError, ErrorCode
+from agent_voice.schemas import AgentVoiceError, EngineManifest, ErrorCode, ModelSpec
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -226,6 +226,170 @@ def test_default_model_alias_by_tier(tmp_path):
     registry = _registry(tmp_path)
     assert registry.default_model_alias("qwen3_tts", "high") == "1.7b-base"
     assert registry.default_model_alias("qwen3_tts", "fast") == "0.6b-base"
+
+
+# ---------------------------------------------------------------------------
+# v0.3: one checkpoint per capability, and the mode filter that picks it
+# ---------------------------------------------------------------------------
+
+QWEN_ENGINES = ["qwen3_tts", "qwen3_tts_fast"]
+
+QWEN_PRESET_SPEAKERS = [
+    "Vivian",
+    "Serena",
+    "Uncle_Fu",
+    "Dylan",
+    "Eric",
+    "Ryan",
+    "Aiden",
+    "Ono_Anna",
+    "Sohee",
+]
+
+# alias -> (mode, quality tier, supports_instruct, preset speakers)
+QWEN_EXPECTED_MODELS: dict[str, tuple[str, str, bool, list[str]]] = {
+    "1.7b-base": ("clone", "high", False, []),
+    "0.6b-base": ("clone", "fast", False, []),
+    "1.7b-custom": ("custom_voice", "high", True, QWEN_PRESET_SPEAKERS),
+    "0.6b-custom": ("custom_voice", "fast", False, QWEN_PRESET_SPEAKERS),
+    "1.7b-design": ("voice_design", "high", True, []),
+}
+
+
+@pytest.mark.parametrize("engine_id", QWEN_ENGINES)
+def test_shipped_qwen_manifests_expose_every_mode(tmp_path, engine_id):
+    """All five official checkpoints, each declared with the mode it can serve."""
+    registry = _registry(tmp_path)
+    specs = {spec.alias: spec for spec in registry.get(engine_id).manifest.models}
+    assert set(specs) == set(QWEN_EXPECTED_MODELS)
+
+    for alias, (mode, tier, supports_instruct, presets) in QWEN_EXPECTED_MODELS.items():
+        spec = specs[alias]
+        assert spec.mode == mode, f"{engine_id}:{alias} must declare mode {mode}"
+        assert spec.quality_tier == tier, f"{engine_id}:{alias} must be tier {tier}"
+        assert spec.supports_instruct == supports_instruct, (
+            f"{engine_id}:{alias} supports_instruct must be {supports_instruct}"
+        )
+        assert spec.preset_speakers == presets, f"{engine_id}:{alias} preset speakers"
+
+
+@pytest.mark.parametrize("engine_id", QWEN_ENGINES)
+def test_shipped_0_6b_custom_has_no_instruct_channel(tmp_path, engine_id):
+    """The installed 0.6B CustomVoice backend drops `instruct`.
+
+    The manifest has to say so, otherwise routing would hand it an instruction it
+    cannot honour and the caller would still receive confident audio.
+    """
+    registry = _registry(tmp_path)
+    small = registry.model_spec(engine_id, "0.6b-custom")
+    big = registry.model_spec(engine_id, "1.7b-custom")
+
+    assert small.mode == "custom_voice"
+    assert small.supports_instruct is False
+    assert big.mode == "custom_voice"
+    assert big.supports_instruct is True
+    # Same nine timbres, so the instruct channel is the only difference.
+    assert small.preset_speakers == big.preset_speakers == QWEN_PRESET_SPEAKERS
+    assert small.quality_tier == "fast"
+    assert big.quality_tier == "high"
+
+
+@pytest.mark.parametrize("engine_id", QWEN_ENGINES)
+@pytest.mark.parametrize(
+    "quality,mode,expected",
+    [
+        ("high", "clone", "1.7b-base"),
+        ("fast", "clone", "0.6b-base"),
+        ("high", "custom_voice", "1.7b-custom"),
+        ("fast", "custom_voice", "0.6b-custom"),
+        ("high", "voice_design", "1.7b-design"),
+    ],
+)
+def test_default_model_alias_filters_by_mode(tmp_path, engine_id, quality, mode, expected):
+    """Without the mode filter, a high-tier pick could be a checkpoint that cannot
+    clone (or cannot design) at all."""
+    registry = _registry(tmp_path)
+    assert registry.default_model_alias(engine_id, quality, mode=mode) == expected
+
+
+@pytest.mark.parametrize("engine_id", QWEN_ENGINES)
+def test_default_model_alias_unknown_mode_raises(tmp_path, engine_id):
+    registry = _registry(tmp_path)
+    with pytest.raises(AgentVoiceError) as excinfo:
+        registry.default_model_alias(engine_id, "high", mode="narrate")
+    assert excinfo.value.error_code == ErrorCode.MODEL_NOT_FOUND
+
+
+def test_model_spec_without_v03_fields_defaults_to_clone():
+    """A v0.2 manifest entry predates modes; it must keep meaning "clone"."""
+    spec = ModelSpec(alias="legacy-tone", hf_repo="local/legacy-tone")
+    assert spec.mode == "clone"
+    assert spec.supports_instruct is False
+    assert spec.preset_speakers == []
+
+
+def test_engine_manifest_without_v03_fields_parses():
+    manifest = EngineManifest(engine_id="legacy", backend_name="legacy")
+    assert manifest.models == []
+    # v0.2 behaviour survives: an engine that declares nothing still clones.
+    assert manifest.capabilities.voice_clone is True
+    assert manifest.capabilities.custom_voice is False
+    assert manifest.capabilities.voice_design is False
+    assert manifest.capabilities.instruct_control is False
+
+
+def test_legacy_manifest_on_disk_loads_as_clone_only(tmp_path):
+    engines = tmp_path / "engines"
+    legacy = engines / "legacy"
+    legacy.mkdir(parents=True)
+    (legacy / "engine.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "engine_id": "legacy",
+                "backend_name": "legacy",
+                "backend_version": "1",
+                "venv_python": None,
+                "models": [{"alias": "legacy-tone", "hf_repo": "local/legacy-tone"}],
+            }
+        ),
+        "utf-8",
+    )
+    (legacy / "worker.py").write_text("", "utf-8")
+
+    registry = EngineRegistry(engines)
+    model = registry.get("legacy").models[0]
+    assert model.alias == "legacy-tone"
+    assert model.mode == "clone"
+    assert model.supports_instruct is False
+    assert model.preset_speakers == []
+
+    listed = next(e for e in registry.list_entries() if e.engine_id == "legacy")
+    assert listed.custom_voice is False
+    assert listed.voice_design is False
+    assert listed.instruct_control is False
+
+
+def test_list_entries_exposes_mode_capability_flags(tmp_path):
+    registry = _registry(tmp_path)
+    entries = {entry.engine_id: entry for entry in registry.list_entries()}
+
+    for engine_id in ["mock", *QWEN_ENGINES]:
+        entry = entries[engine_id]
+        assert entry.custom_voice is True, engine_id
+        assert entry.voice_design is True, engine_id
+        assert entry.instruct_control is True, engine_id
+        modes = {model.mode for model in entry.models}
+        assert {"clone", "custom_voice", "voice_design"} <= modes, engine_id
+        # A caller must be able to see per-model capability, not just per-engine.
+        for model in entry.models:
+            if model.mode == "clone":
+                assert model.supports_instruct is False, f"{engine_id}:{model.alias}"
+
+    mock_models = {model.alias: model for model in entries["mock"].models}
+    assert mock_models["mock-custom"].mode == "custom_voice"
+    assert mock_models["mock-custom"].supports_instruct is True
+    assert mock_models["mock-custom"].preset_speakers == ["Ryan", "Serena"]
+    assert mock_models["mock-design"].mode == "voice_design"
 
 
 def test_resolve_engine_for_model(tmp_path):

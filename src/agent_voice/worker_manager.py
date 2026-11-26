@@ -45,7 +45,7 @@ from .ipc.transport import (
     accept_async,
     make_transport,
 )
-from .schemas import AgentVoiceError, ErrorCode, SynthesisResult
+from .schemas import AgentVoiceError, ErrorCode, ModelMode, SynthesisResult
 from .voice_store import VoiceStore
 
 logger = logging.getLogger(__name__)
@@ -730,6 +730,9 @@ class WorkerManager:
         voice_id: str | None = None,
         ref_text: str = "",
         x_vector_only: bool = False,
+        mode: ModelMode = "clone",
+        speaker: str | None = None,
+        instruct: str = "",
         language: str = "Auto",
         seed: int | None = None,
         speed: float = 1.0,
@@ -740,6 +743,15 @@ class WorkerManager:
 
         ``take`` requests an alternate delivery of the same line. It is part of the
         cache key, so take=2 gets its own cache entry and never shadows take=1.
+
+        ``mode``/``speaker``/``instruct`` say *how* the timbre is chosen: cloning a
+        reference clip, speaking a preset timbre, or designing a voice from a
+        description. They reach the cache key too, because the same text in the
+        same voice is different audio once the delivery changes.
+
+        A non-clone request carries no reference: the worker is told there is no
+        ref audio, no transcript and no prompt cache, whatever the caller passed,
+        so a stale ``voice_id`` cannot leak into a preset or design render.
         """
         effective_seed = self._effective_seed(seed, take)
         started = self.clock.monotonic()
@@ -750,6 +762,9 @@ class WorkerManager:
             voice_id=voice_id,
             ref_text=ref_text,
             x_vector_only=x_vector_only,
+            mode=mode,
+            speaker=speaker,
+            instruct=instruct,
             language=language,
             seed=effective_seed,
             speed=speed,
@@ -764,6 +779,8 @@ class WorkerManager:
                 engine_id=engine_id,
                 model_alias=model_alias,
                 voice_id=voice_id,
+                mode=mode,
+                speaker=speaker,
                 response_format=response_format,
                 started=started,
                 take=take,
@@ -790,12 +807,19 @@ class WorkerManager:
         targets = [temp_out] if not chunks else [
             temp_out.with_name(f"{temp_out.stem}-{chunk.index:03d}.wav") for chunk in chunks
         ]
+        # Only a clone render has a reference voice. A custom-voice or design
+        # render must tell the worker there is none, even if a caller passed a
+        # voice_id, ref_text or x_vector_only flag: reusing a cloned prompt there
+        # would silently speak the wrong timbre.
+        is_clone = mode == "clone"
         prompt_cache_path = (
             str(self.voices.prompt_cache_paths(voice_id, engine_id, model_alias)[0])
-            if voice_id
+            if is_clone and voice_id
             else None
         )
-        ref_wav_path = str(self.voices.ref_wav_path(voice_id)) if voice_id else ""
+        ref_wav_path = str(self.voices.ref_wav_path(voice_id)) if is_clone and voice_id else ""
+        payload_ref_text = ref_text if is_clone else ""
+        payload_x_vector_only = x_vector_only if is_clone else False
 
         segment_paths: list[Path] = []
         replies: list[dict[str, Any]] = []
@@ -821,9 +845,12 @@ class WorkerManager:
                             "model_alias": model_alias,
                             "text": chunk_value,
                             "ref_wav_path": ref_wav_path,
-                            "ref_text": ref_text,
-                            "x_vector_only_mode": x_vector_only,
+                            "ref_text": payload_ref_text,
+                            "x_vector_only_mode": payload_x_vector_only,
                             "prompt_cache_path": prompt_cache_path,
+                            "mode": mode,
+                            "speaker": speaker,
+                            "instruct": instruct,
                             "wav_path": str(chunk_out),
                             "language": language,
                             "seed": effective_seed,
@@ -924,7 +951,11 @@ class WorkerManager:
             model_alias=model_alias,
             backend_name=reply.get("backend_name", hello.get("backend_name", "")),
             backend_version=reply.get("backend_version", hello.get("backend_version", "")),
-            voice_id=voice_id,
+            # A preset or designed render has no reference voice to report, even
+            # if the caller passed an ignored voice_id.
+            voice_id=voice_id if is_clone else None,
+            mode=mode,
+            speaker=speaker,
             cached=False,
             download_url=f"/audio/{artifact_id}",
             chunks_used=chunks_used,
@@ -944,6 +975,8 @@ class WorkerManager:
         response_format: str,
         started: float,
         take: int | None = None,
+        mode: ModelMode = "clone",
+        speaker: str | None = None,
     ) -> SynthesisResult:
         """Materialise a cache hit. Never touches the GPU.
 
@@ -985,7 +1018,9 @@ class WorkerManager:
             model_alias=model_alias,
             backend_name=record.manifest.backend_name,
             backend_version=record.manifest.backend_version,
-            voice_id=voice_id,
+            voice_id=voice_id if mode == "clone" else None,
+            mode=mode,
+            speaker=speaker,
             cached=True,
             download_url=f"/audio/{artifact_id}",
             chunks_used=int(meta.get("chunks_used") or 1),
@@ -1007,6 +1042,9 @@ class WorkerManager:
         voice_id: str | None = None,
         ref_text: str = "",
         x_vector_only: bool = False,
+        mode: ModelMode = "clone",
+        speaker: str | None = None,
+        instruct: str = "",
         language: str = "Auto",
         seed: int | None = None,
         speed: float = 1.0,
@@ -1017,6 +1055,9 @@ class WorkerManager:
         The queue is bounded. A consumer that stops draining it eventually hits
         ``BACKPRESSURE`` and the worker is cancelled rather than buffering audio
         without limit.
+
+        ``mode``/``speaker``/``instruct`` mirror :meth:`synthesize` so a preset or
+        designed voice streams too.
 
         ``take`` is accepted for call-site symmetry with :meth:`synthesize`, but a
         stream has no cache entry and no ``SynthesisResult`` to report it on, so it
@@ -1037,7 +1078,15 @@ class WorkerManager:
         request_id = uuid.uuid4().hex
         handle.last_used_at = self.clock.now()
 
-        mode = "native" if handle.hello.get("capabilities", {}).get("streaming") else "emulated"
+        streaming_mode = (
+            "native" if handle.hello.get("capabilities", {}).get("streaming") else "emulated"
+        )
+
+        # Same rule as synthesize: only a clone render has a reference voice.
+        is_clone = mode == "clone"
+        ref_wav_path = str(self.voices.ref_wav_path(voice_id)) if is_clone and voice_id else ""
+        payload_ref_text = ref_text if is_clone else ""
+        payload_x_vector_only = x_vector_only if is_clone else False
 
         started = asyncio.Event()
 
@@ -1057,12 +1106,13 @@ class WorkerManager:
                             "stream_id": str(stream_id),
                             "model_alias": model_alias,
                             "text": text,
-                            "ref_wav_path": (
-                                str(self.voices.ref_wav_path(voice_id)) if voice_id else ""
-                            ),
-                            "ref_text": ref_text,
-                            "x_vector_only_mode": x_vector_only,
+                            "ref_wav_path": ref_wav_path,
+                            "ref_text": payload_ref_text,
+                            "x_vector_only_mode": payload_x_vector_only,
                             "prompt_cache_path": None,
+                            "mode": mode,
+                            "speaker": speaker,
+                            "instruct": instruct,
                             "language": language,
                             "seed": effective_seed,
                             "speed": speed,
@@ -1099,7 +1149,7 @@ class WorkerManager:
             # engine lock here so the whole engine does not wedge.
             self._end_job(job)
             raise
-        return stream_id, queue, mode
+        return stream_id, queue, streaming_mode
 
     async def cancel_stream(self, engine_id: str, stream_id: uuid.UUID) -> bool:
         handle = self._workers.get(engine_id)
@@ -1305,6 +1355,9 @@ class WorkerManager:
         speed: float,
         response_format: str,
         take: int | None = None,
+        mode: ModelMode = "clone",
+        speaker: str | None = None,
+        instruct: str = "",
     ) -> str:
         record = self.registry.get(engine_id)
         # Which weights this alias resolves to belongs in the key: re-pointing an
@@ -1319,19 +1372,27 @@ class WorkerManager:
         except AgentVoiceError:
             hf_repo = ""
             revision = "unknown"
+
+        # Only a clone render depends on the reference. Normalising the other
+        # fields for preset/design modes keeps the key aligned with what is
+        # actually sent to the worker, so a stray ref_text cannot fork the cache.
+        is_clone = mode == "clone"
+        keyed_voice_id = (voice_id or "") if is_clone else ""
+        keyed_ref_text = ref_text if is_clone else ""
+        keyed_x_vector_only = x_vector_only if is_clone else False
         ref_sha = ""
-        if voice_id:
+        if keyed_voice_id:
             from .voice_store import sha256_file
 
-            ref_path = self.voices.ref_wav_path(voice_id)
+            ref_path = self.voices.ref_wav_path(keyed_voice_id)
             if ref_path.is_file():
                 ref_sha = sha256_file(ref_path)
         return build_cache_key(
             text=text,
-            voice_id=voice_id or "",
+            voice_id=keyed_voice_id,
             ref_wav_sha256=ref_sha,
-            ref_text=ref_text,
-            x_vector_only_mode=x_vector_only,
+            ref_text=keyed_ref_text,
+            x_vector_only_mode=keyed_x_vector_only,
             engine_id=engine_id,
             model_alias=model_alias,
             backend_name=record.manifest.backend_name,
@@ -1343,6 +1404,9 @@ class WorkerManager:
             normalize_lufs=self.settings.normalize_lufs,
             chunk_chars=self.settings.chunk_chars,
             take=take,
+            mode=mode,
+            speaker=speaker or "",
+            instruct=instruct or "",
             hf_repo=hf_repo,
             model_revision=revision,
         )

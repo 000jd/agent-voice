@@ -3,11 +3,17 @@
 
 Runs inside ``engines/qwen3_tts/.venv``. Speaks IPC protocol v1.
 
+Three synthesis modes, each routed to its own entry point: ``clone``
+(``generate_voice_clone``), ``custom_voice`` (``generate_custom_voice`` with a
+preset speaker) and ``voice_design`` (``generate_voice_design`` from a
+natural-language description).
+
 Cancellation is real: a ``transformers.StoppingCriteria`` consults a
 ``threading.Event`` between decode steps, so a cancel lands mid-utterance rather
-than only between chunks. Streaming is emulated because this backend has no
-token-level streaming API — the parent is told ``streaming_mode: "emulated"`` so
-nobody claims otherwise.
+than only between chunks. All three entry points forward ``**kwargs`` to
+``model.generate()``, so the same criteria covers every mode. Streaming is
+emulated because this backend has no token-level streaming API — the parent is
+told ``streaming_mode: "emulated"`` so nobody claims otherwise.
 """
 
 from __future__ import annotations
@@ -37,6 +43,32 @@ STREAM_CHUNK_SECONDS = 0.1
 PROMPT_SCHEMA_VERSION = 2
 # Live prompt objects kept in RAM (one per distinct voice/text/mode).
 PROMPT_CACHE_SIZE = 8
+
+# Request-level mistakes the worker can spot before touching the model. Marker ->
+# fix, so _classify can answer BAD_REQUEST with a suggestion an agent can act on
+# instead of a generic INTERNAL_ERROR.
+CLIENT_ERROR_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "custom_voice needs a preset speaker",
+        "Pass speaker=<preset name>; list_models() reports preset_speakers per model.",
+    ),
+    (
+        "voice_design needs a non-empty instruct",
+        "Describe the target voice in instruct, e.g. 'A warm, low-pitched male narrator'.",
+    ),
+    (
+        "unknown mode",
+        "Use mode='clone', 'custom_voice' or 'voice_design'.",
+    ),
+)
+
+
+def _client_error_suggestion(message: str) -> str:
+    """Actionable fix for a caller mistake, or ``""`` when it is not one."""
+    for marker, suggestion in CLIENT_ERROR_HINTS:
+        if marker in message:
+            return suggestion
+    return ""
 
 
 def _model_device(model):
@@ -186,7 +218,13 @@ class QwenEngine:
                 "engine_id": "qwen3_tts",
                 "backend_name": BACKEND_NAME,
                 "backend_version": self.backend_version,
-                "capabilities": {"streaming": False, "pcm_native": False},
+                "capabilities": {
+                    "streaming": False,
+                    "pcm_native": False,
+                    "custom_voice": True,
+                    "voice_design": True,
+                    "instruct_control": True,
+                },
                 "loaded_models": list(self.loaded),
                 "gpu_vram_mb": self._vram_mb(),
                 "pid": os.getpid(),
@@ -250,17 +288,60 @@ class QwenEngine:
 
     # -- synthesis ------------------------------------------------------
     def _generate(self, msg: dict, cancel: threading.Event):
-        """Run generate_voice_clone with cancellation wired into decode."""
+        """Run the entry point for this request's mode with cancellation wired in."""
         model = self._load(msg["model_alias"])
-        ref_path = msg.get("ref_wav_path") or ""
-        ref_text = msg.get("ref_text") or ""
-        x_vector_only = bool(msg.get("x_vector_only_mode"))
-        language = msg.get("language") or "Auto"
+        mode = msg.get("mode") or "clone"
         text = msg.get("text") or ""
+        language = msg.get("language") or "Auto"
         seed = msg.get("seed")
 
         if self._torch is not None and seed is not None:
             self._torch.manual_seed(int(seed))
+
+        # The custom-voice and voice-design entry points forward **kwargs to
+        # model.generate(), so one CancelCriteria covers all three modes.
+        stopping_criteria = [CancelCriteria(cancel)]
+
+        if mode == "custom_voice":
+            speaker = (msg.get("speaker") or "").strip()
+            if not speaker:
+                raise ValueError(
+                    "custom_voice needs a preset speaker: pass speaker=<name> "
+                    "(list_models() reports preset_speakers for this model)"
+                )
+            wavs, sr = model.generate_custom_voice(
+                text=text,
+                speaker=speaker,
+                language=language,
+                # None, not "", so the checkpoint treats it as "no instruction".
+                instruct=(msg.get("instruct") or "").strip() or None,
+                stopping_criteria=stopping_criteria,
+            )
+            return wavs[0], sr
+
+        if mode == "voice_design":
+            instruct = (msg.get("instruct") or "").strip()
+            if not instruct:
+                raise ValueError(
+                    "voice_design needs a non-empty instruct: describe the voice "
+                    "you want (e.g. 'A warm, low-pitched male narrator')"
+                )
+            wavs, sr = model.generate_voice_design(
+                text=text,
+                instruct=instruct,
+                language=language,
+                stopping_criteria=stopping_criteria,
+            )
+            return wavs[0], sr
+
+        if mode != "clone":
+            raise ValueError(
+                f"unknown mode: {mode!r}: expected clone, custom_voice or voice_design"
+            )
+
+        ref_path = msg.get("ref_wav_path") or ""
+        ref_text = msg.get("ref_text") or ""
+        x_vector_only = bool(msg.get("x_vector_only_mode"))
 
         if not ref_path:
             # The *-Base checkpoints only do voice cloning; they ship no built-in
@@ -286,7 +367,7 @@ class QwenEngine:
         kwargs = {
             "text": text,
             "language": language,
-            "stopping_criteria": [CancelCriteria(cancel)],
+            "stopping_criteria": stopping_criteria,
         }
         if prompt is not None:
             kwargs["voice_clone_prompt"] = prompt
@@ -469,7 +550,8 @@ class QwenEngine:
             )
         except Exception as exc:
             self._error(request_id, self._classify(exc), str(exc),
-                        "Check GPU memory and that the reference audio is valid.")
+                        _client_error_suggestion(str(exc))
+                        or "Check GPU memory and that the reference audio is valid.")
         finally:
             with self._lock:
                 self.in_flight -= 1
@@ -522,7 +604,8 @@ class QwenEngine:
                 }
             )
         except Exception as exc:
-            self._error(request_id, self._classify(exc), str(exc), "")
+            self._error(request_id, self._classify(exc), str(exc),
+                        _client_error_suggestion(str(exc)))
         finally:
             with self._lock:
                 self.in_flight -= 1
@@ -535,6 +618,8 @@ class QwenEngine:
             return "CUDA_OOM"
         if "no reference voice supplied" in message:
             return "VOICE_NOT_FOUND"
+        if _client_error_suggestion(message):
+            return "BAD_REQUEST"
         return "INTERNAL_ERROR"
 
     def _error(self, request_id: str, code: str, message: str, suggestion: str) -> None:
@@ -583,6 +668,9 @@ def _models_from_env() -> dict[str, str]:
     return {
         "1.7b-base": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         "0.6b-base": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "1.7b-custom": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "0.6b-custom": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        "1.7b-design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     }
 
 

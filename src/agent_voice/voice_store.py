@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from filelock import FileLock
 
@@ -119,16 +119,24 @@ class VoiceStore:
         ref_text: str = "",
         x_vector_only: bool = False,
         overwrite: bool = False,
+        source: Literal["cloned", "designed"] = "cloned",
+        design_instruct: str = "",
     ) -> VoiceMetadata:
-        """Register (or idempotently re-return) a cloned voice.
+        """Register (or idempotently re-return) a voice.
+
+        ``source`` records where the reference came from: a user clip, or a
+        VoiceDesign render that turned a description into a voice. A designed
+        voice keeps its ``design_instruct`` so the provenance of an otherwise
+        anonymous reference clip is never lost — without it, a saved design looks
+        exactly like a clone and cannot be re-derived or explained.
 
         The incoming clip is canonicalised into a staging directory first, because
         only the canonical bytes tell us whether this is a retry of an existing
         voice or a genuine name clash. A rejected clone therefore never leaves a
         half-built voice directory behind.
         """
-        source = Path(source_path)
-        if not source.is_file():
+        clip = Path(source_path)
+        if not clip.is_file():
             raise AgentVoiceError(
                 ErrorCode.BAD_REQUEST,
                 f"reference audio not found: {source_path}",
@@ -138,7 +146,7 @@ class VoiceStore:
         staging = Path(tempfile.mkdtemp(dir=str(self.voices_dir), prefix=".staging-"))
         try:
             staged_wav = staging / REF_WAV_NAME
-            duration = canonicalise_ref_audio(source, staged_wav)
+            duration = canonicalise_ref_audio(clip, staged_wav)
 
             if duration < MIN_REF_AUDIO_SECONDS:
                 raise AgentVoiceError(
@@ -162,17 +170,20 @@ class VoiceStore:
                     existing.ref_wav_sha256 == digest
                     and existing.ref_text == ref_text
                     and existing.x_vector_only_mode == x_vector_only
+                    and existing.source == source
+                    and existing.design_instruct == design_instruct
                 )
                 if identical:
                     # Agent retries land here: same name, same audio, same
-                    # transcript. Returning the existing voice keeps clone_voice
-                    # idempotent instead of piling up duplicates.
+                    # transcript, same provenance. Returning the existing voice
+                    # keeps clone_voice/design_voice idempotent instead of piling
+                    # up duplicates.
                     return existing
                 if not overwrite:
                     raise AgentVoiceError(
                         ErrorCode.BAD_REQUEST,
                         f"a voice named '{name}' already exists (id {existing.voice_id}) "
-                        "with different audio or ref_text",
+                        "with different audio, ref_text or source",
                         "Pass overwrite=True (or ?overwrite=true on POST /v1/voices) to "
                         "replace it, or choose a different name.",
                     )
@@ -206,6 +217,8 @@ class VoiceStore:
                 duration_sec=round(duration, 3),
                 created_at=time.time(),
                 warnings=warnings,
+                source=source,
+                design_instruct=design_instruct,
             )
             _atomic_write_json(target_dir / METADATA_NAME, metadata.model_dump())
             return metadata

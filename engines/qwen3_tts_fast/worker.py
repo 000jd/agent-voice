@@ -3,11 +3,15 @@
 
 Runs inside ``engines/qwen3_tts_fast/.venv``. Speaks IPC protocol v1.
 
-This backend has real token-level streaming via
-``generate_voice_clone_streaming(chunk_size=8)``, so ``stream_pcm`` forwards audio
-while the model is still decoding and ``streaming_mode`` is ``"native"``.
-Cancellation is checked between yielded chunks *and* the generator is closed so
-the CUDA graph loop stops promptly.
+Three synthesis modes, each with a streaming and a non-streaming entry point:
+``clone`` (``generate_voice_clone*``), ``custom_voice``
+(``generate_custom_voice*`` with a preset speaker) and ``voice_design``
+(``generate_voice_design*`` from a natural-language description).
+
+This backend has real token-level streaming via ``generate_*_streaming(chunk_size=8)``,
+so ``stream_pcm`` forwards audio while the model is still decoding and
+``streaming_mode`` is ``"native"``. Cancellation is checked between yielded
+chunks *and* the generator is closed so the CUDA graph loop stops promptly.
 """
 
 from __future__ import annotations
@@ -41,6 +45,32 @@ PROMPT_CACHE_SIZE = 8
 # silence appended (faster_qwen3_tts/model.py:_resolve_voice_clone_prompt_from_reference).
 # Reproduce it exactly so a warm cache hit is bit-identical to a cold compute.
 _ICL_APPEND_SILENCE = True
+
+# Request-level mistakes the worker can spot before touching the model. Marker ->
+# fix, so _classify can answer BAD_REQUEST with a suggestion an agent can act on
+# instead of a generic INTERNAL_ERROR.
+CLIENT_ERROR_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "custom_voice needs a preset speaker",
+        "Pass speaker=<preset name>; list_models() reports preset_speakers per model.",
+    ),
+    (
+        "voice_design needs a non-empty instruct",
+        "Describe the target voice in instruct, e.g. 'A warm, low-pitched male narrator'.",
+    ),
+    (
+        "unknown mode",
+        "Use mode='clone', 'custom_voice' or 'voice_design'.",
+    ),
+)
+
+
+def _client_error_suggestion(message: str) -> str:
+    """Actionable fix for a caller mistake, or ``""`` when it is not one."""
+    for marker, suggestion in CLIENT_ERROR_HINTS:
+        if marker in message:
+            return suggestion
+    return ""
 
 
 def _model_device(model):
@@ -186,7 +216,13 @@ class FastEngine:
                 "engine_id": "qwen3_tts_fast",
                 "backend_name": BACKEND_NAME,
                 "backend_version": self.backend_version,
-                "capabilities": {"streaming": True, "pcm_native": True},
+                "capabilities": {
+                    "streaming": True,
+                    "pcm_native": True,
+                    "custom_voice": True,
+                    "voice_design": True,
+                    "instruct_control": True,
+                },
                 "loaded_models": list(self.loaded),
                 "gpu_vram_mb": self._vram_mb(),
                 "pid": os.getpid(),
@@ -249,7 +285,64 @@ class FastEngine:
         self.conn.send_json({"id": msg["id"], "ok": True})
 
     # -- synthesis ------------------------------------------------------
-    def _common_kwargs(self, model, msg: dict) -> dict:
+    def _entry_point(self, model, msg: dict, *, streaming: bool):
+        """Resolve the backend entry point and kwargs for this request's mode.
+
+        Returns ``(function, kwargs)`` so streaming and non-streaming share one
+        routing decision: the caller just splats the kwargs.
+        """
+        mode = msg.get("mode") or "clone"
+        # Validates the mode plus speaker/instruct before any backend work runs.
+        kwargs = self._generation_kwargs(model, msg, mode)
+        if streaming:
+            # Every streaming entry point shares the chunk_size knob.
+            kwargs["chunk_size"] = STREAM_CHUNK_STEPS
+        non_streaming_name, streaming_name = {
+            "clone": ("generate_voice_clone", "generate_voice_clone_streaming"),
+            "custom_voice": ("generate_custom_voice", "generate_custom_voice_streaming"),
+            "voice_design": ("generate_voice_design", "generate_voice_design_streaming"),
+        }[mode]
+        return getattr(model, streaming_name if streaming else non_streaming_name), kwargs
+
+    def _generation_kwargs(self, model, msg: dict, mode: str) -> dict:
+        """Mode-specific kwargs; also the single place caller mistakes are caught."""
+        text = msg.get("text") or ""
+        language = msg.get("language") or "Auto"
+
+        if mode == "custom_voice":
+            speaker = (msg.get("speaker") or "").strip()
+            if not speaker:
+                raise ValueError(
+                    "custom_voice needs a preset speaker: pass speaker=<name> "
+                    "(list_models() reports preset_speakers for this model)"
+                )
+            return {
+                "text": text,
+                "language": language,
+                "speaker": speaker,
+                # The 0.6B CustomVoice backend drops instruct internally; forward it
+                # unchanged rather than second-guessing the model here.
+                "instruct": (msg.get("instruct") or "").strip() or None,
+            }
+
+        if mode == "voice_design":
+            instruct = (msg.get("instruct") or "").strip()
+            if not instruct:
+                raise ValueError(
+                    "voice_design needs a non-empty instruct: describe the voice "
+                    "you want (e.g. 'A warm, low-pitched male narrator')"
+                )
+            return {"text": text, "language": language, "instruct": instruct}
+
+        if mode != "clone":
+            raise ValueError(
+                f"unknown mode: {mode!r}: expected clone, custom_voice or voice_design"
+            )
+
+        return self._clone_kwargs(model, msg)
+
+    def _clone_kwargs(self, model, msg: dict) -> dict:
+        """Clone kwargs, prompt cache included. Prompt caching is clone-only."""
         ref_path = msg.get("ref_wav_path") or ""
         if not ref_path:
             # The *-Base checkpoints have no built-in speakers; without a reference
@@ -452,7 +545,8 @@ class FastEngine:
         try:
             model = self._load(msg["model_alias"])
             self._seed(msg.get("seed"))
-            audio_list, sr = model.generate_voice_clone(**self._common_kwargs(model, msg))
+            generate, kwargs = self._entry_point(model, msg, streaming=False)
+            audio_list, sr = generate(**kwargs)
             if event.is_set():
                 self._error(request_id, "JOB_CANCELLED", "request was cancelled", "")
                 return
@@ -477,7 +571,8 @@ class FastEngine:
             )
         except Exception as exc:
             self._error(request_id, self._classify(exc), str(exc),
-                        "Check GPU memory and the reference audio.")
+                        _client_error_suggestion(str(exc))
+                        or "Check GPU memory and the reference audio.")
         finally:
             with self._lock:
                 self.in_flight -= 1
@@ -497,9 +592,8 @@ class FastEngine:
 
             model = self._load(msg["model_alias"])
             self._seed(msg.get("seed"))
-            generator = model.generate_voice_clone_streaming(
-                chunk_size=STREAM_CHUNK_STEPS, **self._common_kwargs(model, msg)
-            )
+            generate, kwargs = self._entry_point(model, msg, streaming=True)
+            generator = generate(**kwargs)
 
             produced = 0
             for chunk, sr, _timing in generator:
@@ -533,7 +627,8 @@ class FastEngine:
             )
         except Exception as exc:
             if not event.is_set():
-                self._error(request_id, self._classify(exc), str(exc), "")
+                self._error(request_id, self._classify(exc), str(exc),
+                            _client_error_suggestion(str(exc)))
         finally:
             if generator is not None:
                 close = getattr(generator, "close", None)
@@ -551,6 +646,8 @@ class FastEngine:
         message = str(exc)
         if "out of memory" in message.lower() or "OutOfMemoryError" in type(exc).__name__:
             return "CUDA_OOM"
+        if _client_error_suggestion(message):
+            return "BAD_REQUEST"
         return "INTERNAL_ERROR"
 
     def _error(self, request_id: str, code: str, message: str, suggestion: str) -> None:
@@ -594,6 +691,9 @@ def _models_from_env() -> dict[str, str]:
     return {
         "1.7b-base": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         "0.6b-base": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "1.7b-custom": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "0.6b-custom": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        "1.7b-design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     }
 
 

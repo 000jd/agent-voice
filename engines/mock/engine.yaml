@@ -9,6 +9,9 @@ capabilities:
   streaming: true
   pcm_native: true
   voice_clone: false
+  custom_voice: true
+  voice_design: true
+  instruct_control: true
   languages: [Auto, English]
 
 models:
@@ -17,3 +20,19 @@ models:
     quality_tier: fast
     est_vram_gb: 0.0
     default: true
+    mode: clone
+  # hf_repo values starting with local/ count as available without a download,
+  # so the full custom-voice/design routing surface is testable on CPU.
+  - alias: mock-custom
+    hf_repo: local/mock-custom
+    quality_tier: fast
+    est_vram_gb: 0.0
+    mode: custom_voice
+    supports_instruct: true
+    preset_speakers: [Ryan, Serena]
+  - alias: mock-design
+    hf_repo: local/mock-design
+    quality_tier: high
+    est_vram_gb: 0.0
+    mode: voice_design
+    supports_instruct: true

@@ -49,6 +49,10 @@ def _key(**overrides) -> str:
         "normalize_lufs": -16.0,
         "chunk_chars": 400,
         "take": None,
+        # v0.3: the same text can be cloned, preset-spoken or designed.
+        "mode": "clone",
+        "speaker": None,
+        "instruct": "",
         "hf_repo": "local/mock-tone",
         "model_revision": "local",
     }
@@ -237,6 +241,10 @@ def test_cache_key_is_deterministic():
         ("normalize_lufs", -20.0),
         ("chunk_chars", 200),
         ("take", 2),
+        # v0.3: mode/speaker/instruct change the audio as much as the voice does.
+        ("mode", "custom_voice"),
+        ("speaker", "Ryan"),
+        ("instruct", "speak slowly and warmly"),
         ("hf_repo", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
         ("model_revision", "abcdef1234567890abcdef1234567890abcdef12"),
     ],
@@ -244,6 +252,16 @@ def test_cache_key_is_deterministic():
 def test_every_cached_field_changes_the_key(field, value):
     """Full isolation: any parameter that can alter audio must alter the key."""
     assert _key() != _key(**{field: value}), f"{field} must participate in the cache key"
+
+
+def test_modes_never_share_a_cache_entry():
+    """The same voice, text and seed say something different per mode."""
+    keys = {
+        _key(),
+        _key(mode="custom_voice", speaker="Ryan"),
+        _key(mode="voice_design", instruct="a warm, low narrator"),
+    }
+    assert len(keys) == 3
 
 
 def test_all_fields_are_covered():
@@ -266,6 +284,11 @@ def test_all_fields_are_covered():
         # v0.2: alternate deliveries and model identity must also separate keys,
         # otherwise a `take=2` or a re-pulled model would silently reuse audio.
         "take",
+        # v0.3: a preset timbre or a design instruction is a different utterance
+        # of the same text, so it must never share an entry with a clone.
+        "mode",
+        "speaker",
+        "instruct",
         "hf_repo",
         "model_revision",
     }

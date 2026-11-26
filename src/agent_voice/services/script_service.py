@@ -16,7 +16,7 @@ from pathlib import Path
 
 import soundfile as sf
 
-from ..api.routing import resolve_target
+from ..api.routing import ResolvedTarget, resolve_target
 from ..audio_utils import (
     SAMPLE_RATE,
     crossfade_stitch,
@@ -31,6 +31,7 @@ from ..schemas import (
     BeatSpec,
     BeatTiming,
     ErrorCode,
+    ModelMode,
     ScriptRequest,
     ScriptResult,
 )
@@ -84,15 +85,22 @@ async def render_script(
     # Every beat may name its own voice/engine/model — that is what makes a
     # multi-speaker podcast possible — but most scripts repeat the same tuple, so
     # resolution is memoised per tuple instead of hoisted out of the loop (which
-    # silently ignored every beat after the first).
-    resolved: dict[tuple[str | None, str | None, str | None, str], object] = {}
+    # silently ignored every beat after the first). speaker and instruct belong in
+    # the key: two beats with the same model can still be a different timbre and a
+    # different delivery.
+    resolved: dict[
+        tuple[str | None, str | None, str | None, str, str | None, str],
+        ResolvedTarget,
+    ] = {}
 
-    def target_for(beat: BeatSpec):
+    def target_for(beat: BeatSpec) -> ResolvedTarget:
         key = (
             beat.voice or payload.default_voice,
             beat.engine or payload.engine,
             beat.model,
             beat.quality or payload.quality,
+            beat.speaker,
+            beat.instruct,
         )
         target = resolved.get(key)
         if target is None:
@@ -106,6 +114,8 @@ async def render_script(
                 engine=key[1],
                 model=key[2],
                 quality=key[3],  # type: ignore[arg-type]
+                speaker=key[4],
+                instruct=key[5],
             )
             resolved[key] = target
         return target
@@ -122,7 +132,8 @@ async def render_script(
     segments: list[Path] = []
     layout: list[tuple[int, bool]] = []
     """(beat index, is_pause) per stitched segment, in playback order."""
-    spoken_voice: dict[int, str | None] = {}
+    spoken: dict[int, tuple[str | None, ModelMode, str | None, str]] = {}
+    """beat index -> (voice_id, mode, speaker, instruct) that actually spoke it."""
     beat_cache: dict[int, tuple[bool, str]] = {}
     total_beats = len(payload.beats)
 
@@ -136,6 +147,12 @@ async def render_script(
                 voice_id=target.voice_id,
                 ref_text=target.ref_text,
                 x_vector_only=target.x_vector_only,
+                # Resolved, not raw: a beat that asked for a preset speaker must
+                # not reach the worker as a clone request, and a designed line must
+                # carry its instruction.
+                mode=target.mode,
+                speaker=target.speaker,
+                instruct=target.instruct,
                 language=beat.language,
                 speed=1.0,
                 response_format="wav",
@@ -157,7 +174,12 @@ async def render_script(
 
             segments.append(segment)
             layout.append((index, False))
-            spoken_voice[index] = target.voice_id
+            spoken[index] = (
+                target.voice_id,
+                target.mode,
+                target.speaker,
+                target.instruct,
+            )
 
             if beat.pause_after_sec > 0:
                 # A real silence segment, so the gap exists in the master audio and
@@ -216,6 +238,7 @@ async def render_script(
             start = onsets[position]
             span = spans[position]
             cached, beat_artifact = beat_cache.get(beat_index, (False, ""))
+            voice_id, beat_mode, beat_speaker, beat_instruct = spoken[beat_index]
             timings.append(
                 BeatTiming(
                     index=beat_index,
@@ -226,7 +249,10 @@ async def render_script(
                     pause_after_sec=beat.pause_after_sec,
                     target_duration_sec=beat.target_duration_sec,
                     fit_mode=beat.fit_mode,
-                    voice_id=spoken_voice[beat_index],
+                    voice_id=voice_id,
+                    mode=beat_mode,
+                    speaker=beat_speaker,
+                    instruct=beat_instruct,
                     cached=cached,
                     artifact_id=beat_artifact,
                 )

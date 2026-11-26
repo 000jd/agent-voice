@@ -22,6 +22,9 @@ genuinely free when idle, and MCP tools that return compact JSON.
 - **Pluggable engines.** Drop a directory into `engines/` with an `engine.yaml` and a
   `worker.py`; the registry discovers it. Two Qwen3-TTS backends ship today (official and
   CUDA-graph accelerated) with more documented in `engines/ADDING_AN_ENGINE.md`.
+- **Three ways to get a voice.** Clone a 3–10 s reference clip, speak one of nine preset
+  timbres with `speaker=`, or describe a voice in words with `design_voice` and save the
+  result as a clone. Five official Qwen3-TTS 12Hz checkpoints cover all three modes.
 - **Deterministic cache.** SHA-256 over the full synthesis parameter set, checked *before* a
   worker is spawned, LRU-bounded.
 - **Agent-native semantics.** `409 WORKER_BUSY` with a `force=true` suggestion, structured
@@ -72,6 +75,15 @@ curl -s -X POST localhost:8000/v1/audio/speech \
   -d '{"model":"tts-1","input":"Hello from agent voice."}' --output out.wav
 ```
 
+The mock engine also carries a full routing surface: `mock-custom` answers `speaker=` (presets
+`Ryan` and `Serena`) and `mock-design` answers `design_voice` / `instruct`. The whole
+clone → preset → design path is therefore testable on CPU:
+
+```bash
+uv run agent-voice voices design probe --engine mock --model mock-design \
+  --instruct "quiet and precise, close-mic"
+```
+
 ## Install a GPU engine
 
 Two Qwen3-TTS backends ship, because they need **mutually exclusive** dependency
@@ -90,6 +102,9 @@ returns in ~0.01 s. That number was not measured on `qwen3_tts_fast`.
 uv run agent-voice engines install qwen3_tts_fast
 uv run agent-voice models download qwen3_tts_fast 0.6b-base
 uv run agent-voice models download qwen3_tts_fast 1.7b-base
+# preset speakers and voice design live in their own checkpoints:
+uv run agent-voice models download qwen3_tts_fast 1.7b-custom
+uv run agent-voice models download qwen3_tts_fast 1.7b-design
 uv run agent-voice models list
 ```
 
@@ -97,8 +112,22 @@ Models land in the standard Hugging Face cache and are reused if already present
 `models list` reports `downloaded_locally` only when real weight files exist —
 a bare `refs/` pointer is not treated as a usable model.
 
-A voice is required for the Base checkpoints (they clone, they have no built-in
-speakers):
+### Five checkpoints, three modes
+
+Every alias is a separate 12Hz checkpoint, and its `mode` decides what it can do:
+
+| Alias | Params | VRAM | Mode | Reference clip? | Use it for |
+|---|---|---|---|---|---|
+| `1.7b-base` | 1.7B | ~4.4 GB | `clone` | required | default; best cloning quality |
+| `0.6b-base` | 0.6B | ~2.2 GB | `clone` | required | `quality="fast"` cloning |
+| `1.7b-custom` | 1.7B | ~4.4 GB | `custom_voice` | not needed | nine preset speakers, plus `instruct` |
+| `0.6b-custom` | 0.6B | ~2.2 GB | `custom_voice` | not needed | nine preset speakers, no `instruct` |
+| `1.7b-design` | 1.7B | ~4.4 GB | `voice_design` | not needed | design a voice from a description |
+
+`agent-voice models list` reports `mode`, `supports_instruct` and `preset_speakers` for every
+alias, so an agent can tell which model answers a given request without reading the manifest.
+
+The Base checkpoints clone and have no built-in speakers, so they need a registered voice:
 
 ```bash
 uv run agent-voice voices add narrator ./my-clip.wav \
@@ -106,6 +135,72 @@ uv run agent-voice voices add narrator ./my-clip.wav \
 ```
 
 3–10 seconds of clean speech is the quality sweet spot.
+
+### Nine preset speakers
+
+The CustomVoice checkpoints ship nine fixed timbres. Pass one as `speaker=` and no reference
+clip is needed at all:
+
+`Vivian` · `Serena` · `Uncle_Fu` · `Dylan` · `Eric` · `Ryan` · `Aiden` · `Ono_Anna` · `Sohee`
+
+```python
+speak("Good evening.", speaker="Serena")                  # 0.6b-custom is enough
+speak("Good evening.", speaker="Uncle_Fu", instruct="slower, wearier")   # 1.7B only
+```
+
+`instruct` is honoured only by checkpoints that declare `supports_instruct` — `1.7b-custom`
+and `1.7b-design`. `0.6b-custom` speaks the same nine timbres with no instruct support.
+
+### Design a voice from a description
+
+`design_voice` turns words into a speaker with no reference audio at all:
+
+```python
+design_voice(
+    name="narrator",
+    instruct="warm baritone, measured pace, a little gravel, late-night radio",
+)
+```
+
+The result carries `preview_file_path` and, with the default `save_as_clone=true`, a
+`voice_id` — the render is registered as an ordinary reference voice. From then on it is a
+normal clone voice on **any** cloning checkpoint, which is the design→clone workflow:
+
+```python
+speak("Chapter one.", voice="narrator")     # 0.6b-base or 1.7b-base, your pick
+```
+
+`list_voices()` reports each voice's `source` — `cloned` from a clip, or `designed` — and, for
+a designed one, the `design_instruct` it was built from, so the provenance survives.
+
+Pass `save_as_clone=false` to audition a design without registering it: you get the preview
+and `voice_id: null`. `take=2`, `take=3`, … re-rolls the same description without touching
+take 1, and `seed=` makes a design reproducible.
+
+Over HTTP the same body goes to `POST /v1/voices/design` (`DesignVoiceRequest`), which returns
+the `DesignVoiceResult` above:
+
+```bash
+curl -s -X POST localhost:8000/v1/voices/design \
+  -H 'content-type: application/json' \
+  -d '{"name":"narrator","instruct":"warm baritone, measured pace","save_as_clone":true}'
+```
+
+From a shell it needs no running daemon — the command starts the worker manager in-process:
+
+```bash
+uv run agent-voice voices design narrator \
+  --instruct "warm baritone, measured pace, a little gravel, late-night radio"
+```
+
+`--sample-text` (default: a built-in 5–8 s anchor sentence), `--language English`,
+`--save-as-clone/--no-save-as-clone`, `--take`, `--seed`, `--overwrite`, `--engine`, `--model`
+and `--quality high|fast` are available, and the command prints the full `DesignVoiceResult`
+as JSON plus the `voice_id` it registered.
+
+Designing runs on the `1.7b-design` checkpoint, so download it first
+(`agent-voice models download qwen3_tts_fast 1.7b-design`); `server_info().voice_design_available`
+tells you whether it is already there.
 
 ### Measured on an RTX 4060 Ti 16 GB
 
@@ -216,18 +311,41 @@ client = MultiServerMCPClient({
 tools = await client.get_tools()
 ```
 
+### OpenAI-compatible clients
+
+`POST /v1/audio/speech` is drop-in for an OpenAI SDK client: `input`, `voice`,
+`response_format` and `speed` all work, and `model` accepts `tts-1` (fast tier), `tts-1-hd`
+(high tier) or an explicit `engine:model` selector.
+
+A real OpenAI client sends a voice name that only exists on OpenAI, so rather than answering
+`VOICE_NOT_FOUND`, a builtin name is resolved locally in this order:
+
+1. a registered voice with that exact name;
+2. `AGENT_VOICE_DEFAULT_VOICE_ID`, when set;
+3. your only registered voice, when exactly one exists;
+4. **a preset speaker**, when the default engine can voice it without a reference clip —
+   `alloy` → `Ryan`, `echo` → `Aiden`, `fable` → `Dylan`, `onyx` → `Uncle_Fu`,
+   `nova` → `Serena`, `shimmer` → `Vivian`.
+
+Step 4 is what makes a fresh install work: a `custom_voice` checkpoint needs no reference
+audio, so an OpenAI-shaped client hears speech before anything has been cloned. When the
+fallback answers, the response carries `x-agent-voice-speaker: <name>` so the substitution is
+visible instead of silent. Any other unknown voice name still fails with `VOICE_NOT_FOUND` —
+papering over a typo would be worse than an error.
+
 ## Tools
 
-19 tools, split into a `core` and a `full` surface (`AGENT_VOICE_TOOLSET`, see
-[Security](#security)). Every tool returns compact JSON — audio is never inlined as base64.
+20 tools, split into a `core` and a `full` surface (`AGENT_VOICE_TOOLSET`, see
+[Security](#security)). 12 of them are core. Every tool returns compact JSON — audio is
+never inlined as base64.
 
 | Tool | Surface | Purpose |
 |---|---|---|
 | `server_info` | core | **Call first.** Version, defaults, voices, engines and GPU state in one call — never spawns a worker |
-| `speak` | core | Synthesise one utterance, return a file path |
+| `speak` | core | Synthesise one utterance, return a file path. Takes `voice`, `speaker` or `instruct` |
 | `speak_script` | core | Multi-beat script with exact per-beat timings and SRT/VTT |
 | `start_script_job` / `get_job` / `cancel_job` | core | Long scripts and other async work |
-| `clone_voice` / `list_voices` / `delete_voice` | core | Manage reference voices |
+| `clone_voice` / `design_voice` / `list_voices` / `delete_voice` | core | Create voices by cloning a clip or describing one, then list/delete them |
 | `gpu_status` / `unload_models` | core | Inspect and free the GPU |
 | `set_agent_binding` / `list_agent_bindings` | full | Per-agent voice routing |
 | `list_engines` / `list_models` | full | Discover engines, models, install state |
@@ -247,21 +365,28 @@ a failed synthesis round-trip:
 
 ```json
 {
-  "version": "0.2.1",
+  "version": "0.3.0",
   "default_engine": "qwen3_tts_fast",
   "default_voice": "a1b2c3d4e5f6",
   "voices_count": 1,
   "voices": [{"voice_id": "a1b2c3d4e5f6", "name": "narrator", "duration_sec": 6.4}],
   "installed_engines": ["qwen3_tts_fast"],
+  "preset_speakers": ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan",
+                      "Aiden", "Ono_Anna", "Sohee"],
+  "voice_design_available": true,
   "engines": [{"engine_id": "qwen3_tts_fast", "installed": true, "streaming": true,
                "why_unavailable": null}],
   "gpu_status": {"active_engine": null, "loaded_models": [], "vram_used_mb": 631}
 }
 ```
 
-`voices_count == 0` means clone a voice before synthesising. `installed_engines`
-tells you which engines can actually run, and `engines[].why_unavailable` explains
-the ones that cannot.
+`voices_count == 0` means no cloned voice exists yet — but `preset_speakers` non-empty means
+`speak(speaker=...)` still works right now on the default engine, and `voice_design_available`
+means `design_voice` can create a voice without another download. Speaker lists for another
+engine come from `list_models(engine_id)`; pass `engine=` to use it. `installed_engines` tells
+you which engines can actually run, and `engines[].why_unavailable` explains the ones that
+cannot. Per-model detail comes from `list_models` (or `agent-voice models list`): each alias
+reports its `mode`, whether it `supports_instruct`, and its own `preset_speakers`.
 
 ### Return fields worth reading
 
@@ -274,6 +399,8 @@ the ones that cannot.
 | `chunks_used` | How many text chunks were stitched. `>1` means the input exceeded `CHUNK_CHARS` and was split — normal, not an error |
 | `elapsed_ms` | Wall-clock cost of the call; near zero on a cache hit, so latency regressions are obvious |
 | `cached` | `true` when the deterministic disk cache answered and no GPU work happened |
+| `mode` | Which mode produced the audio: `clone`, `custom_voice` or `voice_design` |
+| `speaker` | The preset timbre that spoke, when a `custom_voice` checkpoint answered |
 | `real_time_factor` | Defined as `duration_sec / elapsed_sec` — above 1.0 means faster than real time, `None` when the duration is unknown. ⚠️ In the current build the daemon computes the reciprocal (`elapsed/duration`), so a render 37× faster than real time reports `0.027`; recompute from `duration_sec` and `elapsed_ms` if the value looks inverted. On the reference box a warm 0.6B render measured **≈ 0.86** (slightly slower than real time) |
 | `take` | Which alternate delivery was rendered (`take=2`, …). A new take gets its own cache entry, so take 1 is untouched |
 
@@ -283,6 +410,9 @@ Want a different read of the same line? Pass `take=2` (or `3`, …) to `speak`, 
 individual `speak_script` beat. Each take is a separate cache entry, so asking again for the same
 take is free and take 1 still resolves to the original audio. When you pass `take` without a
 `seed`, the seed is derived from it, so a given take is reproducible.
+
+A take also re-rolls a design: `design_voice(..., take=2)` gives a different speaker for the
+same description.
 
 ### Idempotent voice cloning
 
@@ -305,24 +435,49 @@ speak_script(beats=[
 ], export_srt=True)
 ```
 
+Because a beat is a `BeatSpec`, it can pick its own mode — clone a clip, speak a preset
+timbre, or steer delivery with `instruct`:
+
+```python
+speak_script(beats=[
+    # cloned voice, from a reference clip
+    {"text": "Welcome back to the show.", "voice": "host"},
+    # preset timbre, no clip involved
+    {"text": "Our guest needs no introduction.", "speaker": "Uncle_Fu"},
+    # preset timbre plus a delivery instruction (1.7B custom checkpoint)
+    {"text": "It was, honestly, the strangest week of my life.",
+     "speaker": "Ryan", "instruct": "quieter, as if telling a secret"},
+])
+```
+
 | Key | Effect |
 |---|---|
 | `text` | What to say (required) |
 | `voice` | Voice id or name for **this beat** — enables multi-speaker scripts (podcasts, interviews); the result's `beats[].voice_id` records who actually spoke |
+| `speaker` | Preset timbre for this beat (`Vivian` … `Sohee`), answered by a `custom_voice` checkpoint. Needs no reference clip, so it works on a fresh install |
+| `instruct` | Delivery direction for this beat (`"slower, wearier"`). With a `speaker` it steers that preset and needs `supports_instruct`; with no `voice`/`speaker` it routes the beat to `voice_design` and becomes the description of a new timbre; a cloned beat ignores it |
 | `engine` / `model` / `quality` | Per-beat overrides of the same-named `speak` options |
 | `language` | `"Auto"` or a language name |
 | `target_duration_sec` + `fit_mode` | Fit the beat into a fixed slot (`none`, `pad`, `atempo`) — for fixed-length video segments |
 | `pause_after_sec` | 0–10 s of silence inserted **after** the beat. Included in the reported timings, so subtitles and visuals stay frame-accurate |
 | `take` | Alternate delivery of this beat's line (`take=2`, `take=3`, …). Re-record one beat without touching the others |
 
-`BeatTiming` reports `start_sec`, `end_sec`, `pause_after_sec` and `voice_id` per
-beat. `end_sec` is the end of the spoken portion; the next beat starts at
+`speak` takes the same arguments for a single line, and routing follows the same rules:
+`speak("Good evening.", speaker="Serena")` speaks a preset timbre;
+`speak("Good evening.", instruct="a tired, gravelly narrator")` has no voice or speaker to
+fall back on, so it routes to `voice_design` and invents one. Pair `speaker` with `instruct` to
+steer a preset instead, and never pass `voice` and `speaker` together — two timbres in one
+request is an error rather than a guess. On a cloned beat (`voice=`), `instruct` is ignored,
+because a Base checkpoint has no instruct channel.
+
+`BeatTiming` reports `start_sec`, `end_sec`, `pause_after_sec`, `voice_id`, `mode` and
+`speaker` per beat. `end_sec` is the end of the spoken portion; the next beat starts at
 `end_sec + pause_after_sec`. That is what makes a Manim or slideshow timeline land
 on the frame you expect.
 
-`pause_after_sec` and per-beat `voice` need no MCP plumbing of their own — beats are
-passed straight into `BeatSpec`, so anything the contract accepts works through the
-tool.
+`pause_after_sec`, per-beat `voice`, `speaker`, `instruct` and `take` need no MCP plumbing of
+their own — beats are passed straight into `BeatSpec`, so anything the contract accepts works
+through the tool.
 
 ### The `.timing.json` file
 
@@ -382,6 +537,7 @@ extra keys:
 | `beats[].pause_after_sec` | Silence inserted after this beat, included in the layout |
 | `beats[].target_duration_sec` / `fit_mode` | The slot that was requested, echoed (`null` / `"none"` when unused) |
 | `beats[].voice_id` | Which voice actually spoke this beat — auditable multi-speaker scripts |
+| `beats[].mode` / `speaker` / `instruct` | How this beat was rendered: `clone`, `custom_voice` or `voice_design`, the preset timbre if one spoke, and the instruction if one was given |
 | `beats[].cached` | `true` when this beat was reused from disk. Edit one beat of twelve and see eleven instant hits |
 | `beats[].artifact_id` | This beat's own artifact, so a single beat can be fetched or re-rendered |
 | `srt_path` / `vtt_path` / `timing_json_path` | Where the sidecars landed |
@@ -471,10 +627,10 @@ between them, and exits non-zero if they disagree by more than 750 ms.
 ## Agent skill
 
 An installable skill for coding agents lives at
-[`skills/agent-voice/SKILL.md`](skills/agent-voice/SKILL.md) — orientation,
-first-run voice cloning, script beats, reproducibility, error handling and the MCP
-config snippet, in about 30 seconds of reading. The MCP server also serves it as the
-`agent-voice://guide` resource.
+[`skills/agent-voice/SKILL.md`](skills/agent-voice/SKILL.md) — orientation, voice-mode
+selection (clone, preset speaker, design), first-run voice cloning, script beats,
+reproducibility, error handling and the MCP config snippet, in about 30 seconds of reading.
+The MCP server also serves it as the `agent-voice://guide` resource.
 
 ## Security
 
@@ -499,7 +655,7 @@ an agent.
   | value | Tools exposed |
   |---|---|
   | `auto` (default) | `core`, plus the management tools when mutation is enabled |
-  | `core` | Synthesis, voices clone/read/delete, GPU status. No engine/model management at all |
+  | `core` | Synthesis, voices clone/design/read/delete, GPU status. No engine/model management at all |
   | `full` | Everything, so the per-call loopback + mutation guard answers with an actionable error |
 
   `core` is the right choice for an agent that only needs to make audio: a shorter tool list costs
@@ -571,11 +727,43 @@ Alternatively, Task Scheduler with trigger "At log on" and action
 agent-voice serve | mcp | status
 agent-voice engines  list | install <id> | test <id> | pending | approve <id>
 agent-voice models   list | download <engine> <alias>
-agent-voice voices   list | add <name> <wav> | delete <voice_id>
+agent-voice voices   list | add <name> <wav> | design <name> --instruct "..." | delete <voice_id>
 agent-voice bindings list | set <agent> ... | delete <agent>
 agent-voice cache    stats | clear
 agent-voice unload [--force]
 ```
+
+### `voices design <name> --instruct "..."`
+
+Designs a voice from a written description and registers it as a clone voice. It runs
+in-process (start the worker manager, render, stop), so **no daemon needs to be running** —
+the same in-process pattern `engines test` and the Manim demo use:
+
+```console
+$ agent-voice voices design narrator \
+    --instruct "warm baritone, measured pace, a little gravel, late-night radio"
+{
+  "voice_id": "7c1a90d2be44",
+  "name": "narrator",
+  "preview_file_path": "/repo/data/artifacts/0f3c8a11d2b4.wav",
+  "duration_sec": 6.42,
+  "source": "designed",
+  "design_instruct": "warm baritone, measured pace, a little gravel, late-night radio",
+  "engine_id": "qwen3_tts_fast",
+  "model_alias": "1.7b-design"
+}
+designed 'narrator' -> voice 7c1a90d2be44 (6.42 s preview: /repo/data/artifacts/0f3c8a11d2b4.wav)
+```
+
+| Option | Effect |
+|---|---|
+| `--instruct` / `-i` | What the voice should sound like (required) |
+| `--sample-text` | Sentence the designed voice speaks; defaults to a built-in 5–8 s anchor |
+| `--language` | Language of that sentence (default `English`) |
+| `--save-as-clone/--no-save-as-clone` | Register the render as a voice (default) or keep only the preview |
+| `--take` / `--seed` | Re-roll the same description, or pin it for a reproducible render |
+| `--overwrite` | Replace an existing voice with the same name |
+| `--engine` / `--model` / `--quality` | Target selection; `--model` must be a `voice_design` checkpoint |
 
 ### `engines test <engine_id>` — IPC v1 conformance
 

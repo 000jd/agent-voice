@@ -35,6 +35,11 @@ CACHE_KEY_FIELDS: tuple[str, ...] = (
     "normalize_lufs",
     "chunk_chars",
     "take",
+    # v0.3: the same text can be cloned, preset-spoken or designed. The mode,
+    # speaker and instruction change the audio just as much as the voice does.
+    "mode",
+    "speaker",
+    "instruct",
     "hf_repo",
     "model_revision",
 )

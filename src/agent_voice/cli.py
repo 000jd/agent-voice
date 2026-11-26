@@ -14,10 +14,17 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import typer
 
 from .config import get_settings
+
+# Imported eagerly, unlike the engine/model/voice modules below: Typer evaluates
+# option defaults when this module is imported, so the `voices design` sample text
+# has to be available here. `schemas` is torch-free by contract (see its module
+# docstring), so this does not break the "no torch in the CLI" rule.
+from .schemas import DEFAULT_DESIGN_SAMPLE_TEXT
 
 app = typer.Typer(
     help="Headless multi-engine voice server for AI agents.", no_args_is_help=True
@@ -542,8 +549,10 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
             return _skip_rest(steps, "hello handshake invalid")
 
         # -- load_model -------------------------------------------------
+        # Conformance exercises the clone protocol; CustomVoice/VoiceDesign can
+        # share the high tier, so an unfiltered pick could load a non-clone model.
         try:
-            alias = registry.default_model_alias(engine_id)
+            alias = registry.default_model_alias(engine_id, mode="clone")
         except AgentVoiceError as exc:
             steps.append(_Step("load_model", False, exc.message))
             return _skip_rest(steps, "no model alias to load")
@@ -971,6 +980,112 @@ def voices_add(
     _print(metadata.model_dump(mode="json"))
     for warning in metadata.warnings:
         typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW)
+
+
+@voices_app.command("design")
+def voices_design(
+    name: str,
+    instruct: str = typer.Option(
+        ...,
+        "--instruct",
+        "-i",
+        help="What the voice should sound like, in plain language.",
+    ),
+    sample_text: str = typer.Option(
+        DEFAULT_DESIGN_SAMPLE_TEXT,
+        "--sample-text",
+        help="Sentence the designed voice speaks (5-8 s of audio is the sweet spot).",
+    ),
+    language: str = typer.Option(
+        "English", "--language", help="Language the sample sentence is spoken in."
+    ),
+    save_as_clone: bool = typer.Option(
+        True,
+        "--save-as-clone/--no-save-as-clone",
+        help="Register the render as a reusable voice (default), or keep only the preview.",
+    ),
+    take: int | None = typer.Option(
+        None,
+        "--take",
+        min=1,
+        help="Alternate design of the same prompt; each take caches separately.",
+    ),
+    seed: int | None = typer.Option(
+        None, "--seed", help="Fixed seed, so the same prompt renders identical audio."
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace an existing voice that already has this name."
+    ),
+    engine: str | None = typer.Option(
+        None, "--engine", help="Engine id (default: the configured engine)."
+    ),
+    model: str | None = typer.Option(
+        None, "--model", help="Model alias; must be a voice_design checkpoint (1.7b-design)."
+    ),
+    quality: Literal["high", "fast"] = typer.Option(
+        "high", "--quality", help="high | fast, when --model is left unset."
+    ),
+) -> None:
+    """Design a voice from a text description, then save it as a clone.
+
+    Runs in-process against the engines directory, so no daemon needs to be
+    running. A voice_design checkpoint renders the preview; with --save-as-clone
+    (the default) that preview is registered as an ordinary reference voice, which
+    any cloning checkpoint can then speak with — design once, clone forever.
+    """
+    import asyncio
+
+    from .api.app import AppContext
+    from .schemas import AgentVoiceError, DesignVoiceRequest
+    from .services.voice_design_service import render_design
+
+    payload = DesignVoiceRequest(
+        name=name,
+        instruct=instruct,
+        sample_text=sample_text,
+        language=language,
+        save_as_clone=save_as_clone,
+        take=take,
+        seed=seed,
+        overwrite=overwrite,
+        engine=engine,
+        model=model,
+        quality=quality,
+    )
+    # Same lifecycle the daemon and the Manim demo use: start the manager, run the
+    # service in-process, always stop it. Nothing here touches torch directly.
+    ctx = AppContext(get_settings())
+
+    async def run():
+        await ctx.workers.start()
+        try:
+            return await render_design(ctx, payload)
+        finally:
+            await ctx.workers.stop()
+
+    try:
+        result = asyncio.run(run())
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt:
+        typer.secho("interrupted", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=130) from None
+
+    _print(result.model_dump(mode="json"))
+    if result.voice_id:
+        typer.secho(
+            f"designed '{result.name}' -> voice {result.voice_id} "
+            f"({result.duration_sec:.2f} s preview: {result.preview_file_path})",
+            fg=typer.colors.GREEN,
+        )
+    else:
+        typer.secho(
+            "preview only (nothing saved): " + result.preview_file_path,
+            fg=typer.colors.YELLOW,
+        )
 
 
 @voices_app.command("delete")

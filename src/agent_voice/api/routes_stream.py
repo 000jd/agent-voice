@@ -20,7 +20,17 @@ router = APIRouter(tags=["stream"])
 
 
 async def _open_stream(
-    request: Request, *, text: str, voice, engine, model, quality, language, speed
+    request: Request,
+    *,
+    text: str,
+    voice,
+    engine,
+    model,
+    quality,
+    language,
+    speed,
+    speaker=None,
+    instruct: str = "",
 ):
     ctx = request.app.state.ctx
     if len(text) > ctx.settings.max_text_chars:
@@ -36,6 +46,8 @@ async def _open_stream(
         bindings=ctx.bindings,
         agent_id=request.headers.get("x-agent-id"),
         voice=voice,
+        speaker=speaker,
+        instruct=instruct,
         engine=engine,
         model=model,
         quality=quality,
@@ -47,6 +59,11 @@ async def _open_stream(
         voice_id=target.voice_id,
         ref_text=target.ref_text,
         x_vector_only=target.x_vector_only,
+        # Canonical values from the resolved target: the speaker spelling as the
+        # manifest declares it, and no instruct when a clone checkpoint speaks.
+        mode=target.mode,
+        speaker=target.speaker,
+        instruct=target.instruct,
         language=language,
         speed=speed,
     )
@@ -70,6 +87,8 @@ async def pcm_stream(request: Request):
         quality=body.get("quality", "high"),
         language=body.get("language", "Auto"),
         speed=float(body.get("speed", 1.0)),
+        speaker=body.get("speaker"),
+        instruct=body.get("instruct") or "",
     )
 
     async def generate():
@@ -97,6 +116,9 @@ async def pcm_stream(request: Request):
         "x-agent-voice-streaming-mode": mode,
         "x-agent-voice-sample-rate": "24000",
     }
+    if target.speaker:
+        # The body is raw PCM, so a preset timbre is only observable here.
+        headers["x-agent-voice-speaker"] = target.speaker
     return StreamingResponse(
         generate(), media_type="application/octet-stream", headers=headers
     )
@@ -115,6 +137,10 @@ async def audio_ws(websocket: WebSocket):
 
     async def pump(payload: dict) -> None:
         nonlocal current
+        # Whichever timbre the request asked for, by preset name or instruction,
+        # travels the same path as on the HTTP stream: routing decides the model.
+        speaker = payload.get("speaker")
+        instruct = payload.get("instruct") or ""
         target = resolve_target(
             settings=ctx.settings,
             registry=ctx.registry,
@@ -122,6 +148,8 @@ async def audio_ws(websocket: WebSocket):
             bindings=ctx.bindings,
             agent_id=websocket.headers.get("x-agent-id"),
             voice=payload.get("voice"),
+            speaker=speaker,
+            instruct=instruct,
             engine=payload.get("engine"),
             model=payload.get("model"),
             quality=payload.get("quality", "high"),
@@ -133,6 +161,9 @@ async def audio_ws(websocket: WebSocket):
             voice_id=target.voice_id,
             ref_text=target.ref_text,
             x_vector_only=target.x_vector_only,
+            mode=target.mode,
+            speaker=target.speaker,
+            instruct=target.instruct,
             language=payload.get("language", "Auto"),
             speed=float(payload.get("speed", 1.0)),
         )

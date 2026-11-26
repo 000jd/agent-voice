@@ -32,6 +32,7 @@ from .schemas import (
     EngineManifest,
     ErrorCode,
     ModelEntry,
+    ModelMode,
     ModelSpec,
     validate_alias,
     validate_slug,
@@ -281,6 +282,9 @@ class EngineRegistry:
                 is_default=spec.default,
                 downloaded_locally=hf_model_downloaded(spec.hf_repo),
                 loaded=False,
+                mode=spec.mode,
+                supports_instruct=spec.supports_instruct,
+                preset_speakers=list(spec.preset_speakers),
             )
             for spec in manifest.models
         ]
@@ -338,6 +342,9 @@ class EngineRegistry:
                     ),
                     streaming=bool(record.manifest.capabilities.streaming),
                     pcm_native=bool(record.manifest.capabilities.pcm_native),
+                    custom_voice=bool(record.manifest.capabilities.custom_voice),
+                    voice_design=bool(record.manifest.capabilities.voice_design),
+                    instruct_control=bool(record.manifest.capabilities.instruct_control),
                     models=[
                         model.model_copy(update={"loaded": model.alias in loaded_models})
                         for model in record.models
@@ -355,21 +362,32 @@ class EngineRegistry:
             models.extend(self._records[current].models)
         return models
 
-    def default_model_alias(self, engine_id: str, quality: str = "high") -> str:
+    def default_model_alias(
+        self, engine_id: str, quality: str = "high", mode: ModelMode | None = None
+    ) -> str:
+        """Pick the model for a quality tier, optionally restricted to one mode.
+
+        Clone routing must pass ``mode="clone"``: with CustomVoice and VoiceDesign
+        sharing the high tier, an unfiltered pick could load a model that cannot
+        clone at all.
+        """
         record = self.get(engine_id)
-        for model in record.manifest.models:
+        candidates = [
+            model for model in record.manifest.models if mode is None or model.mode == mode
+        ]
+        if not candidates:
+            raise AgentVoiceError(
+                ErrorCode.MODEL_NOT_FOUND,
+                f"engine '{engine_id}' declares no {mode or 'usable'} model",
+                "Fix engine.yaml or register a model with register_model().",
+            )
+        for model in candidates:
             if model.quality_tier == quality:
                 return model.alias
-        for model in record.manifest.models:
+        for model in candidates:
             if model.default:
                 return model.alias
-        if record.manifest.models:
-            return record.manifest.models[0].alias
-        raise AgentVoiceError(
-            ErrorCode.MODEL_NOT_FOUND,
-            f"engine '{engine_id}' declares no models",
-            "Register a model with register_model() or fix engine.yaml.",
-        )
+        return candidates[0].alias
 
     def model_spec(self, engine_id: str, alias: str) -> ModelSpec:
         record = self.get(engine_id)

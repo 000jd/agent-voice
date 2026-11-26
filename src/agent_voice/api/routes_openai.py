@@ -10,35 +10,77 @@ from .routing import resolve_target
 
 router = APIRouter(tags=["speech"])
 
-OPENAI_BUILTIN_VOICES = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
+OPENAI_SPEAKER_MAP: dict[str, str] = {
+    "alloy": "Ryan",
+    "echo": "Aiden",
+    "fable": "Dylan",
+    "onyx": "Uncle_Fu",
+    "nova": "Serena",
+    "shimmer": "Vivian",
+}
+"""Builtin OpenAI name -> preset speaker on a CustomVoice checkpoint.
+
+Used only as the last resort, when the caller has no voice of its own: a preset
+timbre needs no reference clip, so an OpenAI-shaped client still hears speech on
+a fresh install that has nothing cloned yet."""
+
+OPENAI_BUILTIN_VOICES = set(OPENAI_SPEAKER_MAP)
 """Voice names hard-coded into real OpenAI SDK / LangChain / Pipecat / LiveKit
 clients. None of them can be satisfied by an OpenAI TTS clone, so they are mapped
-onto whatever the local install actually has instead of 404-ing the client."""
+onto whatever the local install actually has instead of 404-ing the client.
+
+Derived from the map above so the two can never drift apart."""
 
 
-def _substitute_openai_voice(request: Request, voice: str | None) -> str | None:
-    """Map a builtin OpenAI voice name onto a locally resolvable voice.
+def _preset_speaker_for(request: Request, speaker: str) -> str | None:
+    """The mapped speaker if the default engine can voice it without a clone.
+
+    A CustomVoice checkpoint speaks fixed timbres, so this is the one path to
+    audio that needs neither a registered voice nor a download of anything but
+    the checkpoint itself. ``local/`` repos count as present too: they are models
+    that ship with the install rather than being fetched from HuggingFace.
+    """
+    ctx = request.app.state.ctx
+    for model in ctx.registry.list_models(ctx.settings.default_engine):
+        if model.mode != "custom_voice" or speaker not in model.preset_speakers:
+            continue
+        if model.downloaded_locally or model.hf_repo.startswith("local/"):
+            return speaker
+    return None
+
+
+def _substitute_openai_voice(
+    request: Request, voice: str | None
+) -> tuple[str | None, str | None]:
+    """Map a builtin OpenAI voice name onto a locally resolvable voice or speaker.
+
+    Returns ``(voice_id, speaker)``: at most one of the two is set, and both are
+    None when nothing local can satisfy the name.
 
     Strictly scoped to the builtin set: any other unknown name still fails with
     VOICE_NOT_FOUND, because silently speaking in the wrong voice — or worse,
     papering over a typo — is not a favour to an agent.
     """
     if voice not in OPENAI_BUILTIN_VOICES:
-        return voice
+        return voice, None
 
     ctx = request.app.state.ctx
     if ctx.voices.resolve(voice) is not None:
-        return voice
+        return voice, None
 
     configured = ctx.settings.default_voice_id or None
     if configured and ctx.voices.resolve(configured) is not None:
-        return configured
+        return configured, None
 
     saved = ctx.voices.list()
     if len(saved) == 1:
-        return saved[0].voice_id
+        return saved[0].voice_id, None
 
-    return None
+    # No local voice to clone with, so try the preset timbre the name maps to.
+    mapped = OPENAI_SPEAKER_MAP.get(voice or "")
+    if mapped is None:
+        return None, None
+    return None, _preset_speaker_for(request, mapped)
 
 
 def _agent_id(request: Request) -> str | None:
@@ -73,13 +115,17 @@ async def run_synthesis(
     seed: int | None,
     speed: float,
     take: int | None = None,
+    speaker: str | None = None,
+    instruct: str = "",
     openai_voice_compat: bool = False,
 ):
     ctx = request.app.state.ctx
     _validate_text(request, text)
 
     if openai_voice_compat:
-        voice = _substitute_openai_voice(request, voice)
+        # Either a local voice or a preset speaker comes back; routing turns that
+        # pair into one concrete model, then the worker is handed the resolution.
+        voice, speaker = _substitute_openai_voice(request, voice)
 
     target = resolve_target(
         settings=ctx.settings,
@@ -88,6 +134,8 @@ async def run_synthesis(
         bindings=ctx.bindings,
         agent_id=_agent_id(request),
         voice=voice,
+        speaker=speaker,
+        instruct=instruct,
         engine=engine,
         model=model,
         quality=quality,  # type: ignore[arg-type]
@@ -100,6 +148,12 @@ async def run_synthesis(
         voice_id=target.voice_id,
         ref_text=target.ref_text,
         x_vector_only=target.x_vector_only,
+        # The resolved target, not the raw request: it carries the canonical
+        # speaker spelling and drops an instruct a clone checkpoint cannot use,
+        # so neither pollutes the cache key without changing the audio.
+        mode=target.mode,
+        speaker=target.speaker,
+        instruct=target.instruct,
         language=language,
         seed=seed,
         speed=speed,
@@ -134,14 +188,18 @@ async def openai_speech(payload: SpeechRequest, request: Request):
         "flac": "audio/flac",
         "pcm": "application/octet-stream",
     }[payload.response_format]
+    headers = {
+        "x-agent-voice-engine": result.engine_id,
+        "x-agent-voice-model": result.model_alias,
+    }
+    if result.speaker:
+        # The body is audio, so a preset-timbre fallback is only observable here.
+        headers["x-agent-voice-speaker"] = result.speaker
     return FileResponse(
         result.file_path,
         media_type=media,
         filename=f"{result.artifact_id}.{payload.response_format}",
-        headers={
-            "x-agent-voice-engine": result.engine_id,
-            "x-agent-voice-model": result.model_alias,
-        },
+        headers=headers,
     )
 
 
@@ -162,6 +220,8 @@ async def agent_speak(payload: SpeakRequest, request: Request):
         # A new take is an alternate delivery of the same line: same text, other
         # audio. It feeds the cache key, so take 1 stays cached.
         take=payload.take,
+        speaker=payload.speaker,
+        instruct=payload.instruct,
     )
     return result.model_dump(mode="json")
 

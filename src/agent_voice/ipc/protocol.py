@@ -121,7 +121,10 @@ class FrameWriter(Protocol):
 # synthesize   req  {"id": str, "method": "synthesize", "model_alias": str,
 #                    "text": str, "ref_wav_path": str, "ref_text": str,
 #                    "x_vector_only_mode": bool, "prompt_cache_path": str|None,
-#                    "language": str, "seed": int|None, "speed": float}
+#                    "language": str, "seed": int|None, "speed": float,
+#                    "mode": str, "speaker": str|None, "instruct": str}
+#                    mode/speaker/instruct are optional (default clone/None/"");
+#                    omitting them keeps v1 behaviour exactly.
 #              resp {"id": str, "wav_path": str, "sample_rate": int,
 #                    "duration_sec": float, "model_alias": str,
 #                    "backend_name": str, "backend_version": str}

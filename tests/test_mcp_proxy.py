@@ -94,6 +94,7 @@ EXPECTED_TOOLS = {
     "get_job",
     "cancel_job",
     "clone_voice",
+    "design_voice",
     "list_voices",
     "delete_voice",
     "set_agent_binding",
@@ -275,6 +276,22 @@ async def test_gpu_status_shape(tmp_path):
             assert key in payload(result)
 
 
+@pytest.mark.asyncio
+async def test_server_info_advertises_preset_speakers_and_voice_design(tmp_path):
+    """server_info must name the timbres speak(speaker=...) accepts right now.
+
+    On the mock engine the custom_voice and voice_design checkpoints ship as
+    ``local/`` repos, so both answers are available without a download. An agent
+    reads this before deciding between speaker=, instruct= and design_voice().
+    """
+    async with mcp_client(tmp_path) as (client, _app):
+        info = payload(await client.call_tool("server_info", {}))
+        assert {"Ryan", "Serena"} <= set(info["preset_speakers"])
+        assert info["voice_design_available"] is True
+        # Still a free snapshot: nothing is resident until something is asked for.
+        assert info["voices_count"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Synthesis tools
 # ---------------------------------------------------------------------------
@@ -305,6 +322,62 @@ async def test_speak_reports_structured_error_for_unknown_engine(tmp_path):
         body = await call_expecting_error(client, "speak", {"text": "Hi.", "engine": "nope"})
         assert body["error_code"] == "ENGINE_NOT_FOUND"
         assert body["suggestion"]
+
+
+@pytest.mark.asyncio
+async def test_speak_with_speaker_and_instruct_reports_its_mode(tmp_path):
+    """A preset timbre plus delivery direction is custom_voice, not a clone."""
+    async with mcp_client(tmp_path) as (client, _app):
+        body = payload(
+            await client.call_tool(
+                "speak",
+                {
+                    "text": "Preset timbre with a delivery instruction.",
+                    "speaker": "Ryan",
+                    "instruct": "slow, warm and calm",
+                },
+            )
+        )
+        assert body["mode"] == "custom_voice"
+        assert body["speaker"] == "Ryan"
+        assert body["voice_id"] is None, "a preset speaker has no reference clip"
+        assert body["model_alias"] == "mock-custom"
+        assert Path(body["file_path"]).is_file()
+
+
+@pytest.mark.asyncio
+async def test_speak_on_a_preset_works_with_no_voice_registered(tmp_path):
+    """speaker= is the one way to hear audio on a fresh install with no clips."""
+    async with mcp_client(tmp_path) as (client, _app):
+        assert payload(await client.call_tool("list_voices", {}))["voices"] == []
+        body = payload(
+            await client.call_tool("speak", {"text": "No voice needed.", "speaker": "Serena"})
+        )
+        assert body["mode"] == "custom_voice"
+        assert body["speaker"] == "Serena"
+        assert Path(body["file_path"]).is_file()
+
+
+@pytest.mark.asyncio
+async def test_speak_rejects_voice_and_speaker_together(tmp_path):
+    """Two timbres in one request: whichever won would be a guess."""
+    async with mcp_client(tmp_path) as (client, _app):
+        body = await call_expecting_error(
+            client, "speak", {"text": "Both.", "voice": "any-voice", "speaker": "Ryan"}
+        )
+        assert body["error_code"] == "BAD_REQUEST"
+        assert body["suggestion"]
+
+
+@pytest.mark.asyncio
+async def test_speak_rejects_unknown_preset_speaker(tmp_path):
+    """The suggestion must name the speakers that do exist."""
+    async with mcp_client(tmp_path) as (client, _app):
+        body = await call_expecting_error(
+            client, "speak", {"text": "Who?", "speaker": "Nobody"}
+        )
+        assert body["error_code"] == "BAD_REQUEST"
+        assert "Ryan" in body["suggestion"]
 
 
 @pytest.mark.asyncio
@@ -389,6 +462,50 @@ async def test_clone_voice_rejects_short_clip(tmp_path):
         assert body["error_code"] == "INVALID_REF_AUDIO"
 
 
+@pytest.mark.asyncio
+async def test_design_voice_returns_a_designed_payload_and_saves_it(tmp_path):
+    """design_voice talks or describes: no reference clip is supplied at all."""
+    instruct = "a warm, low British narrator in his forties, unhurried"
+    async with mcp_client(tmp_path) as (client, _app):
+        body = payload(
+            await client.call_tool("design_voice", {"name": "mcp-designer", "instruct": instruct})
+        )
+        assert body["source"] == "designed"
+        assert body["design_instruct"] == instruct
+        assert body["name"] == "mcp-designer"
+        assert body["model_alias"] == "mock-design"
+        assert body["engine_id"] == "mock"
+        assert body["voice_id"], "save_as_clone defaults to true"
+        assert Path(body["preview_file_path"]).is_file()
+        assert body["duration_sec"] > 0
+
+        # The description is kept as provenance, so a designed voice is auditable.
+        voices = payload(await client.call_tool("list_voices", {}))["voices"]
+        saved = next(v for v in voices if v["voice_id"] == body["voice_id"])
+        assert saved["source"] == "designed"
+        assert saved["design_instruct"] == instruct
+        assert saved["ref_text"], "the anchor sentence is stored as the transcript"
+
+
+@pytest.mark.asyncio
+async def test_designed_voice_is_speakable_afterwards(tmp_path):
+    """'Design once, speak a thousand times': the save is an ordinary voice."""
+    async with mcp_client(tmp_path) as (client, _app):
+        designed = payload(
+            await client.call_tool(
+                "design_voice", {"name": "reusable", "instruct": "bright and quick"}
+            )
+        )
+        spoken = payload(
+            await client.call_tool(
+                "speak", {"text": "Now in the designed voice.", "voice": designed["voice_id"]}
+            )
+        )
+        assert spoken["mode"] == "clone"
+        assert spoken["voice_id"] == designed["voice_id"]
+        assert Path(spoken["file_path"]).is_file()
+
+
 # ---------------------------------------------------------------------------
 # Header extraction
 # ---------------------------------------------------------------------------
@@ -433,10 +550,13 @@ async def test_mutation_disabled_blocks_register_engine(tmp_path):
     async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
         names = {tool.name for tool in await client.list_tools()}
         assert "register_engine" not in names
-        # 11 since v0.2.1: delete_voice moved into core so an agent can clean up
-        # a bad clone without dropping to the CLI.
-        assert len(names) == 11
+        # 12 since v0.3.0: design_voice joined core, because "describe a voice and
+        # speak it" is the one path that needs neither a clip nor a download, and
+        # delete_voice has been core since v0.2.1 so an agent can clean up a bad
+        # clone without dropping to the CLI.
+        assert len(names) == 12
         assert "delete_voice" in names
+        assert "design_voice" in names
 
 
 @pytest.mark.asyncio
@@ -625,3 +745,38 @@ async def test_narrate_video_prompt_is_registered(tmp_path):
     async with mcp_client(tmp_path) as (client, _app):
         names = {prompt.name for prompt in await client.list_prompts()}
         assert "narrate_video" in names
+
+
+def test_server_info_presets_are_scoped_to_the_default_engine():
+    """Only speakers the default engine can actually voice may be advertised.
+
+    server_info() says these names are accepted by speak(speaker=...); a speaker
+    from a non-default engine would make that same call fail with BAD_REQUEST.
+    """
+    from agent_voice.mcp_server import _preset_speech_surface
+    from agent_voice.schemas import EngineEntry, ModelEntry
+
+    def entry(engine_id: str, speaker: str) -> EngineEntry:
+        return EngineEntry(
+            engine_id=engine_id,
+            backend_name=engine_id,
+            backend_version="1",
+            installed=True,
+            models=[
+                ModelEntry(
+                    engine_id=engine_id,
+                    alias=f"{engine_id}-custom",
+                    hf_repo=f"local/{engine_id}-custom",
+                    quality_tier="fast",
+                    est_vram_gb=0.0,
+                    mode="custom_voice",
+                    preset_speakers=[speaker],
+                )
+            ],
+        )
+
+    speakers, design_available = _preset_speech_surface(
+        [entry("mock", "Ryan"), entry("other", "Vivian")], "mock"
+    )
+    assert speakers == ["Ryan"]
+    assert design_available is False

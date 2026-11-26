@@ -13,6 +13,9 @@ capabilities:
   streaming: true
   pcm_native: true
   voice_clone: true
+  custom_voice: true
+  voice_design: true
+  instruct_control: true
   languages:
     - Auto
     - Chinese
@@ -26,13 +29,40 @@ capabilities:
     - Spanish
     - Italian
 
+# The five official 12Hz checkpoints: clone (Base), preset timbres (CustomVoice)
+# and natural-language voice design (VoiceDesign). The installed 0.6B CustomVoice
+# backend drops `instruct`, so supports_instruct is false for that alias.
 models:
   - alias: 1.7b-base
     hf_repo: Qwen/Qwen3-TTS-12Hz-1.7B-Base
     quality_tier: high
     est_vram_gb: 4.4
     default: true
+    mode: clone
   - alias: 0.6b-base
     hf_repo: Qwen/Qwen3-TTS-12Hz-0.6B-Base
     quality_tier: fast
     est_vram_gb: 2.2
+    mode: clone
+  - alias: 1.7b-custom
+    hf_repo: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    quality_tier: high
+    est_vram_gb: 4.4
+    mode: custom_voice
+    supports_instruct: true
+    preset_speakers:
+      [Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee]
+  - alias: 0.6b-custom
+    hf_repo: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+    quality_tier: fast
+    est_vram_gb: 2.2
+    mode: custom_voice
+    supports_instruct: false
+    preset_speakers:
+      [Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee]
+  - alias: 1.7b-design
+    hf_repo: Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+    quality_tier: high
+    est_vram_gb: 4.4
+    mode: voice_design
+    supports_instruct: true
