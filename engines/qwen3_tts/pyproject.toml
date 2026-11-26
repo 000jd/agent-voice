@@ -1,0 +1,26 @@
+[project]
+name = "agent-voice-engine-qwen3-tts"
+version = "0.1.0"
+description = "Official Qwen3-TTS backend for agent-voice"
+requires-python = ">=3.11,<3.13"
+
+# Official qwen-tts pins transformers==4.57.3. This is why the official and
+# CUDA-graph engines cannot share a virtualenv (see engines/qwen3_tts_fast).
+dependencies = [
+    "qwen-tts==0.1.1",
+    "torch",
+    "torchaudio",
+    "soundfile",
+    "numpy",
+]
+
+[tool.uv]
+# sm_89 (RTX 4060 Ti) is covered by cu128 wheels; driver 580 is far newer.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]

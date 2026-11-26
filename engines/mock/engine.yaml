@@ -1,0 +1,19 @@
+engine_id: mock
+display_name: Mock (tone generator, no dependencies)
+backend_name: mock
+backend_version: "1"
+protocol_version: 1
+venv_python: null
+
+capabilities:
+  streaming: true
+  pcm_native: true
+  voice_clone: false
+  languages: [Auto, English]
+
+models:
+  - alias: mock-tone
+    hf_repo: local/mock-tone
+    quality_tier: fast
+    est_vram_gb: 0.0
+    default: true

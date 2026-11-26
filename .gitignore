@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments — the core venv and every per-engine venv.
+# These are multi-GB and fully reproducible from pyproject.toml + uv.lock.
+.venv/
+engines/*/.venv/
+
+# Runtime data: voices, cache, artifacts, jobs, bindings, logs
+data/
+
+# Runtime lock files (filelock: bindings.json.lock, daemon.lock, .registry.lock)
+*.lock
+# ...but dependency lock files MUST be committed for reproducible installs.
+!uv.lock
+!engines/*/uv.lock
+
+# Local configuration (copy .env.example)
+.env
+
+# Test / tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor / agent-local state (not part of the project source)
+.commandcode/
+.idea/
+.vscode/
+
+# OS noise
+.DS_Store
+Thumbs.db
