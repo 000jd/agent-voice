@@ -11,7 +11,7 @@ given for every release so a tag can be verified against the history.
 
 No unreleased changes.
 
-## [0.3.3] — 2026-11-26
+## [0.3.3] — 2026-11-26 — `2650a4a`
 
 Security-hardening and governance release. No dependency changes; the core venv
 still installs no torch.
