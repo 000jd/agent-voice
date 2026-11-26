@@ -26,7 +26,7 @@ from ..audio_utils import (
     write_srt,
     write_vtt,
 )
-from ..pronunciations import apply_pronunciations, pronunciation_hash
+from ..pronunciations import apply_pronunciations
 from ..schemas import (
     AgentVoiceError,
     BeatSpec,
@@ -97,11 +97,10 @@ async def render_script(
             "Split it into smaller scripts or raise MAX_SCRIPT_BEATS.",
         )
 
-    # One map and one hash for the whole script: the persistent lexicon plus this
-    # call's overrides. The hash goes into every per-beat cache key, so editing the
-    # lexicon can never serve audio rendered from the old one.
+    # One map for the whole script: the persistent lexicon plus this call's
+    # overrides. The rewritten text is what gets spoken and what the cache keys
+    # on, so an unrelated lexicon edit leaves existing beats cached.
     pron_map = ctx.pronunciations.effective(payload.pronunciations)
-    pron_hash = pronunciation_hash(pron_map)
 
     # Every beat may name its own voice/engine/model — that is what makes a
     # multi-speaker podcast possible — but most scripts repeat the same tuple, so
@@ -180,7 +179,6 @@ async def render_script(
                 speed=1.0,
                 response_format="wav",
                 take=beat.take,
-                pronunciations_hash=pron_hash,
             )
             segment = work_dir / f"beat-{index:03d}.wav"
             segment.write_bytes(Path(result.file_path).read_bytes())

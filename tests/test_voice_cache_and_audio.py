@@ -53,8 +53,6 @@ def _key(**overrides) -> str:
         "mode": "clone",
         "speaker": None,
         "instruct": "",
-        # v0.3.1: canonical hash of the effective pronunciation map.
-        "pronunciations": "",
         "hf_repo": "local/mock-tone",
         "model_revision": "local",
     }
@@ -247,7 +245,6 @@ def test_cache_key_is_deterministic():
         ("mode", "custom_voice"),
         ("speaker", "Ryan"),
         ("instruct", "speak slowly and warmly"),
-        ("pronunciations", "hash-of-a-different-map"),
         ("hf_repo", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
         ("model_revision", "abcdef1234567890abcdef1234567890abcdef12"),
     ],
@@ -292,9 +289,6 @@ def test_all_fields_are_covered():
         "mode",
         "speaker",
         "instruct",
-        # v0.3.1: a lexicon update must not reuse audio rendered with old
-        # pronunciation rules.
-        "pronunciations",
         "hf_repo",
         "model_revision",
     }

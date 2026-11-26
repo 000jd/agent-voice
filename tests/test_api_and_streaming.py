@@ -870,3 +870,52 @@ def test_design_voice_rejects_unsafe_name(client):
         "/v1/voices/design", json={"name": "bad\nname", "instruct": "warm"}
     )
     assert response.status_code == 422
+
+
+def test_unrelated_lexicon_edits_do_not_invalidate_the_cache(client):
+    first = client.post("/v1/agent/speak", json={"text": "Hello world."})
+    repeat = client.post("/v1/agent/speak", json={"text": "Hello world."})
+    assert first.status_code == repeat.status_code == 200
+    assert repeat.json()["cached"] is True
+
+    baseline = client.post("/v1/agent/speak", json={"text": "Run kubectl."})
+    assert baseline.status_code == 200
+    assert baseline.json()["cached"] is False
+
+    client.app.state.ctx.pronunciations.set("kubectl", "cube control")
+
+    unrelated = client.post("/v1/agent/speak", json={"text": "Hello world."})
+    assert unrelated.json()["cached"] is True, (
+        "a new entry that does not appear in the line must not invalidate it"
+    )
+    assert unrelated.json()["file_path"] == repeat.json()["file_path"]
+
+    rewritten = client.post("/v1/agent/speak", json={"text": "Run kubectl."})
+    assert rewritten.json()["cached"] is False
+    assert rewritten.json()["duration_sec"] > baseline.json()["duration_sec"], (
+        "'Run cube control.' is one spoken word longer than 'Run kubectl.'"
+    )
+    again = client.post("/v1/agent/speak", json={"text": "Run kubectl."})
+    assert again.json()["cached"] is True
+
+
+def test_pronunciation_overrides_are_capped(client):
+    too_many = {f"w{i}": "x" for i in range(501)}
+
+    speech = client.post(
+        "/v1/agent/speak", json={"text": "hi", "pronunciations": too_many}
+    )
+    assert speech.status_code == 422
+    assert speech.json()["error_code"] == "BAD_REQUEST"
+
+    script = client.post(
+        "/v1/agent/script",
+        json={"beats": [{"text": "hi"}], "pronunciations": too_many},
+    )
+    assert script.status_code == 422
+
+    long_term = client.post(
+        "/v1/agent/speak",
+        json={"text": "hi", "pronunciations": {"x": "y" * 201}},
+    )
+    assert long_term.status_code == 422

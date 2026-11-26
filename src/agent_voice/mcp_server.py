@@ -31,7 +31,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers, get_http_request
 from mcp_types import ToolAnnotations
 
-from .pronunciations import prepare_text
+from .pronunciations import prepare_text, validate_pronunciation_map
 from .schemas import (
     DEFAULT_DESIGN_SAMPLE_TEXT,
     AgentVoiceError,
@@ -146,6 +146,19 @@ def _with_default_pause(beats: list[BeatSpec], pause_after_sec: float) -> list[B
         )
         for beat in beats
     ]
+
+
+def _check_pronunciations(pronunciations: dict[str, str] | None) -> None:
+    """Reject an oversized per-call map as a structured tool error."""
+    try:
+        validate_pronunciation_map(pronunciations)
+    except ValueError as exc:
+        raise AgentVoiceError(
+            ErrorCode.BAD_REQUEST,
+            f"invalid pronunciations: {exc}",
+            "Use at most 500 entries; each key and replacement may be at most "
+            "200 characters.",
+        ) from exc
 
 
 def _preset_speech_surface(
@@ -381,6 +394,7 @@ def build_mcp_server(ctx) -> FastMCP:
         from .api.routing import resolve_target
 
         try:
+            _check_pronunciations(pronunciations)
             request = SpeakRequest(
                 text=text,
                 voice=voice,
@@ -405,7 +419,7 @@ def build_mcp_server(ctx) -> FastMCP:
                 )
             # Rewritten after the limit check: the caller is told off for what it
             # sent, not for a spoken form an expansion made longer.
-            spoken_text, pronunciations_hash = prepare_text(
+            spoken_text = prepare_text(
                 ctx.pronunciations, request.text, request.pronunciations
             )
             target = resolve_target(
@@ -439,7 +453,6 @@ def build_mcp_server(ctx) -> FastMCP:
                 speed=request.speed,
                 response_format=request.format,
                 take=request.take,
-                pronunciations_hash=pronunciations_hash,
             )
         except AgentVoiceError as exc:
             _raise_tool_error(exc)
@@ -470,6 +483,7 @@ def build_mcp_server(ctx) -> FastMCP:
         `pronunciations` maps words to spoken forms for every beat.
         """
         try:
+            _check_pronunciations(pronunciations)
             payload = ScriptRequest(
                 beats=_with_default_pause(beats, pause_after_sec),
                 default_voice=default_voice,
@@ -510,6 +524,7 @@ def build_mcp_server(ctx) -> FastMCP:
             kind: always "script".
         """
         try:
+            _check_pronunciations(pronunciations)
             payload = ScriptRequest(
                 beats=_with_default_pause(beats, pause_after_sec),
                 default_voice=default_voice,

@@ -5,25 +5,50 @@ recognises. The lexicon is a small, operator-owned replacement map persisted at
 ``data/pronunciations.json``; per-call overrides sit on top of it. Replacement is
 case-insensitive and whole-word, so ``async`` never corrupts ``asynchronously``.
 
-The file is read on every request rather than cached: editing the lexicon with the
-CLI must affect a running daemon immediately, and the file is tiny. The canonical
-hash of the effective map is part of the synthesis cache key, so a lexicon change
-invalidates old audio instead of serving a stale render.
+The rewritten spoken text is what the synthesis pipeline speaks and what the
+synthesis cache keys on: adding an unrelated entry leaves existing renders cached,
+while changing a term that appears in a line changes that line's key. Subtitles
+keep the original written text.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from filelock import FileLock
 
 PRONUNCIATION_FILE = "pronunciations.json"
+MAX_LEXICON_ENTRIES = 500
+MAX_LEXICON_TERM_CHARS = 200
+
+
+def validate_pronunciation_map(mapping: dict[str, str] | None) -> None:
+    """Reject an oversized lexicon before it reaches the regex or a worker."""
+    if not mapping:
+        return
+    if len(mapping) > MAX_LEXICON_ENTRIES:
+        raise ValueError(
+            f"pronunciation map has {len(mapping)} entries, limit is {MAX_LEXICON_ENTRIES}"
+        )
+    for word, replacement in mapping.items():
+        if not isinstance(word, str) or not isinstance(replacement, str):
+            raise ValueError("pronunciation keys and replacements must be strings")
+        if len(word) > MAX_LEXICON_TERM_CHARS:
+            raise ValueError(
+                f"pronunciation key is {len(word)} characters, limit is "
+                f"{MAX_LEXICON_TERM_CHARS}"
+            )
+        if len(replacement) > MAX_LEXICON_TERM_CHARS:
+            raise ValueError(
+                f"pronunciation replacement for {word!r} is {len(replacement)} "
+                f"characters, limit is {MAX_LEXICON_TERM_CHARS}"
+            )
 
 
 def _clean_mapping(value: Any) -> dict[str, str]:
@@ -83,11 +108,19 @@ class PronunciationStore:
             raise ValueError("pronunciation word must not be empty")
         if not isinstance(replacement, str):
             raise ValueError("pronunciation replacement must be a string")
+        validate_pronunciation_map({word: replacement})
+
         with self._lock:
             data = self.load()
-            for existing in list(data):
-                if existing.lower() == word.lower():
-                    data.pop(existing)
+            existing = any(key.lower() == word.lower() for key in data)
+            if not existing and len(data) >= MAX_LEXICON_ENTRIES:
+                raise ValueError(
+                    f"lexicon has {len(data)} entries, limit is {MAX_LEXICON_ENTRIES}; "
+                    "delete an entry before adding another"
+                )
+            for key in list(data):
+                if key.lower() == word.lower():
+                    data.pop(key)
             data[word] = replacement
             self._write(data)
         return self.list()
@@ -114,6 +147,26 @@ class PronunciationStore:
         return merged
 
 
+@lru_cache(maxsize=64)
+def _compiled(
+    mapping_key: tuple[tuple[str, str], ...],
+) -> tuple[re.Pattern[str], dict[str, str]]:
+    """Compile a mapping once; each entry becomes a named alternative.
+
+    ``match.lastgroup`` identifies the replacement, so a Unicode case-fold match
+    (``ſync`` for ``sync``, ``İstanbul`` for ``istanbul``) cannot raise the
+    ``KeyError`` that a ``match.group(0).lower()`` lookup did.
+    """
+    ordered = sorted(mapping_key, key=lambda item: len(item[0]), reverse=True)
+    groups: list[str] = []
+    replacements: dict[str, str] = {}
+    for index, (term, replacement) in enumerate(ordered):
+        name = f"k{index}"
+        groups.append(rf"(?P<{name}>(?<!\w){re.escape(term)}(?!\w))")
+        replacements[name] = replacement
+    return re.compile("|".join(groups), re.IGNORECASE), replacements
+
+
 def apply_pronunciations(text: str, mapping: dict[str, str]) -> str:
     """Replace whole-word, case-insensitive keys in ``text``.
 
@@ -123,34 +176,22 @@ def apply_pronunciations(text: str, mapping: dict[str, str]) -> str:
     """
     if not text or not mapping:
         return text
-    keys = sorted(mapping, key=len, reverse=True)
-    pattern = re.compile(
-        "|".join(rf"(?<!\w){re.escape(key)}(?!\w)" for key in keys),
-        re.IGNORECASE,
-    )
-    lowered = {key.lower(): replacement for key, replacement in mapping.items()}
-    return pattern.sub(lambda match: lowered[match.group(0).lower()], text)
+    pattern, replacements = _compiled(tuple(sorted(mapping.items())))
 
+    def replace(match: re.Match[str]) -> str:
+        name = match.lastgroup
+        return replacements[name] if name is not None else match.group(0)
 
-def pronunciation_hash(mapping: dict[str, str]) -> str:
-    """Deterministic hash of the effective map, for the synthesis cache key."""
-    canonical = json.dumps(
-        sorted((key.lower(), replacement) for key, replacement in mapping.items()),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return pattern.sub(replace, text)
 
 
 def prepare_text(
     store: PronunciationStore | None,
     text: str,
     overrides: dict[str, str] | None = None,
-) -> tuple[str, str]:
-    """Return the spoken text and the cache-key hash of the map that produced it."""
+) -> str:
+    """Return the spoken form of ``text`` after persistent + per-call replacement."""
     mapping = (
         store.effective(overrides) if store is not None else _clean_mapping(overrides)
     )
-    if not mapping:
-        return text, pronunciation_hash({})
-    return apply_pronunciations(text, mapping), pronunciation_hash(mapping)
+    return apply_pronunciations(text, mapping) if mapping else text

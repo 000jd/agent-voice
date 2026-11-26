@@ -1,14 +1,20 @@
-"""v0.3.1 pronunciation lexicon: persistence, rewriting, and cache hashing."""
+"""v0.3.2 pronunciation lexicon: persistence, rewriting, caps and regex cache."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import pytest
+
 from agent_voice.pronunciations import (
+    MAX_LEXICON_ENTRIES,
+    MAX_LEXICON_TERM_CHARS,
     PronunciationStore,
+    _compiled,
     apply_pronunciations,
     prepare_text,
-    pronunciation_hash,
+    validate_pronunciation_map,
 )
 
 
@@ -52,18 +58,60 @@ def test_apply_prefers_the_longest_key():
     assert apply_pronunciations("kubectl pod", mapping) == "cube control pod"
 
 
-def test_override_wins_and_prepare_text_returns_the_effective_hash(tmp_path: Path):
+def test_unicode_case_folding_matches_without_keyerror():
+    # re.IGNORECASE matches the long s and dotted capital I; the replacement is
+    # identified by the named group, never by re-lowering the matched text.
+    assert apply_pronunciations("ſync it", {"sync": "sink"}) == "sink it"
+    assert (
+        apply_pronunciations("İstanbul is big", {"istanbul": "iss-tan-bool"})
+        == "iss-tan-bool is big"
+    )
+
+
+def test_compiled_pattern_is_cached():
+    _compiled.cache_clear()
+    mapping = {"kubectl": "cube control"}
+
+    apply_pronunciations("kubectl", mapping)
+    apply_pronunciations("kubectl", mapping)
+
+    info = _compiled.cache_info()
+    assert info.hits >= 1, "the same map must reuse its compiled pattern"
+
+
+def test_override_wins_and_prepare_text_returns_the_spoken_text(tmp_path: Path):
     store = PronunciationStore(tmp_path / "pronunciations.json")
     store.set("nginx", "engine x")
 
-    text, digest = prepare_text(store, "nginx and nginx", {"NGINX": "en-jin-x"})
-
-    assert text == "en-jin-x and en-jin-x"
-    assert digest == pronunciation_hash({"nginx": "en-jin-x"})
-
-
-def test_hash_is_deterministic_and_case_insensitive():
-    assert pronunciation_hash({"A": "x", "b": "y"}) == pronunciation_hash(
-        {"b": "y", "a": "x"}
+    assert prepare_text(store, "nginx and nginx", {"NGINX": "en-jin-x"}) == (
+        "en-jin-x and en-jin-x"
     )
-    assert pronunciation_hash({"a": "x"}) != pronunciation_hash({"a": "z"})
+
+
+def test_validate_rejects_oversized_maps_and_terms():
+    too_many = {f"w{i}": "x" for i in range(MAX_LEXICON_ENTRIES + 1)}
+    with pytest.raises(ValueError, match="limit"):
+        validate_pronunciation_map(too_many)
+
+    with pytest.raises(ValueError, match="limit"):
+        validate_pronunciation_map({"x" * (MAX_LEXICON_TERM_CHARS + 1): "y"})
+    with pytest.raises(ValueError, match="limit"):
+        validate_pronunciation_map({"x": "y" * (MAX_LEXICON_TERM_CHARS + 1)})
+
+
+def test_store_set_enforces_caps_and_allows_replacing_at_the_cap(tmp_path: Path):
+    store = PronunciationStore(tmp_path / "pronunciations.json")
+
+    with pytest.raises(ValueError, match="limit"):
+        store.set("x" * (MAX_LEXICON_TERM_CHARS + 1), "y")
+    with pytest.raises(ValueError, match="limit"):
+        store.set("x", "y" * (MAX_LEXICON_TERM_CHARS + 1))
+
+    path = tmp_path / "pronunciations.json"
+    path.write_text(
+        json.dumps({f"w{i}": "x" for i in range(MAX_LEXICON_ENTRIES)}), "utf-8"
+    )
+    with pytest.raises(ValueError, match="limit"):
+        store.set("new", "y")
+    # Updating an existing key does not grow the map, so it remains allowed.
+    assert store.set("w0", "z")["w0"] == "z"

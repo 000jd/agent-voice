@@ -405,7 +405,7 @@ a failed synthesis round-trip:
 
 ```json
 {
-  "version": "0.3.1",
+  "version": "0.3.2",
   "default_engine": "qwen3_tts_fast",
   "default_voice": "a1b2c3d4e5f6",
   "voices_count": 1,
@@ -709,9 +709,10 @@ lexicon rewrites them before synthesis without changing the text you asked to sp
 - **Per-call overrides.** `speak(..., pronunciations={"kubectl": "cube control"})` and
   `speak_script(..., pronunciations={...})` merge on top of the persistent map for that call
   only; nothing is written to disk. On a script the map applies to every beat.
-- **The cache follows the map.** The effective map's hash is part of the synthesis cache key, so
-  adding, changing or deleting an entry invalidates the old renders instead of serving audio
-  that was spoken the previous way.
+- **The cache follows the spoken text.** Rewriting happens before the cache key is computed,
+  so editing a term invalidates only lines that actually use it; adding an unrelated entry
+  leaves existing renders cached. The lexicon is capped at **500 entries**, with keys and
+  replacements at most **200 characters** each (enforced by the CLI/store and per-call maps).
 - **Subtitles keep the written text.** `.srt`, `.vtt` and `.timing.json` carry the beat text you
   passed in, not the rewritten spoken form — captions show `kubectl`, the audio says
   "cube control".

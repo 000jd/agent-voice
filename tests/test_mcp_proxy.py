@@ -889,3 +889,18 @@ async def test_design_voice_rejects_invalid_candidate_count(tmp_path):
             {"name": "audition", "instruct": "warm", "candidates": 0},
         )
         assert body["error_code"] == "BAD_REQUEST"
+
+
+@pytest.mark.asyncio
+async def test_speak_rejects_oversized_pronunciation_overrides(tmp_path):
+    async with mcp_client(tmp_path) as (client, _app):
+        body = await call_expecting_error(
+            client,
+            "speak",
+            {
+                "text": "hi",
+                "pronunciations": {f"w{i}": "x" for i in range(501)},
+            },
+        )
+        assert body["error_code"] == "BAD_REQUEST"
+        assert "500" in body["message"]

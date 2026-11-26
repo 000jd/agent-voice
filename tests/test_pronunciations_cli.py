@@ -32,3 +32,9 @@ def test_voices_design_exposes_the_candidates_option():
     result = runner.invoke(app, ["voices", "design", "--help"])
     assert result.exit_code == 0
     assert "--candidates" in result.output
+
+
+def test_pronunciations_cli_rejects_oversized_terms():
+    result = runner.invoke(app, ["pronunciations", "set", "x" * 201, "y"])
+    assert result.exit_code == 1
+    assert "limit" in result.output

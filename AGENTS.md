@@ -116,7 +116,8 @@ fastmcp) are legitimately present.
   queue into `429 BACKPRESSURE` instead of unbounded latency.
 - `qwen3_tts_fast` stays strictly serialized: its CUDA graphs are captured at batch 1, so there
   is no micro-batching to add there. Throughput comes from the cache and the queue.
-- The effective pronunciation map is part of the synthesis cache key, so a lexicon edit
-  invalidates old renders; subtitles keep the original written text, never the spoken form.
+- The rewritten spoken text is what the synthesis cache keys on: a lexicon edit invalidates
+  only lines that use the changed term, and unrelated entries leave old renders cached.
+  Subtitles keep the original written text, never the spoken form.
 - Typer sub-commands must not import torch. Defer heavy imports into command bodies.
 - `pyproject.toml`'s core `dependencies` must never gain torch.

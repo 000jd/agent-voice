@@ -758,7 +758,6 @@ class WorkerManager:
         speed: float = 1.0,
         response_format: str = "wav",
         take: int | None = None,
-        pronunciations_hash: str = "",
     ) -> SynthesisResult:
         """Synthesise to a file. Cache is consulted before any worker exists.
 
@@ -769,12 +768,6 @@ class WorkerManager:
         reference clip, speaking a preset timbre, or designing a voice from a
         description. They reach the cache key too, because the same text in the
         same voice is different audio once the delivery changes.
-
-        ``pronunciations_hash`` is the canonical hash of the lexicon map that
-        rewrote ``text`` before this call (see ``pronunciations.prepare_text``). It
-        is opaque here — the rewritten text is what gets spoken — but it belongs in
-        the cache key, so editing the lexicon can never serve audio rendered from
-        the old map.
 
         A non-clone request carries no reference: the worker is told there is no
         ref audio, no transcript and no prompt cache, whatever the caller passed,
@@ -797,7 +790,6 @@ class WorkerManager:
             speed=speed,
             response_format=response_format,
             take=take,
-            pronunciations_hash=pronunciations_hash,
         )
         cached = self.cache.get(cache_key)
         if cached is not None:
@@ -1077,7 +1069,6 @@ class WorkerManager:
         seed: int | None = None,
         speed: float = 1.0,
         take: int | None = None,
-        pronunciations_hash: str = "",
     ) -> tuple[uuid.UUID, asyncio.Queue[bytes], str]:
         """Start a PCM stream. Returns (stream_id, queue, streaming_mode).
 
@@ -1092,10 +1083,6 @@ class WorkerManager:
         stream has no cache entry and no ``SynthesisResult`` to report it on, so it
         cannot select a stored alternate delivery. It still derives the seed (see
         :meth:`effective_seed`), so take=2 does stream different audio.
-
-        ``pronunciations_hash`` is accepted for the same symmetry and is likewise
-        unused: a stream is never cached, and the rewrite has already been applied
-        to ``text`` by the caller.
         """
         resolved_seed = self.effective_seed(seed, take)
         # Hold the engine lock until the streaming RPC has been sent and its
@@ -1391,7 +1378,6 @@ class WorkerManager:
         mode: ModelMode = "clone",
         speaker: str | None = None,
         instruct: str = "",
-        pronunciations_hash: str = "",
     ) -> str:
         record = self.registry.get(engine_id)
         # Which weights this alias resolves to belongs in the key: re-pointing an
@@ -1441,10 +1427,6 @@ class WorkerManager:
             mode=mode,
             speaker=speaker or "",
             instruct=instruct or "",
-            # The lexicon's identity is keyed next to the text it produced, so a
-            # changed map is visible in the key itself rather than only through
-            # whatever its rewrite happened to alter.
-            pronunciations=pronunciations_hash,
             hf_repo=hf_repo,
             model_revision=revision,
         )

@@ -15,6 +15,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .pronunciations import validate_pronunciation_map
+
 PROTOCOL_VERSION = 1
 
 SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_]{1,40}$")
@@ -397,6 +399,12 @@ class SpeakRequest(BaseModel):
     pronunciations: dict[str, str] | None = None
     """Per-call word -> spoken-form overrides merged over data/pronunciations.json."""
 
+    @field_validator("pronunciations")
+    @classmethod
+    def _pronunciations(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        validate_pronunciation_map(value)
+        return value
+
 
 class SpeechRequest(BaseModel):
     """Canonical OpenAI /v1/audio/speech body."""
@@ -473,6 +481,12 @@ class ScriptRequest(BaseModel):
     export_srt: bool = True
     pronunciations: dict[str, str] | None = None
     """Per-call overrides applied to every beat's spoken text."""
+
+    @field_validator("pronunciations")
+    @classmethod
+    def _pronunciations(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        validate_pronunciation_map(value)
+        return value
 
 
 class BeatTiming(BaseModel):

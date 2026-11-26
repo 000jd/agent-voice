@@ -125,9 +125,9 @@ async def run_synthesis(
     _validate_text(request, text)
 
     # Validated before the rewrite on purpose: the limit is about what the caller
-    # sent. The spoken form and the hash of the map that produced it travel
-    # together, so a lexicon edit invalidates exactly the audio it changes.
-    text, pronunciations_hash = prepare_text(ctx.pronunciations, text, pronunciations)
+    # sent. The rewritten spoken text is what gets spoken and what the cache keys
+    # on, so an unrelated lexicon edit leaves existing lines cached.
+    text = prepare_text(ctx.pronunciations, text, pronunciations)
 
     if openai_voice_compat:
         # Either a local voice or a preset speaker comes back; routing turns that
@@ -166,7 +166,6 @@ async def run_synthesis(
         speed=speed,
         response_format=response_format,
         take=take,
-        pronunciations_hash=pronunciations_hash,
     )
 
 

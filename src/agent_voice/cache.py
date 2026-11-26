@@ -40,9 +40,6 @@ CACHE_KEY_FIELDS: tuple[str, ...] = (
     "mode",
     "speaker",
     "instruct",
-    # v0.3.1: the pronunciation map changes the spoken form, so its canonical
-    # hash belongs in the key. Updating the lexicon must never reuse old audio.
-    "pronunciations",
     "hf_repo",
     "model_revision",
 )

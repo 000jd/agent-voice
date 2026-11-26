@@ -1141,7 +1141,8 @@ def pronunciations_set(word: str, replacement: str) -> None:
     """Set one entry. Matching is case-insensitive and whole-word.
 
     The map is read on every synthesis request, so an edit here reaches a running
-    daemon immediately; the change also invalidates the cached audio it affects.
+    daemon immediately. The rewritten spoken text is what the cache keys on, so
+    only lines that use the changed term are invalidated.
     """
     from .pronunciations import PronunciationStore
 

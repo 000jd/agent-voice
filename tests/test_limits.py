@@ -88,3 +88,17 @@ def test_instruct_cap_is_configurable(tmp_path: Path):
 
     assert rejected.status_code == 413
     assert allowed.status_code == 200
+
+
+def test_websocket_rejects_oversized_text_without_closing(client):
+    with client.websocket_connect("/v1/audio/ws") as websocket:
+        websocket.send_json({"type": "speak", "text": "x" * 20_001})
+        frame = websocket.receive_json()
+
+        assert frame["type"] == "error"
+        assert frame["error_code"] == "TEXT_TOO_LONG"
+        assert "limit" in frame["message"]
+
+        # The socket must stay usable for the next request.
+        websocket.send_json({"type": "ping"})
+        assert websocket.receive_json() == {"type": "pong"}

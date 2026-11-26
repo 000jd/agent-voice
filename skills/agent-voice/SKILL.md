@@ -159,8 +159,10 @@ it. Returns `file_path` (read it), `download_url`, `duration_sec`, `mode`, `spea
 
 `speak` and `speak_script` also take `pronunciations={...}` — per-call word → spoken-form
 overrides merged over the operator's persistent `data/pronunciations.json`. Matching is
-case-insensitive and whole-word, it changes only what the engine says, and the cache follows
-the map (an edit invalidates old audio). Subtitles keep the written text.
+case-insensitive and whole-word, and it changes only what the engine says. The cache keys on
+the rewritten spoken text, so an edit invalidates only lines that use the changed term; an
+unrelated entry leaves old renders cached. The lexicon is capped at 500 entries and 200
+characters per key/replacement. Subtitles keep the written text.
 
 **Multi-beat narration** (podcast, video, explainer) — each beat can use a different mode:
 

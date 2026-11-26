@@ -42,8 +42,8 @@ async def _open_stream(
             "Split the input or use speak_script.",
         )
     # Rewritten after the length check, so the limit applies to what the caller
-    # sent; the hash of the effective map rides along with the spoken form.
-    text, pronunciations_hash = prepare_text(ctx.pronunciations, text, pronunciations)
+    # sent. The spoken form itself is the cache discriminator.
+    text = prepare_text(ctx.pronunciations, text, pronunciations)
     target = resolve_target(
         settings=ctx.settings,
         registry=ctx.registry,
@@ -71,7 +71,6 @@ async def _open_stream(
         instruct=target.instruct,
         language=language,
         speed=speed,
-        pronunciations_hash=pronunciations_hash,
     )
     return ctx, target, stream_id, queue, mode
 
@@ -144,15 +143,31 @@ async def audio_ws(websocket: WebSocket):
 
     async def pump(payload: dict) -> None:
         nonlocal current
+        raw_text = payload.get("text") or payload.get("input") or ""
+        if len(raw_text) > ctx.settings.max_text_chars:
+            # Same admission rule as the chunked HTTP route: the caller is told
+            # off for what it sent, before any rewrite or worker exists.
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "error_code": "TEXT_TOO_LONG",
+                    "message": (
+                        f"text is {len(raw_text)} characters, limit is "
+                        f"{ctx.settings.max_text_chars}"
+                    ),
+                    "suggestion": "Split the input or use speak_script.",
+                }
+            )
+            return
         # Whichever timbre the request asked for, by preset name or instruction,
         # travels the same path as on the HTTP stream: routing decides the model.
         speaker = payload.get("speaker")
         instruct = payload.get("instruct") or ""
         # Rewritten exactly the way the chunked route does it, so a socket client
         # and an HTTP client hear the same spoken form for the same line.
-        text, pronunciations_hash = prepare_text(
+        text = prepare_text(
             ctx.pronunciations,
-            payload.get("text") or payload.get("input") or "",
+            raw_text,
             payload.get("pronunciations"),
         )
         target = resolve_target(
@@ -180,7 +195,6 @@ async def audio_ws(websocket: WebSocket):
             instruct=target.instruct,
             language=payload.get("language", "Auto"),
             speed=float(payload.get("speed", 1.0)),
-            pronunciations_hash=pronunciations_hash,
         )
         current = {"engine": target.engine_id, "stream_id": stream_id}
         await websocket.send_json(
