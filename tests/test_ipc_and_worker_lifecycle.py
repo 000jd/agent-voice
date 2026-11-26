@@ -431,3 +431,182 @@ async def _next_frame(connection) -> tuple[int, bytes]:
     frame_type, payload_len = decode_header(header)
     payload = await connection._reader.readexactly(payload_len)
     return frame_type, payload
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: job reconciliation and pruning are actually wired to startup
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_on_startup_marks_interrupted_jobs(tmp_path):
+    """A job left running by a dead process can never resume; it must not lie."""
+    import json
+
+    from agent_voice.job_store import JobStore
+    from agent_voice.schemas import ErrorCode
+
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True)
+    now = 1_700_000_000.0
+    for job_id, status in [
+        ("a" * 16, "pending"),
+        ("b" * 16, "running"),
+        ("c" * 16, "succeeded"),
+    ]:
+        (jobs_dir / f"{job_id}.json").write_text(
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "kind": "script",
+                    "status": status,
+                    "progress": 0.4,
+                    "message": "",
+                    "created_at": now,
+                    "updated_at": now,
+                    "result": None,
+                    "error": None,
+                }
+            ),
+            "utf-8",
+        )
+
+    store = JobStore(jobs_dir)
+    assert store.reconcile_on_startup() == 2
+
+    for job_id in ("a" * 16, "b" * 16):
+        job = store.get(job_id)
+        assert job.status == "failed"
+        assert job.error is not None
+        assert job.error.error_code == ErrorCode.DAEMON_RESTARTED
+    assert store.get("c" * 16).status == "succeeded"
+    # Idempotent: a second boot must not re-report them.
+    assert store.reconcile_on_startup() == 0
+
+
+def test_unknown_job_suggestion_does_not_lie(tmp_path):
+    """Jobs persist under data/jobs/, so the message must not call them ephemeral."""
+    from agent_voice.job_store import JobStore
+
+    store = JobStore(tmp_path / "jobs")
+    with pytest.raises(AgentVoiceError) as excinfo:
+        store.get("doesnotexist")
+    assert "ephemeral" not in excinfo.value.suggestion.lower()
+    assert "jobs" in excinfo.value.suggestion.lower()
+
+
+def test_prune_removes_only_old_records(tmp_path):
+    import os
+    import time
+
+    from agent_voice.job_store import JobStore
+
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True)
+    store = JobStore(jobs_dir)
+    old = store.create("script")
+    fresh = store.create("script")
+
+    stale_time = time.time() - 48 * 3600
+    os.utime(jobs_dir / f"{old.job_id}.json", (stale_time, stale_time))
+
+    assert store.prune() >= 1
+    assert not (jobs_dir / f"{old.job_id}.json").exists()
+    assert (jobs_dir / f"{fresh.job_id}.json").exists()
+
+
+def test_app_lifespan_reconciles_and_prunes(tmp_path):
+    """The wiring itself: startup must reconcile, not just offer the method."""
+    import json
+
+    from agent_voice.api.app import create_app
+    from agent_voice.config import Settings
+
+    data_dir = tmp_path / "data"
+    jobs_dir = data_dir / "jobs"
+    jobs_dir.mkdir(parents=True)
+    stray = "d" * 16
+    (jobs_dir / f"{stray}.json").write_text(
+        json.dumps(
+            {
+                "job_id": stray,
+                "kind": "script",
+                "status": "running",
+                "progress": 0.2,
+                "message": "",
+                "created_at": 1_700_000_000.0,
+                "updated_at": 1_700_000_000.0,
+                "result": None,
+                "error": None,
+            }
+        ),
+        "utf-8",
+    )
+
+    settings = Settings(
+        DATA_DIR=data_dir,
+        ENGINES_DIR=REPO_ROOT / "engines",
+        AGENT_VOICE_DEFAULT_ENGINE="mock",
+        MCP_BASE_PATH="",
+    )
+    app = create_app(settings=settings, mount_mcp=False)
+    from fastapi.testclient import TestClient
+
+    with TestClient(app):
+        pass
+
+    job = app.state.ctx.jobs.get(stray)
+    assert job.status == "failed"
+    assert job.error.error_code == "DAEMON_RESTARTED"
+
+
+def test_app_lifespan_prunes_stale_job_files(tmp_path):
+    """A terminal job older than the retention window is deleted at startup.
+
+    Terminal status on purpose: reconcile rewrites interrupted jobs (giving them
+    a fresh mtime), while prune is what drops records no caller can still poll.
+    """
+    import json
+    import os
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from agent_voice.api.app import create_app
+    from agent_voice.config import Settings
+
+    data_dir = tmp_path / "data"
+    jobs_dir = data_dir / "jobs"
+    jobs_dir.mkdir(parents=True)
+    stale = "e" * 16
+    path = jobs_dir / f"{stale}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "job_id": stale,
+                "kind": "script",
+                "status": "succeeded",
+                "progress": 1.0,
+                "message": "",
+                "created_at": 1_700_000_000.0,
+                "updated_at": 1_700_000_000.0,
+                "result": None,
+                "error": None,
+            }
+        ),
+        "utf-8",
+    )
+    old = time.time() - 48 * 3600
+    os.utime(path, (old, old))
+
+    settings = Settings(
+        DATA_DIR=data_dir,
+        ENGINES_DIR=REPO_ROOT / "engines",
+        AGENT_VOICE_DEFAULT_ENGINE="mock",
+        MCP_BASE_PATH="",
+    )
+    app = create_app(settings=settings, mount_mcp=False)
+
+    with TestClient(app):
+        pass
+
+    assert not path.exists(), "startup must prune records past the retention window"

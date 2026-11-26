@@ -433,7 +433,10 @@ async def test_mutation_disabled_blocks_register_engine(tmp_path):
     async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
         names = {tool.name for tool in await client.list_tools()}
         assert "register_engine" not in names
-        assert len(names) == 10
+        # 11 since v0.2.1: delete_voice moved into core so an agent can clean up
+        # a bad clone without dropping to the CLI.
+        assert len(names) == 11
+        assert "delete_voice" in names
 
 
 @pytest.mark.asyncio
@@ -573,3 +576,52 @@ def test_proxy_builds_with_custom_headers(tmp_path):
     settings = _settings(tmp_path, AGENT_VOICE_API_KEY="k")
     proxy = build_proxy(settings, client_id="agent-a")
     assert proxy is not None
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: tool descriptions must stay compact
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_core_tool_descriptions_stay_within_budget(tmp_path):
+    """The core surface is prompt budget an agent pays on every request.
+
+    Detailed guidance belongs in the agent-voice://guide resource; a tool
+    description should say what it does and which fields matter, then stop.
+    """
+    async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
+        tools = await client.list_tools()
+        total = sum(len(tool.description or "") for tool in tools)
+        # ~4 chars per token; 1600 tokens is the budget agreed for the core set.
+        assert total < 6400, (
+            f"core tool descriptions are {total} chars (~{total // 4} tokens); "
+            "move detail into skills/agent-voice/SKILL.md"
+        )
+
+
+@pytest.mark.asyncio
+async def test_every_tool_has_a_description(tmp_path):
+    async with mcp_client(tmp_path) as (client, _app):
+        for tool in await client.list_tools():
+            assert tool.description, f"{tool.name} has no description"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: resources and prompt
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_guide_and_voices_resources_are_registered(tmp_path):
+    async with mcp_client(tmp_path) as (client, _app):
+        uris = {str(resource.uri) for resource in await client.list_resources()}
+        assert "agent-voice://voices" in uris
+        assert "agent-voice://guide" in uris
+
+
+@pytest.mark.asyncio
+async def test_narrate_video_prompt_is_registered(tmp_path):
+    async with mcp_client(tmp_path) as (client, _app):
+        names = {prompt.name for prompt in await client.list_prompts()}
+        assert "narrate_video" in names

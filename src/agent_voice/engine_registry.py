@@ -441,8 +441,15 @@ class EngineRegistry:
         engine_yaml_content: str,
         pyproject_toml_content: str | None = None,
         worker_py_content: str | None = None,
+        staging: bool = False,
     ) -> EngineRecord:
-        """Scaffold a new plugin. Slug-validated, no path traversal, schema-checked."""
+        """Scaffold a new plugin. Slug-validated, no path traversal, schema-checked.
+
+        With ``staging=True`` the plugin is written to ``engines/.pending/<id>/``
+        where discovery cannot see it, and an operator promotes it with
+        :meth:`approve_engine`. That is the single implementation both the MCP
+        server and the CLI use; there is deliberately no second copy.
+        """
         validate_slug(engine_id)
         if re.search(r"[\\/]|\.\.", engine_id):
             raise AgentVoiceError(
@@ -476,7 +483,7 @@ class EngineRegistry:
             )
         EngineManifest(**raw)  # raises on schema violation
 
-        directory = self.engines_dir / engine_id
+        directory = self.pending_dir / engine_id if staging else self.engines_dir / engine_id
         if directory.exists():
             raise AgentVoiceError(
                 ErrorCode.BAD_REQUEST,
@@ -494,6 +501,74 @@ class EngineRegistry:
                 _atomic_write_text(directory / "pyproject.toml", pyproject_toml_content)
             if worker_py_content:
                 _atomic_write_text(directory / WORKER_NAME, worker_py_content)
+            if not staging:
+                self.reload()
+
+        if staging:
+            # Staged plugins are intentionally absent from the live registry, so
+            # return a record describing the staged directory rather than
+            # self.get(), which would raise.
+            return self._load_engine(directory)
+        return self.get(engine_id)
+
+    @property
+    def pending_dir(self) -> Path:
+        return self.engines_dir / ".pending"
+
+    def list_pending(self) -> list[str]:
+        """Engine ids staged for operator approval."""
+        if not self.pending_dir.is_dir():
+            return []
+        return sorted(
+            entry.name
+            for entry in self.pending_dir.iterdir()
+            if entry.is_dir() and (entry / MANIFEST_NAME).is_file()
+        )
+
+    def approve_engine(self, engine_id: str) -> EngineRecord:
+        """Promote ``engines/.pending/<id>/`` to live, validating first.
+
+        Refuses to overwrite an installed engine: a silent replacement could swap
+        code an operator already trusted for code they have not read.
+        """
+        validate_slug(engine_id)
+        staged = self.pending_dir / engine_id
+        destination = self.engines_dir / engine_id
+
+        if not staged.is_dir():
+            raise AgentVoiceError(
+                ErrorCode.ENGINE_NOT_FOUND,
+                f"no staged engine: {engine_id}",
+                f"Staged plugins: {self.list_pending() or '(none)'}",
+            )
+        if destination.exists():
+            raise AgentVoiceError(
+                ErrorCode.BAD_REQUEST,
+                f"engine '{engine_id}' is already installed",
+                "Remove the installed plugin first if you really mean to replace it.",
+            )
+
+        # Validate the manifest before it becomes importable.
+        raw = yaml.safe_load((staged / MANIFEST_NAME).read_text("utf-8")) or {}
+        if not isinstance(raw, dict):
+            raise AgentVoiceError(
+                ErrorCode.MANIFEST_INVALID,
+                f"{MANIFEST_NAME} in the staged plugin is not a mapping",
+                "Fix the manifest in engines/.pending and retry.",
+            )
+        raw.setdefault("engine_id", engine_id)
+        EngineManifest(**raw)
+        if not (staged / WORKER_NAME).is_file():
+            raise AgentVoiceError(
+                ErrorCode.MANIFEST_INVALID,
+                f"staged plugin '{engine_id}' has no {WORKER_NAME}",
+                "A plugin without a worker cannot run.",
+            )
+
+        with self._lock:
+            import shutil
+
+            shutil.move(str(staged), str(destination))
             self.reload()
 
         return self.get(engine_id)

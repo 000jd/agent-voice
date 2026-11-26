@@ -227,9 +227,8 @@ tools = await client.get_tools()
 | `speak` | core | Synthesise one utterance, return a file path |
 | `speak_script` | core | Multi-beat script with exact per-beat timings and SRT/VTT |
 | `start_script_job` / `get_job` / `cancel_job` | core | Long scripts and other async work |
-| `clone_voice` / `list_voices` | core | Manage reference voices |
+| `clone_voice` / `list_voices` / `delete_voice` | core | Manage reference voices |
 | `gpu_status` / `unload_models` | core | Inspect and free the GPU |
-| `delete_voice` | full | Remove a voice and its cached prompts |
 | `set_agent_binding` / `list_agent_bindings` | full | Per-agent voice routing |
 | `list_engines` / `list_models` | full | Discover engines, models, install state |
 | `download_model` / `register_model` / `register_engine` / `install_engine` | full | Agent-driven self-management |
@@ -248,7 +247,7 @@ a failed synthesis round-trip:
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.1",
   "default_engine": "qwen3_tts_fast",
   "default_voice": "a1b2c3d4e5f6",
   "voices_count": 1,
@@ -450,6 +449,25 @@ ffmpeg -y -i media/videos/scene/1080p30/NarratedClip.mp4 \
        -c:v copy -c:a aac -shortest out.mp4
 ```
 
+#### Runnable example
+
+[`examples/manim_demo/`](examples/manim_demo/) does the whole pipeline end to end:
+it asks for the script, reads `.timing.json`, times the scene from it, renders
+with Manim, and muxes the narration with `ffmpeg`.
+
+```bash
+uv pip install -e ".[demo]"      # adds manim; the core daemon stays lean
+uv run python examples/manim_demo/run_demo.py --engine mock   # no GPU needed
+uv run python examples/manim_demo/run_demo.py                 # configured engine
+```
+
+Without `--engine`, it uses the engine and default voice from `.env`. A cloning engine
+needs a registered voice, so on a clean checkout either use `--engine mock` or clone one
+first.
+
+It prints the per-beat timings, the audio and video durations, and the drift
+between them, and exits non-zero if they disagree by more than 750 ms.
+
 ## Agent skill
 
 An installable skill for coding agents lives at
@@ -481,7 +499,7 @@ an agent.
   | value | Tools exposed |
   |---|---|
   | `auto` (default) | `core`, plus the management tools when mutation is enabled |
-  | `core` | Synthesis, voices read/clone, GPU status. No engine/model management at all |
+  | `core` | Synthesis, voices clone/read/delete, GPU status. No engine/model management at all |
   | `full` | Everything, so the per-call loopback + mutation guard answers with an actionable error |
 
   `core` is the right choice for an agent that only needs to make audio: a shorter tool list costs
@@ -573,6 +591,7 @@ hello          PASS    protocol_version=1 engine_id=mock backend=mock 1 streamin
 load_model     PASS    alias=mock-tone loaded_models=['mock-tone']
 synthesize     PASS    1.92 s of audio in 0.27 s -> conformance.wav
 cancel         PASS    cancel acknowledged, cancelled=True
+health         PASS    ok=True loaded_models=['mock-tone'] in_flight=0
 shutdown       PASS    acknowledged, exited rc=0 in 0.05 s
 mock: IPC v1 conformance passed
 ```
@@ -580,15 +599,16 @@ mock: IPC v1 conformance passed
 The steps are `spawn+connect`, `hello` (asserts `protocol_version == 1` and the engine id matches),
 `load_model` (the registry's default alias), `synthesize` (asserts a WAV exists with duration > 0),
 `cancel` (starts a stream, then cancels it; a cancel acknowledgement — including a `JOB_CANCELLED`
-result — passes) and `shutdown`. Skipped steps are reported as `SKIP` with the reason, never as a
-pass.
+result — passes), `health` (asserts `ok=true` and reports the resident models and in-flight
+requests) and `shutdown`. Skipped steps are reported as `SKIP` with the reason, never as a pass.
 
 ### `engines pending` / `engines approve <id>`
 
 With `REQUIRE_ENGINE_APPROVAL=true`, agent-authored plugins land in `engines/.pending/<id>/`.
-`engines pending` lists them; `engines approve <id>` validates the staged manifest, moves the
-directory to `engines/<id>/`, and reloads the registry. It refuses to overwrite an existing engine
-directory, and a manifest that cannot load blocks the move.
+`engines pending` lists them. `engines approve <id>` prints the engine's model list and the
+`worker.py` SHA-256, asks for confirmation (`--yes` skips the prompt for scripts), validates the
+staged manifest, moves the directory to `engines/<id>/`, and reloads the registry. It refuses to
+overwrite an existing engine directory, and a manifest that cannot load blocks the move.
 
 ### `cache stats` / `cache clear`
 

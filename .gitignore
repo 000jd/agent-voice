@@ -37,3 +37,8 @@ htmlcov/
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Manim demo output
+examples/manim_demo/media/
+examples/manim_demo/out/
+examples/manim_demo/timings.json

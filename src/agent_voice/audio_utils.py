@@ -40,6 +40,42 @@ def _run(argv: list[str], *, timeout: float = 120.0) -> subprocess.CompletedProc
     )
 
 
+_BANNER_PREFIXES = (
+    "ffmpeg version",
+    "ffprobe version",
+    "configuration:",
+    "built with",
+    "libav",
+    "Input #0",
+    "Output #0",
+    "Stream mapping:",
+    "Press [q]",
+    "  Metadata:",
+    "    encoder",
+    "    handler_name",
+    "    vendor_id",
+    "    creation_time",
+)
+
+
+def _ffmpeg_error_tail(stderr: bytes, *, lines: int = 3, limit: int = 250) -> str:
+    """The useful end of an ffmpeg/ffprobe stderr, without the build banner.
+
+    ffmpeg always prints its version, compiled-in ``configuration:`` line and
+    stream metadata before the actual complaint, so a naive ``stderr[:300]``
+    shows an agent the build flags instead of what went wrong. Keep the last few
+    meaningful lines and cap the length.
+    """
+    text = stderr.decode("utf-8", errors="replace")
+    meaningful = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith(_BANNER_PREFIXES)
+    ]
+    tail = " | ".join(meaningful[-lines:]) if meaningful else text.strip()
+    return tail[:limit]
+
+
 def _require_ffmpeg() -> None:
     from shutil import which
 
@@ -75,7 +111,7 @@ def probe_duration(path: Path) -> float:
     if result.returncode != 0:
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"ffprobe failed: {result.stderr.decode('utf-8', 'replace')[:300]}",
+            f"ffprobe failed: {_ffmpeg_error_tail(result.stderr)}",
             "Provide a decodable audio file.",
         )
     try:
@@ -128,7 +164,7 @@ def canonicalise_ref_audio(
     if result.returncode != 0:
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"could not decode reference audio: {result.stderr.decode('utf-8', 'replace')[:300]}",
+            f"could not decode reference audio: {_ffmpeg_error_tail(result.stderr)}",
             "Supply a WAV/MP3/FLAC/OGG file ffmpeg can read.",
         )
 
@@ -230,7 +266,7 @@ def convert_audio(
     if result.returncode != 0:
         raise AgentVoiceError(
             ErrorCode.INTERNAL_ERROR,
-            f"audio conversion failed: {result.stderr.decode('utf-8', 'replace')[:300]}",
+            f"audio conversion failed: {_ffmpeg_error_tail(result.stderr)}",
             "Check that ffmpeg has the required encoder compiled in.",
         )
     return destination
@@ -333,7 +369,7 @@ def fit_segment(
         if result.returncode != 0:
             raise AgentVoiceError(
                 ErrorCode.INTERNAL_ERROR,
-                f"pad fit failed: {result.stderr.decode('utf-8', 'replace')[:200]}",
+                f"pad fit failed: {_ffmpeg_error_tail(result.stderr)}",
                 "Check ffmpeg apad availability.",
             )
         return target_duration_sec
@@ -369,7 +405,7 @@ def fit_segment(
         if result.returncode != 0:
             raise AgentVoiceError(
                 ErrorCode.INTERNAL_ERROR,
-                f"atempo fit failed: {result.stderr.decode('utf-8', 'replace')[:200]}",
+                f"atempo fit failed: {_ffmpeg_error_tail(result.stderr)}",
                 "Check ffmpeg atempo availability.",
             )
         return probe_duration(destination)

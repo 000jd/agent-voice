@@ -225,117 +225,91 @@ def engines_install(engine_id: str) -> None:
 # -- staged plugins (REQUIRE_ENGINE_APPROVAL) --------------------------------
 
 
-def _pending_dir() -> Path:
-    """Where register_engine stages a plugin awaiting operator approval."""
-    return get_settings().engines_dir / ".pending"
-
-
-def _staged_plugins(pending_dir: Path) -> list[Path]:
-    """Directories under `.pending/` that carry an engine.yaml.
-
-    A missing `.pending/` is normal — staging is opt-in — so it yields an empty
-    list rather than an error.
-    """
-    if not pending_dir.is_dir():
-        return []
-    return sorted(
-        path
-        for path in pending_dir.iterdir()
-        if path.is_dir() and (path / "engine.yaml").is_file()
-    )
-
-
 @engines_app.command("pending")
 def engines_pending() -> None:
     """List plugins staged under engines/.pending/ awaiting approval."""
-    pending_dir = _pending_dir()
+    from .engine_registry import EngineRegistry
+
+    settings = get_settings()
+    registry = EngineRegistry(settings.engines_dir)
     _print(
         [
-            {"engine_id": path.name, "path": str(path)}
-            for path in _staged_plugins(pending_dir)
+            {"engine_id": engine_id, "path": str(registry.pending_dir / engine_id)}
+            for engine_id in registry.list_pending()
         ]
     )
 
 
 @engines_app.command("approve")
-def engines_approve(engine_id: str) -> None:
-    """Promote a staged plugin from engines/.pending/<id>/ to engines/<id>/."""
-    import shutil
-
-    import yaml
+def engines_approve(
+    engine_id: str,
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the confirmation prompt (for scripts)."
+    ),
+) -> None:
+    """Promote a staged plugin to engines/<id>/, after showing what it contains."""
+    import hashlib
 
     from .engine_registry import EngineRegistry
-    from .schemas import EngineManifest, validate_slug
+    from .schemas import AgentVoiceError
 
     settings = get_settings()
-    pending_dir = settings.engines_dir / ".pending"
-    staged = pending_dir / engine_id
-    destination = settings.engines_dir / engine_id
+    registry = EngineRegistry(settings.engines_dir)
+    staged = registry.pending_dir / engine_id
 
-    try:
-        validate_slug(engine_id)
-    except ValueError as exc:
-        typer.secho(f"invalid engine id {engine_id!r}: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
-
-    if not (staged / "engine.yaml").is_file():
+    if not staged.is_dir():
         typer.secho(f"no staged plugin at {staged}", fg=typer.colors.RED, err=True)
-        available = [path.name for path in _staged_plugins(pending_dir)]
-        typer.echo(f"staged: {', '.join(available) if available else '(none)'}")
+        typer.echo(f"staged: {', '.join(registry.list_pending()) or '(none)'}")
         raise typer.Exit(code=1)
 
-    # Validate before moving. Promoting a manifest that cannot load would leave a
-    # broken directory in engines/ that the registry silently skips.
+    # Show the operator what they are about to activate. This is the whole point
+    # of staging: an agent wrote this code, and a human approves it after reading
+    # what it claims to be and how it differs from what was reviewed.
+    manifest = None
     try:
-        raw = yaml.safe_load((staged / "engine.yaml").read_text("utf-8")) or {}
-        manifest = EngineManifest(**raw)
-    except Exception as exc:  # noqa: BLE001 - any parse/validation failure blocks approval
+        import yaml
+
+        from .engine_registry import EngineManifest
+
+        manifest = EngineManifest(
+            **yaml.safe_load((staged / "engine.yaml").read_text("utf-8"))
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable manifest blocks approval
         typer.secho(f"staged manifest is not usable: {exc}", fg=typer.colors.RED, err=True)
         typer.echo("Nothing was moved.", err=True)
         raise typer.Exit(code=1) from exc
 
-    if manifest.engine_id != engine_id:
-        typer.secho(
-            f"manifest engine_id '{manifest.engine_id}' does not match '{engine_id}'",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        typer.echo("Nothing was moved.", err=True)
-        raise typer.Exit(code=1)
+    worker_path = staged / "worker.py"
+    worker_sha = (
+        hashlib.sha256(worker_path.read_bytes()).hexdigest()
+        if worker_path.is_file()
+        else "(no worker.py)"
+    )
+    typer.echo(f"plugin    : {manifest.engine_id}")
+    typer.echo(f"backend   : {manifest.backend_name} {manifest.backend_version}")
+    typer.echo(f"models    : {[m.alias for m in manifest.models] or '(none)'}")
+    typer.echo(f"worker.py : {worker_sha}")
+    typer.echo(f"from      : {staged}")
 
-    if destination.exists():
-        typer.secho(
-            f"refusing to overwrite existing engine directory: {destination}",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        typer.echo(
-            "Delete or rename it first; approving never replaces a live plugin.", err=True
-        )
-        raise typer.Exit(code=1)
+    if not yes:
+        typer.confirm("Activate this plugin? It will be runnable by the daemon.", abort=True)
 
-    shutil.move(str(staged), str(destination))
-    # A fresh registry instance, so the reload reflects the directory on disk
-    # rather than any state this process happened to hold.
-    registry = EngineRegistry(settings.engines_dir)
     try:
-        record = registry.get(engine_id)
-    except Exception as exc:  # noqa: BLE001 - the move already happened; report it
-        typer.secho(
-            f"moved to {destination}, but the registry does not list it: {exc}",
-            fg=typer.colors.RED,
-            err=True,
-        )
+        record = registry.approve_engine(engine_id)
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        typer.echo("Nothing was moved.", err=True)
         raise typer.Exit(code=1) from exc
 
     _print(
         {
             "approved": engine_id,
-            "from": str(staged),
-            "to": str(destination),
+            "to": str(record.directory),
+            "worker_sha256": worker_sha,
             "installed": record.installed,
             "why_unavailable": record.why_unavailable,
-            "engines": registry.ids(),
         }
     )
     if not record.installed:
@@ -354,6 +328,7 @@ STEP_NAMES: tuple[str, ...] = (
     "load_model",
     "synthesize",
     "cancel",
+    "health",
     "shutdown",
 )
 
@@ -456,6 +431,37 @@ def _reference_voice(voices) -> tuple[str, str, bool]:
         str(voices.ref_wav_path(candidate.voice_id)),
         candidate.ref_text,
         candidate.x_vector_only_mode,
+    )
+
+
+def _probe_voice(voices, tmpdir: Path):
+    """Register a synthetic reference voice so a cloning engine can be tested.
+
+    The Qwen Base checkpoints cannot synthesise at all without a reference clip,
+    so `engines test <cloning engine>` would fail on a clean checkout with no
+    voices registered. A deterministic 6 s formant tone is enough to exercise the
+    whole pipeline; it is registered under a reserved name and removed by the
+    caller in a finally block.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    sr = 24_000
+    seconds = 6.0
+    n = int(sr * seconds)
+    t = np.linspace(0, seconds, n, endpoint=False)
+    signal = (
+        0.18 * np.sin(2 * np.pi * 180 * t)
+        + 0.10 * np.sin(2 * np.pi * 640 * t)
+        + 0.05 * np.sin(2 * np.pi * 1200 * t)
+    )
+    path = tmpdir / "probe-ref.wav"
+    sf.write(path, signal.astype(np.float32), sr, subtype="PCM_16")
+    return voices.add(
+        name="agent-voice-probe",
+        source_path=path,
+        ref_text="This is a synthetic reference clip used for engine conformance testing.",
+        x_vector_only=False,
     )
 
 
@@ -563,15 +569,16 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
         # -- synthesize -------------------------------------------------
         ref_wav, ref_text, x_vector_only = _reference_voice(voices)
         if not ref_wav and record.manifest.capabilities.voice_clone:
-            steps.append(
-                _Step(
-                    "synthesize",
-                    False,
-                    "engine clones voices but no reference voice is registered; run "
-                    "`agent-voice voices add <name> <wav>`",
-                )
+            # A cloning engine cannot synthesise without a reference, so a clean
+            # checkout would fail here. Register a synthetic one for the duration
+            # of the test instead of demanding manual setup.
+            probe = _probe_voice(voices, workdir)
+            ref_wav = str(voices.ref_wav_path(probe.voice_id))
+            ref_text = probe.ref_text
+            x_vector_only = probe.x_vector_only_mode
+            typer.echo(
+                "  (no voice registered: using a synthetic probe voice for conformance)"
             )
-            return _skip_rest(steps, "cannot synthesise without a voice")
 
         wav_path = workdir / "conformance.wav"
         started = time.perf_counter()
@@ -622,11 +629,20 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
         # A long text, so the cancel reliably lands while audio is still coming.
         stream_text = " ".join(["conformance"] * 60)
         try:
+            voice_id = None
+            if ref_wav:
+                # Without a reference the cloning engines never decode at all, so
+                # the cancel below would acknowledge a stream that never started
+                # and prove nothing. Reuse whichever voice the synthesize step used.
+                for candidate in voices.list():
+                    if str(voices.ref_wav_path(candidate.voice_id)) == ref_wav:
+                        voice_id = candidate.voice_id
+                        break
             stream_id, queue, _mode = await manager.stream(
                 engine_id=engine_id,
                 model_alias=alias,
                 text=stream_text,
-                voice_id=None,
+                voice_id=voice_id,
                 ref_text=ref_text,
                 x_vector_only=x_vector_only,
             )
@@ -669,6 +685,10 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
             ).strip()
         if not first_chunk:
             detail += "; no audio arrived before the cancel"
+            # Without real audio in flight, a cancel acknowledgement proves only
+            # that the worker answers RPCs. Report that honestly rather than
+            # letting the step pass on a no-op.
+            cancel_ok = False
         steps.append(_Step("cancel", cancel_ok, detail))
 
         # Let the background stream task unwind and drop the engine lock before
@@ -677,6 +697,27 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
         if task is not None and not task.done():
             with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
                 await asyncio.wait_for(asyncio.shield(task), timeout=30.0)
+
+        # -- health -----------------------------------------------------
+        # The protocol's health RPC is what a manager uses to check a live
+        # worker, so a conformance run that never calls it is not exercising v1.
+        try:
+            reply = await handle.connection.request(
+                {"id": uuid.uuid4().hex, "method": "health"}, timeout=15.0
+            )
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            steps.append(_Step("health", False, f"no reply: {exc}"))
+            return _skip_rest(steps, "worker did not answer health")
+
+        health_ok = reply.get("error_code") is None and reply.get("ok") is True
+        if health_ok:
+            detail = (
+                f"ok=True loaded_models={reply.get('loaded_models')} "
+                f"in_flight={reply.get('in_flight')}"
+            )
+        else:
+            detail = f"{reply.get('error_code')}: {reply.get('message')}"
+        steps.append(_Step("health", health_ok, detail))
 
         # -- shutdown ---------------------------------------------------
         started = time.perf_counter()
@@ -718,6 +759,11 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
                     await asyncio.to_thread(handle.process.wait, 5.0)
         with contextlib.suppress(Exception):
             await manager.stop()
+        # Remove the synthetic probe voice, if one was registered, so a
+        # conformance run leaves data/voices exactly as it found it.
+        for leftover in voices.list():
+            if leftover.name == "agent-voice-probe":
+                voices.delete(leftover.voice_id)
         shutil.rmtree(workdir, ignore_errors=True)
 
 

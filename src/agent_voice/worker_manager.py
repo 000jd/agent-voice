@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -27,7 +28,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,8 @@ from .ipc.transport import (
 )
 from .schemas import AgentVoiceError, ErrorCode, SynthesisResult
 from .voice_store import VoiceStore
+
+logger = logging.getLogger(__name__)
 
 _OOM_PATTERN = re.compile(
     r"CUDA out of memory|OutOfMemoryError|torch\.cuda\.OutOfMemoryError|"
@@ -174,6 +177,10 @@ class WorkerManager:
         self._running = False
         self._spawn_count = 0
         self._health_connections: dict[str, AsyncConnection] = {}
+        # Optional sync housekeeping callback run on every reaper tick. The app
+        # wires JobStore.prune here so job retention does not require importing
+        # the job store into the GPU manager.
+        self.on_reaper_tick: Callable[[], object] | None = None
 
     # -- lifecycle of the manager ---------------------------------------
     async def start(self) -> None:
@@ -1238,6 +1245,14 @@ class WorkerManager:
                 await asyncio.sleep(interval)
                 if not self._running:
                     break
+                # Housekeeping runs on every tick, including while work is in
+                # flight — _reap_once is about GPUs and bails when busy, but a
+                # stale job record has nothing to do with the GPU.
+                if self.on_reaper_tick is not None:
+                    try:
+                        self.on_reaper_tick()
+                    except Exception:
+                        logger.warning("reaper housekeeping hook failed", exc_info=True)
                 await self._reap_once()
             except asyncio.CancelledError:
                 raise

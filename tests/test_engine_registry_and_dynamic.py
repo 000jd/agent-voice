@@ -256,3 +256,118 @@ def test_list_entries_marks_loaded_models(tmp_path):
     entries = registry.list_entries(loaded={"mock": ["mock-tone"]})
     mock_entry = next(e for e in entries if e.engine_id == "mock")
     assert mock_entry.models[0].loaded is True
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: staging and approval live in the registry (one code path)
+# ---------------------------------------------------------------------------
+
+
+_STAGED_MANIFEST = (
+    "engine_id: stagedeng\n"
+    "backend_name: stagedeng\n"
+    "backend_version: '1'\n"
+    "venv_python: null\n"
+    "models: []\n"
+)
+
+
+def test_register_engine_can_stage(tmp_path):
+    registry = _registry(tmp_path)
+    record = registry.register_engine(
+        engine_id="stagedeng",
+        engine_yaml_content=_STAGED_MANIFEST,
+        worker_py_content="print('x')\n",
+        staging=True,
+    )
+    assert (tmp_path / "engines" / ".pending" / "stagedeng").is_dir()
+    assert record.engine_id == "stagedeng"
+
+
+def test_staged_engine_is_invisible_to_discovery(tmp_path):
+    registry = _registry(tmp_path)
+    registry.register_engine(
+        engine_id="stagedeng",
+        engine_yaml_content=_STAGED_MANIFEST,
+        worker_py_content="print('x')\n",
+        staging=True,
+    )
+    assert "stagedeng" not in registry.ids(), (
+        "a staged plugin must not be loadable or spawnable before approval"
+    )
+
+
+def test_list_pending_reports_staged_ids(tmp_path):
+    registry = _registry(tmp_path)
+    assert registry.list_pending() == []
+    registry.register_engine(
+        engine_id="stagedeng",
+        engine_yaml_content=_STAGED_MANIFEST,
+        worker_py_content="print('x')\n",
+        staging=True,
+    )
+    assert registry.list_pending() == ["stagedeng"]
+
+
+def test_approve_engine_promotes_and_reloads(tmp_path):
+    registry = _registry(tmp_path)
+    registry.register_engine(
+        engine_id="stagedeng",
+        engine_yaml_content=_STAGED_MANIFEST,
+        worker_py_content="print('x')\n",
+        staging=True,
+    )
+    record = registry.approve_engine("stagedeng")
+    assert record.engine_id == "stagedeng"
+    assert "stagedeng" in registry.ids(), "approval must hot-reload discovery"
+    assert registry.list_pending() == []
+    assert not (tmp_path / "engines" / ".pending" / "stagedeng").exists()
+
+
+def test_approve_refuses_to_overwrite_an_installed_engine(tmp_path):
+    """Silently replacing trusted code with unread code defeats the gate."""
+    registry = _registry(tmp_path)
+    registry.register_engine(
+        engine_id="stagedeng",
+        engine_yaml_content=_STAGED_MANIFEST,
+        worker_py_content="print('x')\n",
+        staging=True,
+    )
+    registry.approve_engine("stagedeng")
+    registry.register_engine(
+        engine_id="stagedeng",
+        engine_yaml_content=_STAGED_MANIFEST,
+        worker_py_content="print('different')\n",
+        staging=True,
+    )
+    with pytest.raises(AgentVoiceError) as excinfo:
+        registry.approve_engine("stagedeng")
+    assert excinfo.value.error_code == ErrorCode.BAD_REQUEST
+    # The staged copy is left in place for the operator to inspect.
+    assert (tmp_path / "engines" / ".pending" / "stagedeng").is_dir()
+
+
+def test_approve_unknown_engine_is_rejected(tmp_path):
+    registry = _registry(tmp_path)
+    with pytest.raises(AgentVoiceError) as excinfo:
+        registry.approve_engine("nope")
+    assert excinfo.value.error_code == ErrorCode.ENGINE_NOT_FOUND
+
+
+def test_approve_rejects_invalid_slug(tmp_path):
+    registry = _registry(tmp_path)
+    with pytest.raises((AgentVoiceError, ValueError)):
+        registry.approve_engine("../../evil")
+
+
+def test_approve_rejects_plugin_without_a_worker(tmp_path):
+    registry = _registry(tmp_path)
+    registry.register_engine(
+        engine_id="stagedeng",
+        engine_yaml_content=_STAGED_MANIFEST,
+        worker_py_content=None,
+        staging=True,
+    )
+    with pytest.raises(AgentVoiceError) as excinfo:
+        registry.approve_engine("stagedeng")
+    assert excinfo.value.error_code == ErrorCode.MANIFEST_INVALID

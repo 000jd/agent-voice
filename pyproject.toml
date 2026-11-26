@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-voice"
-version = "0.1.0"
+version = "0.2.1"
 description = "Headless, UI-free, multi-engine voice cloning and speech synthesis server for AI agents"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -35,6 +35,11 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-timeout>=2.3",
     "ruff>=0.7",
+]
+demo = [
+    # Only the narrated-video example needs Manim; the core daemon and the
+    # engine venvs must stay lean.
+    "manim>=0.18",
 ]
 
 [project.scripts]

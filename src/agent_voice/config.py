@@ -6,12 +6,13 @@ isolated per-engine virtualenvs under ``engines/<engine_id>/.venv``.
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -72,9 +73,15 @@ class Settings(BaseSettings):
     mcp_base_path: str = Field(default="", alias="MCP_BASE_PATH")
 
     # --- HTTP security --------------------------------------------------
-    allowed_hosts: list[str] = Field(default_factory=list, alias="AGENT_VOICE_ALLOWED_HOSTS")
+    # NoDecode stops pydantic-settings from JSON-decoding this list from the
+    # environment *before* the validator runs, which would make a plain
+    # `testserver` or `a,b` value raise SettingsError. `_split_hosts` accepts
+    # both comma text and a JSON array.
+    allowed_hosts: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, alias="AGENT_VOICE_ALLOWED_HOSTS"
+    )
     """Extra Host header values accepted by the DNS-rebinding guard, beyond the
-    loopback defaults. Accepts a comma-separated string from the environment."""
+    loopback defaults. Accepts `a,b` from the environment."""
 
     # --- Paths ----------------------------------------------------------
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
@@ -90,10 +97,24 @@ class Settings(BaseSettings):
     @field_validator("allowed_hosts", mode="before")
     @classmethod
     def _split_hosts(cls, value: object) -> object:
-        """Accept `a,b,c` from the environment as well as a real list."""
-        if isinstance(value, str):
-            return [part.strip() for part in value.split(",") if part.strip()]
-        return value
+        """Accept `a,b`, `["a","b"]` or a real list.
+
+        Both text forms show up in practice: a human writes comma text in .env,
+        while a script or the older documented example writes a JSON array.
+        """
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [part.strip() for part in text.split(",") if part.strip()]
 
     @field_validator("data_dir", "engines_dir")
     @classmethod

@@ -302,3 +302,141 @@ def test_script_service_accepts_progress_callback():
         REPO_ROOT / "src" / "agent_voice" / "services" / "script_service.py"
     ).read_text("utf-8")
     assert "on_beat" in source, "per-beat progress needs a callback hook"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: non-ASCII Authorization must be 401, never 500
+# ---------------------------------------------------------------------------
+
+
+def test_authorization_header_unreadable_by_test_client():
+    """Documented limitation: httpx2 refuses to encode non-ASCII headers.
+
+    That is why the non-ASCII coverage above drives the middleware comparison
+    directly instead of going through TestClient. If httpx2 ever allows it, the
+    assertion below flips and the end-to-end variant can be written.
+    """
+    import httpx2
+
+    with pytest.raises((UnicodeEncodeError, TypeError)):
+        httpx2.Headers({"authorization": "Bearer café"})
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Bearer café",
+        "Bearer ünïcödé",
+        "Bearer 日本語",
+        "Bearer 🔒",
+        "Bearer caf\u00e9\u0000",
+    ],
+)
+def test_non_ascii_authorization_variants_never_500(header):
+    """The middleware comparison itself must never raise on non-ASCII input.
+
+    Driven directly rather than through TestClient: httpx2 refuses to *encode* a
+    non-ASCII header, so the request never reaches the server. What matters here
+    is that the server-side comparison returns False (-> 401) instead of raising
+    TypeError (-> 500).
+    """
+    import hmac
+
+    expected = "Bearer secret-key"
+    # This is the exact call the middleware performs.
+    authorized = hmac.compare_digest(
+        header.encode("utf-8", errors="replace"), expected.encode("utf-8")
+    )
+    assert authorized is False
+
+
+@pytest.mark.parametrize(
+    "raw_header",
+    [
+        b"Bearer caf\xc3\xa9",
+        b"Bearer caf\xe9",
+        b"Bearer \xf0\x9f\x94\x92",
+    ],
+)
+async def test_non_ascii_authorization_header_returns_401_over_asgi(
+    tmp_path, raw_header
+):
+    """A non-ASCII Authorization header is rejected, never a 500.
+
+    TestClient cannot carry this case: httpx/httpx2 raise while *encoding* a
+    non-ASCII header value, so the request never reaches the app. Calling the
+    ASGI app with raw header bytes is the only way to exercise the middleware
+    with exactly the input a hostile or buggy client can send.
+    """
+    settings = _settings(tmp_path, AGENT_VOICE_API_KEY="secret-key")
+    app = create_app(settings=settings, mount_mcp=False)
+
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/v1/voices",
+        "raw_path": b"/v1/voices",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"127.0.0.1"), (b"authorization", raw_header)],
+        "server": ("127.0.0.1", 8000),
+        "client": ("127.0.0.1", 12345),
+    }
+
+    await app(scope, receive, send)
+
+    assert sent and sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 401
+
+
+def test_valid_key_still_works_after_byte_compare(authed_client):
+    response = authed_client.post(
+        "/v1/agent/speak",
+        json={"text": "Ok."},
+        headers={"Authorization": "Bearer secret-key"},
+    )
+    assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: testserver must not be a production default
+# ---------------------------------------------------------------------------
+
+
+def test_testserver_absent_from_production_allowed_hosts():
+    from agent_voice.api.app import DEFAULT_ALLOWED_HOSTS
+
+    assert "testserver" not in DEFAULT_ALLOWED_HOSTS, (
+        "testserver is a test harness name; production defaults must stay loopback-only"
+    )
+    assert {"127.0.0.1", "localhost"} <= DEFAULT_ALLOWED_HOSTS
+
+
+def test_testserver_rejected_when_not_configured(tmp_path, monkeypatch):
+    """A real deployment must not accept Host: testserver just because tests do."""
+    monkeypatch.delenv("AGENT_VOICE_ALLOWED_HOSTS", raising=False)
+    from agent_voice.config import reset_settings_cache
+
+    reset_settings_cache()
+    settings = _settings(tmp_path, AGENT_VOICE_ALLOWED_HOSTS="")
+    app = create_app(settings=settings, mount_mcp=False)
+    with TestClient(app) as test_client:
+        assert test_client.get("/health", headers={"Host": "testserver"}).status_code == 421
+    reset_settings_cache()
+
+
+@pytest.mark.parametrize("raw", ["testserver", "a.com,b.com", '["x.com","y.com"]', "", "  "])
+def test_allowed_hosts_accepts_all_documented_forms(tmp_path, raw):
+    settings = _settings(tmp_path, AGENT_VOICE_ALLOWED_HOSTS=raw)
+    assert isinstance(settings.allowed_hosts, list)

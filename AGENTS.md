@@ -42,7 +42,7 @@ AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""
 ```
 
 `engines test <id>` is the fastest way to prove an engine still speaks protocol v1: it spawns a
-real worker and walks `spawn+connect → hello → load_model → synthesize → cancel → shutdown`,
+real worker and walks `spawn+connect → hello → load_model → synthesize → cancel → health → shutdown`,
 printing a pass/fail row per step and exiting non-zero on any failure. Use it after touching
 anything in the worker, the transport or the manager.
 

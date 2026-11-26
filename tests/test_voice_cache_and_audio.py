@@ -437,3 +437,62 @@ def test_pcm_bytes_to_seconds():
 def test_probe_duration_matches_written_file(tmp_path):
     path = _tone(tmp_path / "d.wav", seconds=2.5)
     assert probe_duration(path) == pytest.approx(2.5, abs=0.02)
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: ffmpeg error tails must drop the build banner
+# ---------------------------------------------------------------------------
+
+_FFMPEG_BANNER = b"""ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers
+  built with gcc 11 (Ubuntu 11.4.0-1ubuntu1~22.04)
+  configuration: --prefix=/usr --extra-version=0ubuntu1 --enable-gpl
+  libavutil      58. 29.100 / 58. 29.100
+  libavcodec     60. 31.100 / 60. 31.100
+Input #0, wav, from 'missing.wav':
+  Duration: N/A, bitrate: N/A
+[in#0 @ 0x55] Error opening input: No such file or directory
+Error opening input file missing.wav.
+Error opening input files: No such file or directory
+"""
+
+
+def test_ffmpeg_error_tail_drops_the_build_banner():
+    from agent_voice.audio_utils import _ffmpeg_error_tail
+
+    tail = _ffmpeg_error_tail(_FFMPEG_BANNER)
+    assert "configuration:" not in tail
+    assert "libavutil" not in tail
+    assert "ffmpeg version" not in tail
+    assert "Error opening" in tail
+
+
+def test_ffmpeg_error_tail_caps_length():
+    from agent_voice.audio_utils import _ffmpeg_error_tail
+
+    huge = b"\n".join([b"real error line %d" % i for i in range(50)])
+    tail = _ffmpeg_error_tail(huge)
+    assert len(tail) <= 250
+
+
+def test_ffmpeg_error_tail_keeps_the_last_lines():
+    from agent_voice.audio_utils import _ffmpeg_error_tail
+
+    tail = _ffmpeg_error_tail(_FFMPEG_BANNER, lines=2)
+    # The two most specific lines win over the generic opener.
+    assert "missing.wav" in tail
+
+
+def test_ffmpeg_error_tail_handles_empty_stderr():
+    from agent_voice.audio_utils import _ffmpeg_error_tail
+
+    assert _ffmpeg_error_tail(b"") == ""
+
+
+def test_ffmpeg_error_tail_is_used_by_the_audio_pipeline():
+    """A regression guard: no call site may go back to dumping raw stderr."""
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "agent_voice" / "audio_utils.py"
+    ).read_text("utf-8")
+    raw_dumps = source.count("stderr.decode(")
+    # Exactly one: inside _ffmpeg_error_tail itself.
+    assert raw_dumps == 1, f"{raw_dumps} raw stderr dumps remain; use _ffmpeg_error_tail"

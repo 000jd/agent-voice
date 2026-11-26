@@ -14,11 +14,11 @@ The server exposes a **core** or a **full** surface (`AGENT_VOICE_TOOLSET`), and
 only see the tools you were granted:
 
 - **core** — `server_info`, `speak`, `speak_script`, `start_script_job`/`get_job`/
-  `cancel_job`, `clone_voice`, `list_voices`, `gpu_status`, `unload_models`. That is
-  everything needed to make audio. If these are the only tools you have, don't try to
+  `cancel_job`, `clone_voice`, `list_voices`, `delete_voice`, `gpu_status`, `unload_models`.
+  That is everything needed to make audio. If these are the only tools you have, don't try to
   install engines — there is no tool for it and no flag you can set.
 - **full** — adds `list_engines`, `list_models`, `download_model`, `register_model`,
-  `register_engine`, `install_engine`, `delete_voice`, and the binding tools. The
+  `register_engine`, `install_engine`, and the binding tools. The
   management calls are refused unless the operator enabled
   `ALLOW_AGENT_ENGINE_MUTATION` **and** you are calling from loopback; expect
   `AGENT_MUTATION_DISABLED` otherwise, and report it rather than retrying.

@@ -63,10 +63,15 @@ PROTECTED_PREFIXES = ("/v1", "/audio")
 """/audio is protected too: an artifact holds the user's own speech, or a clone of
 their voice, so it is no less sensitive than the request that produced it."""
 
-DEFAULT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]", "::1", "testserver"})
-"""Loopback names, both IPv6 spellings, and ``testserver`` (what Starlette's
-TestClient sends). ``AGENT_VOICE_ALLOWED_HOSTS`` extends this set — it never
-replaces it, because relaxing the default is the DNS-rebinding hole itself."""
+DEFAULT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]", "::1"})
+"""Loopback names in both IPv6 spellings. ``AGENT_VOICE_ALLOWED_HOSTS`` extends
+this set — it never replaces it, because relaxing the default is the
+DNS-rebinding hole itself.
+
+``testserver`` (what Starlette's TestClient sends) is deliberately NOT here: a
+production default should describe production, and a test harness can add it
+through the same setting every other extra host uses.
+"""
 
 ARTIFACT_ID_PATTERN = re.compile(r"[0-9a-f]{16}")
 """Exactly what the daemon generates: 16 lowercase hex chars (``uuid4().hex[:16]``)."""
@@ -244,9 +249,20 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
     async def app_lifespan(app: FastAPI):
         await ctx.workers.start()
         app.state.ctx = ctx
+        # A job left `pending` or `running` by a previous process can never
+        # resume, so reconcile it to failed before anything can poll it, then
+        # drop records old enough that no caller is still waiting on them.
+        reconciled = ctx.jobs.reconcile_on_startup()
+        pruned = ctx.jobs.prune()
+        if reconciled:
+            logger.info("reconciled %d interrupted job(s) to DAEMON_RESTARTED", reconciled)
+        if pruned:
+            logger.info("pruned %d stale job record(s)", pruned)
+        ctx.workers.on_reaper_tick = ctx.jobs.prune
         try:
             yield
         finally:
+            ctx.workers.on_reaper_tick = None
             await ctx.workers.stop()
 
     mcp_app = None
@@ -289,7 +305,14 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
         expected = f"Bearer {api_key}"
         # Constant-time: `!=` short-circuits at the first differing byte, which
         # leaks the key prefix to anyone able to time the 401s.
-        if not hmac.compare_digest(header, expected):
+        #
+        # Compared as UTF-8 bytes, not str: `hmac.compare_digest` raises
+        # TypeError on two `str` values when either holds a non-ASCII character,
+        # so `Authorization: Bearer café` used to surface as a 500 instead of a
+        # plain 401. `errors="replace"` keeps a lone surrogate from re-raising.
+        if not hmac.compare_digest(
+            header.encode("utf-8", errors="replace"), expected.encode("utf-8")
+        ):
             return JSONResponse(
                 status_code=401,
                 content=ErrorResponse(

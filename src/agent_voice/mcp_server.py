@@ -26,17 +26,14 @@ import json
 from pathlib import Path
 from typing import Any, NoReturn
 
-import yaml
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers, get_http_request
 from mcp_types import ToolAnnotations
-from pydantic import ValidationError
 
 from .schemas import (
     AgentVoiceError,
     BeatSpec,
-    EngineManifest,
     ErrorCode,
     ErrorResponse,
     QualityTier,
@@ -47,7 +44,7 @@ from .schemas import (
     SynthesisResult,
     VoiceListResponse,
 )
-from .security import is_loopback_client, validate_slug
+from .security import is_loopback_client
 from .services.script_service import render_script
 from .settings_types import SettingsLike
 
@@ -126,75 +123,6 @@ def _require_mutation_allowed(settings: SettingsLike, tool_name: str) -> None:
             f"{tool_name} is loopback-only (caller was {host})",
             "Run the MCP client on the daemon's machine, or manage engines with the CLI.",
         )
-
-
-def _stage_engine(
-    settings: SettingsLike,
-    *,
-    engine_id: str,
-    engine_yaml_content: str,
-    pyproject_toml_content: str | None,
-    worker_py_content: str | None,
-) -> Path:
-    """Write a plugin to ``engines/.pending/<engine_id>/`` for operator approval.
-
-    The validation ``EngineRegistry.register_engine`` performs is repeated here —
-    slug, YAML mapping, and ``EngineManifest`` (which forbids unknown keys) —
-    because a staged plugin is promoted verbatim. Promotion itself belongs to the
-    registry/CLI: discovery only reads ``engines/<id>/engine.yaml``, so a staged
-    directory cannot be loaded or spawned until an operator activates it.
-    """
-    try:
-        validate_slug(engine_id)
-    except ValueError as exc:
-        raise AgentVoiceError(
-            ErrorCode.INVALID_SLUG,
-            f"invalid engine id {engine_id!r}: {exc}",
-            "Use a lowercase slug: letters, digits and underscores, 2-41 chars.",
-        ) from exc
-
-    try:
-        raw = yaml.safe_load(engine_yaml_content) or {}
-    except yaml.YAMLError as exc:
-        raise AgentVoiceError(
-            ErrorCode.MANIFEST_INVALID,
-            f"engine.yaml is not valid YAML: {exc}",
-            "Fix the YAML and retry.",
-        ) from exc
-    if not isinstance(raw, dict):
-        raise AgentVoiceError(
-            ErrorCode.MANIFEST_INVALID,
-            "engine.yaml must be a YAML mapping",
-            "See engines/ADDING_AN_ENGINE.md for the manifest schema.",
-        )
-
-    raw["engine_id"] = engine_id
-    try:
-        EngineManifest(**raw)
-    except ValidationError as exc:
-        raise AgentVoiceError(
-            ErrorCode.MANIFEST_INVALID,
-            f"engine manifest rejected: {exc.error_count()} problem(s)",
-            f"{exc}",
-        ) from exc
-
-    directory = Path(settings.engines_dir) / ".pending" / engine_id
-    if directory.exists():
-        raise AgentVoiceError(
-            ErrorCode.BAD_REQUEST,
-            f"a pending plugin already exists for '{engine_id}'",
-            "Ask the operator to approve or discard it before registering again.",
-        )
-
-    directory.mkdir(parents=True)
-    (directory / "engine.yaml").write_text(
-        yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), "utf-8"
-    )
-    if pyproject_toml_content:
-        (directory / "pyproject.toml").write_text(pyproject_toml_content, "utf-8")
-    if worker_py_content:
-        (directory / "worker.py").write_text(worker_py_content, "utf-8")
-    return directory
 
 
 def _with_default_pause(beats: list[BeatSpec], pause_after_sec: float) -> list[BeatSpec]:
@@ -452,40 +380,17 @@ def build_mcp_server(ctx) -> FastMCP:
         export_srt: bool = True,
         pause_after_sec: float = 0.0,
     ) -> ScriptResult:
-        """Synthesise a multi-beat script into one stitched file, with exact timings.
+        """Synthesise a multi-beat script into one stitched file with exact timings.
 
-        Use it for narration with pauses, multi-speaker content, or anything whose
-        timing another process has to match (video, slides, subtitles). For a
-        single line, speak() is cheaper.
+        Use this when timing matters downstream (video, slides, subtitles) or the
+        content has several beats. Each beat is a BeatSpec; `pause_after_sec`
+        inserts real silence and is included in the timings, per-beat `voice`
+        enables multi-speaker scripts, and `target_duration_sec` + `fit_mode` pin
+        a beat to a fixed slot. For one line, prefer speak().
 
-        Each beat is a BeatSpec (everything optional except `text`):
-        {text, voice?, engine?, model?, quality?, language?, target_duration_sec?,
-         fit_mode?, pause_after_sec?, take?}
-
-        * `pause_after_sec` (0..10) inserts real silence after the beat and is
-          included in the reported timings, so subtitles and downstream visuals
-          stay frame-accurate. This is how you time a visual to land. The
-          call-level `pause_after_sec` argument is a default for every beat that
-          does not set its own; a beat's own value always wins.
-        * `voice` per beat enables multi-speaker scripts (podcasts, interviews):
-          each beat may name a different registered voice.
-        * `target_duration_sec` + `fit_mode` ("none"|"pad"|"atempo") force a beat
-          into a fixed slot on a video timeline.
-        * `take` re-records one beat without disturbing the others.
-
-        Read:
-            file_path: the stitched master audio; read this.
-            duration_sec: total length, pauses included.
-            beats[]: index, text, start_sec, end_sec, duration_sec, pause_after_sec,
-                voice_id (who actually spoke), target_duration_sec, fit_mode —
-                everything a timeline or subtitle pass needs.
-            beats[].cached: true when this beat was reused from disk. Re-rendering
-                an edited script should show every untouched beat as a hit, so this
-                tells you what the edit actually cost.
-            beats[].artifact_id: the per-beat artifact id, so you can fetch or
-                replace exactly one beat.
-            srt_path, vtt_path: subtitle files, written when export_srt is true.
-            timing_json_path: this whole result, written next to the audio.
+        Returns `file_path`, `duration_sec`, `beats[]` (start_sec, end_sec,
+        voice_id, cached, artifact_id) and, when export_srt, `srt_path` and
+        `timing_json_path`. Full field guide: resource agent-voice://guide.
         """
         try:
             payload = ScriptRequest(
@@ -619,23 +524,13 @@ def build_mcp_server(ctx) -> FastMCP:
     ) -> dict[str, Any]:
         """Register a reference voice from a local audio file. Do this before speaking.
 
-        Use it when list_voices() is empty, or when you need another speaker. The
-        clip is normalised to 24 kHz mono and silence-trimmed; 3-10 seconds of
-        clean single-speaker speech is the quality sweet spot. Providing
-        `ref_text` (an accurate transcript) makes the engine condition on both the
-        audio and its words (ICL mode), which is audibly better than audio-only
-        `x_vector_only=true`. A wrong transcript is worse than none.
+        Use it when list_voices() is empty or you need another speaker. 3-10 s of
+        clean single-speaker speech is the sweet spot; an accurate `ref_text` is
+        audibly better than audio-only `x_vector_only=true`, and a wrong
+        transcript is worse than none. Idempotent for the same name plus
+        byte-identical audio; differing audio fails unless overwrite=true.
 
-        Idempotent: the same `name` plus byte-identical audio returns the existing
-        voice instead of creating a duplicate, so a retried call is safe. If the
-        name exists but the audio or transcript differs, the call fails rather
-        than silently swapping a voice another job may be using — pass
-        overwrite=true to replace it deliberately.
-
-        Read:
-            voice_id: pass this as `voice` to speak()/speak_script().
-            duration_sec: how much usable speech the clip contributed.
-            warnings[]: concrete quality problems (too short, clipped, silent).
+        Returns `voice_id` (pass it as `voice`), `duration_sec`, `warnings[]`.
         """
         from .security import ensure_within_base
 
@@ -669,7 +564,7 @@ def build_mcp_server(ctx) -> FastMCP:
         """
         return VoiceListResponse(voices=ctx.voices.list())
 
-    @tool(annotations=destructive, full_only=True)
+    @tool(annotations=destructive)
     async def delete_voice(voice_id: str) -> dict[str, str]:
         """Delete a voice and all of its cached prompts. This cannot be undone.
 
@@ -874,20 +769,27 @@ def build_mcp_server(ctx) -> FastMCP:
             _require_mutation_allowed(settings, "register_engine")
 
             if settings.require_engine_approval:
-                # Promotion is deliberately not implemented here: activating a
-                # staged plugin is the operator's decision (registry/CLI), and
-                # doing it from an agent would defeat the approval gate.
-                directory = _stage_engine(
-                    settings,
-                    engine_id=engine_id,
-                    engine_yaml_content=engine_yaml_content,
-                    pyproject_toml_content=pyproject_toml_content,
-                    worker_py_content=worker_py_content,
-                )
+                # Staging lives in the registry so the CLI promotes through the
+                # exact same code path. Promotion is deliberately not reachable
+                # from here: activating a staged plugin is the operator's call.
+                try:
+                    record = ctx.registry.register_engine(
+                        engine_id=engine_id,
+                        engine_yaml_content=engine_yaml_content,
+                        pyproject_toml_content=pyproject_toml_content,
+                        worker_py_content=worker_py_content,
+                        staging=True,
+                    )
+                except ValueError as exc:
+                    raise AgentVoiceError(
+                        ErrorCode.INVALID_SLUG,
+                        f"invalid engine id {engine_id!r}: {exc}",
+                        "Use a lowercase slug: letters, digits and underscores, 2-41 chars.",
+                    ) from exc
                 return {
                     "engine_id": engine_id,
                     "staged": True,
-                    "staged_path": str(directory),
+                    "staged_path": str(record.directory),
                     "installed": False,
                     "job_id": None,
                 }
@@ -957,21 +859,11 @@ def build_mcp_server(ctx) -> FastMCP:
     async def gpu_status() -> dict[str, Any]:
         """Report worker state, resident models, VRAM and the idle-unload countdown.
 
-        Use it to decide whether the next call is warm, and to see what is holding
-        the GPU. Reads only: it never spawns or wakes a worker.
-
-        Read:
-            workers: engine_id -> alive|dead. A dead entry means the next request
-                has to respawn the worker and reload weights.
-            loaded_models: "engine:alias" entries currently resident in VRAM.
-            vram_used_mb, vram_free_mb: whole-GPU figures; null without NVML.
-            queue_depth, in_flight: jobs waiting for the engine lock, jobs running.
-            unload_in_seconds: seconds until the idle reaper unloads the resident
-                model (MODEL_IDLE_TTL_SECONDS minus idle time). null when nothing
-                is resident, or when work is queued/running so the countdown is
-                paused. Any request resets it, so a small value means the model is
-                about to be dropped and your next call will be a cold start.
-            last_used_at: unix timestamp of the last synthesis.
+        Reads only: it never spawns or wakes a worker. `workers` tells you whether
+        the next call is warm; `loaded_models` what is resident; and
+        `unload_in_seconds` how long before the idle reaper drops it (null when
+        nothing is resident or work is queued). A small value means your next call
+        will be a cold start.
         """
         return await ctx.workers.gpu_status()
 

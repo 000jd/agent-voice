@@ -32,6 +32,10 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     monkeypatch.setenv("ALLOW_AGENT_ENGINE_MUTATION", "true")
     monkeypatch.setenv("MODEL_IDLE_TTL_SECONDS", "900")
     monkeypatch.setenv("MIN_ENGINE_RESIDENCY_SECONDS", "60")
+    # Starlette's TestClient sends `Host: testserver`. That name is deliberately
+    # absent from the production defaults, so the harness opts in exactly the
+    # way an operator would: through the allowed-hosts setting.
+    monkeypatch.setenv("AGENT_VOICE_ALLOWED_HOSTS", "testserver")
     monkeypatch.delenv("AGENT_VOICE_API_KEY", raising=False)
     reset_settings_cache()
     yield
