@@ -277,11 +277,19 @@ def convert_audio(
 # ---------------------------------------------------------------------------
 
 
+CROSSFADE_MS = 20
+"""Default seam crossfade: long enough to hide a click, short enough not to smear
+consonants. Every consumer that needs to reason about seams shares this value."""
+
+PEAK_CEILING = 0.89
+"""≈ -1 dBFS. Emphasis gain is capped here so a loud syllable cannot clip."""
+
+
 def crossfade_stitch(
     segments: list[Path],
     destination: Path,
     *,
-    crossfade_ms: int = 20,
+    crossfade_ms: int = CROSSFADE_MS,
     sample_rate: int = SAMPLE_RATE,
 ) -> float:
     """Concatenate WAV segments with a short linear crossfade.
@@ -324,6 +332,104 @@ def crossfade_stitch(
     destination.parent.mkdir(parents=True, exist_ok=True)
     sf.write(destination, accumulated, sample_rate, subtype="PCM_16")
     return len(accumulated) / sample_rate
+
+
+def stitch_offsets(
+    frame_counts: list[int] | tuple[int, ...],
+    *,
+    crossfade_ms: int = CROSSFADE_MS,
+    sample_rate: int = SAMPLE_RATE,
+) -> list[tuple[float, float]]:
+    """``(onset_sec, span_sec)`` per stitched component.
+
+    Mirrors :func:`crossfade_stitch`'s arithmetic exactly: it removes
+    ``min(fade, accumulated, next)`` frames at each seam, and only when that is
+    more than one frame. Summing raw durations instead would drift steadily past
+    the real file length, so any caller that reports timings has to use this.
+
+    The last component's span is its remaining frames (the tail is never faded),
+    which makes the spans add up to the stitched length.
+    """
+    counts = [max(0, int(count)) for count in frame_counts]
+    if not counts:
+        return []
+    fade = max(1, int(sample_rate * crossfade_ms / 1000))
+    losses: list[int] = []
+    accumulated = counts[0]
+    for count in counts[1:]:
+        overlap = min(fade, accumulated, count)
+        loss = overlap if overlap > 1 else 0
+        losses.append(loss)
+        accumulated += count - loss
+
+    offsets: list[tuple[float, float]] = []
+    cursor = 0
+    for position, count in enumerate(counts):
+        loss = losses[position] if position < len(losses) else 0
+        span = max(0, count - loss)
+        offsets.append((cursor / sample_rate, span / sample_rate))
+        cursor += span
+    return offsets
+
+
+def apply_gain(
+    block: np.ndarray,
+    gain_db: float,
+    *,
+    peak_ceiling: float = PEAK_CEILING,
+) -> np.ndarray:
+    """Scale a float block by ``gain_db``, backed off if the peak would clip.
+
+    ``[emphasis]`` adds a few dB on purpose. Louder is the point; distorted is
+    not, so the result is peak-limited to ``peak_ceiling`` rather than clipped by
+    whichever encoder sees it next.
+    """
+    if gain_db == 0 or block.size == 0:
+        return block
+    scaled = block * np.float32(10.0 ** (gain_db / 20.0))
+    peak = float(np.max(np.abs(scaled)))
+    if peak > peak_ceiling > 0:
+        scaled = scaled * np.float32(peak_ceiling / peak)
+    return scaled.astype(np.float32, copy=False)
+
+
+def apply_gain_file(
+    source: Path,
+    destination: Path,
+    gain_db: float,
+    *,
+    peak_ceiling: float = PEAK_CEILING,
+) -> Path:
+    """Write ``source`` to ``destination`` with ``gain_db`` applied (PCM_16 WAV)."""
+    import soundfile as sf
+
+    data, sample_rate = sf.read(source, dtype="float32", always_2d=False)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(destination, apply_gain(data, gain_db, peak_ceiling=peak_ceiling), sample_rate,
+             subtype="PCM_16")
+    return destination
+
+
+def scale_pcm16(chunk: bytes, gain_db: float, *, peak_ceiling: float = PEAK_CEILING) -> bytes:
+    """Apply ``gain_db`` to one chunk of 24 kHz mono int16 LE PCM.
+
+    Used by the streaming path, which has no file to rewrite at stitch time. Each
+    chunk is limited on its own, so a long loud passage cannot clip even though
+    there is no look-ahead.
+    """
+    if gain_db == 0 or not chunk:
+        return chunk
+    samples = np.frombuffer(chunk, dtype="<i2").astype(np.float32) / 32768.0
+    scaled = apply_gain(samples, gain_db, peak_ceiling=peak_ceiling) * 32768.0
+    return np.clip(np.round(scaled), -32768, 32767).astype("<i2").tobytes()
+
+
+def silence_pcm16(duration_sec: float, *, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """``duration_sec`` of int16 LE silence, for inserting pauses into a stream."""
+    frames = max(0, int(round(duration_sec * sample_rate)))
+    return bytes(frames * 2)
 
 
 # ---------------------------------------------------------------------------

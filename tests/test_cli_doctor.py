@@ -1,9 +1,12 @@
-"""v0.3.3 CLI onboarding: `doctor` (environment gate) and `mcp-config`.
+"""v0.3.3/v0.4.0 CLI onboarding: `doctor` (environment gate), `serve` and `mcp-config`.
 
 `doctor` deliberately inspects the real machine — PATH, a socket bind,
 nvidia-smi, the engine registry — so every test that asserts on a row fakes the
 probe instead of trusting the host. One test runs it against this checkout for
 real, and skips when the box cannot satisfy doctor's hard requirements.
+
+`serve` is never actually started: uvicorn.run is replaced, so these tests assert
+what the command would bind (and whether it refuses at all) without a daemon.
 """
 
 from __future__ import annotations
@@ -18,10 +21,13 @@ from pathlib import Path
 
 import httpx
 import pytest
+import uvicorn
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
+import agent_voice.cli as cli
 from agent_voice.cli import app
-from agent_voice.config import reset_settings_cache
+from agent_voice.config import Settings, get_settings, reset_settings_cache
 
 runner = CliRunner()
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +36,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clean_settings_cache() -> Iterator[None]:
+    """Every test starts and ends with a fresh settings cache.
+
+    Several tests override AGENT_VOICE_HOST/PORT or chdir to a directory with its
+    own `.env`; `get_settings` is `lru_cache`d, so a stale Settings object would
+    leak both ways without this.
+    """
+    reset_settings_cache()
+    yield
+    reset_settings_cache()
 
 
 def _text(result) -> str:
@@ -43,6 +62,22 @@ def _text(result) -> str:
     return combined if stderr in combined else combined + stderr
 
 
+def _assert_exit(result, code: int) -> str:
+    """Assert the command exited with `code` on purpose, not by raising.
+
+    Click reports an escaped exception as exit_code 1 as well, so an
+    `isinstance(SystemExit | None)` check is what proves `typer.Exit` (or a clean
+    return) was reached instead of a traceback.
+    """
+    output = _text(result)
+    assert result.exit_code == code, output
+    assert isinstance(result.exception, SystemExit) or result.exception is None, (
+        f"expected typer.Exit, raised {result.exception!r}"
+    )
+    assert "Traceback (most recent call last)" not in output, output
+    return output
+
+
 def patch_which(mapping: dict[str, str | None], monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch `shutil.which` for the named tools only; everything else stays real."""
     inherited = shutil.which
@@ -53,6 +88,27 @@ def patch_which(mapping: dict[str, str | None], monkeypatch: pytest.MonkeyPatch)
         return inherited(name, *args, **kwargs)
 
     monkeypatch.setattr(shutil, "which", fake_which)
+
+
+def fake_uvicorn_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Replace `uvicorn.run`: record what `serve` would bind instead of serving."""
+    seen: dict[str, object] = {}
+
+    def fake_run(target: str, **kwargs: object) -> None:
+        seen["target"] = target
+        seen.update(kwargs)
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    return seen
+
+
+def forbid_uvicorn_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if `serve` ever reaches uvicorn (it must refuse first)."""
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("uvicorn.run must not be reached when the bind is refused")
+
+    monkeypatch.setattr(uvicorn, "run", forbidden)
 
 
 def patch_nvidia_smi(
@@ -224,6 +280,38 @@ def test_doctor_warns_when_dotenv_is_absent(
     assert result.exit_code == 0, output
     assert "cp .env.example .env" in output
     assert "WARN" in output
+    # M4: absence is its own status text, but the effective engine is still judged.
+    assert "absent, built-in defaults apply" in output
+    assert "AGENT_VOICE_DEFAULT_ENGINE=mock (installed)" in output
+
+
+def test_doctor_fails_on_a_ghost_engine_from_the_environment_without_a_dotenv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tools: None, free_port: int
+) -> None:
+    """M4: no `.env` must not skip the engine check — the shell can set it."""
+    monkeypatch.chdir(tmp_path)  # a fresh checkout: no `.env` here
+    monkeypatch.setenv("AGENT_VOICE_DEFAULT_ENGINE", "ghost_engine")
+    reset_settings_cache()
+
+    result = runner.invoke(app, ["doctor"])
+    output = _text(result)
+
+    assert result.exit_code == 1, output
+    assert "absent, built-in defaults apply" in output
+    assert "AGENT_VOICE_DEFAULT_ENGINE=ghost_engine" in output
+    assert "fix:" in output
+
+
+def test_doctor_env_row_reports_presence_and_the_effective_engine(
+    tools: None, free_port: int
+) -> None:
+    # The real checkout has a .env: presence is PASS and the engine verdict follows.
+    result = runner.invoke(app, ["doctor"])
+    output = _text(result)
+
+    assert result.exit_code == 0, output
+    assert "present; AGENT_VOICE_DEFAULT_ENGINE=" in output
+    assert "(installed)" in output
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +417,123 @@ def test_doctor_treats_a_running_daemon_as_a_pass(
 
 
 # ---------------------------------------------------------------------------
+# doctor: a broken config is a row, not a traceback (M3)
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_reports_an_invalid_dotenv_as_a_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tools: None
+) -> None:
+    """`AGENT_VOICE_PORT=abc` in .env used to traceback out of get_settings()."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("AGENT_VOICE_PORT=abc\n", "utf-8")
+    # The shell variable would win over the file and mask the bad value.
+    monkeypatch.delenv("AGENT_VOICE_PORT", raising=False)
+    reset_settings_cache()
+
+    result = runner.invoke(app, ["doctor"])
+    output = _assert_exit(result, 1)
+
+    assert "config" in output
+    assert "FAIL" in output
+    assert "AGENT_VOICE_PORT" in output
+    assert "fix .env" in output
+    # The remaining rows still print, on built-in defaults.
+    assert "inbox" in output
+    assert "port" in output
+
+
+def test_doctor_reports_an_invalid_enum_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tools: None, free_port: int
+) -> None:
+    """A bad enum value is the same class of failure as a non-numeric port."""
+
+    def broken_settings() -> Settings:
+        return Settings(AGENT_VOICE_TOOLSET="ghost_toolset", _env_file=None)
+
+    with pytest.raises(ValidationError):
+        broken_settings()
+
+    monkeypatch.setattr(cli, "get_settings", broken_settings)
+
+    result = runner.invoke(app, ["doctor"])
+    output = _assert_exit(result, 1)
+
+    assert "config" in output
+    assert "AGENT_VOICE_TOOLSET" in output
+    assert "fix .env" in output
+
+
+# ---------------------------------------------------------------------------
+# doctor: the port probe is address-family aware (M5)
+# ---------------------------------------------------------------------------
+
+
+def _ipv6_loopback_available() -> bool:
+    if not socket.has_ipv6:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+def _free_port(family: socket.AddressFamily, host: str) -> int:
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+def test_doctor_reports_a_free_ipv6_loopback_port_as_pass(
+    monkeypatch: pytest.MonkeyPatch, tools: None
+) -> None:
+    """AGENT_VOICE_HOST=::1 is a supported loopback bind, not an AF_INET port."""
+    if not _ipv6_loopback_available():
+        pytest.skip("this machine has no IPv6 loopback")
+    port = _free_port(socket.AF_INET6, "::1")
+    monkeypatch.setenv("AGENT_VOICE_HOST", "::1")
+    monkeypatch.setenv("AGENT_VOICE_PORT", str(port))
+    reset_settings_cache()
+
+    result = runner.invoke(app, ["doctor"])
+    output = _text(result)
+
+    assert result.exit_code == 0, output
+    assert f"::1:{port} is free" in output
+
+
+def test_doctor_fails_when_an_ipv6_loopback_port_is_held(
+    monkeypatch: pytest.MonkeyPatch, tools: None
+) -> None:
+    if not _ipv6_loopback_available():
+        pytest.skip("this machine has no IPv6 loopback")
+
+    listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    listener.bind(("::1", 0))
+    listener.listen(1)
+    port = int(listener.getsockname()[1])
+    monkeypatch.setenv("AGENT_VOICE_HOST", "::1")
+    monkeypatch.setenv("AGENT_VOICE_PORT", str(port))
+    reset_settings_cache()
+
+    def refuse(url: str, **kwargs: object) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "get", refuse)
+    try:
+        result = runner.invoke(app, ["doctor"])
+    finally:
+        listener.close()
+    output = _text(result)
+
+    assert result.exit_code == 1, output
+    assert f"::1:{port}" in output
+    assert "in use" in output
+
+
+# ---------------------------------------------------------------------------
 # doctor: the real checkout (the release gate)
 # ---------------------------------------------------------------------------
 
@@ -411,3 +616,74 @@ def test_mcp_config_requires_a_client() -> None:
 
     assert result.exit_code != 0
     assert "--client" in _text(result)
+
+
+# ---------------------------------------------------------------------------
+# serve: the bind safety gate is judged on the *effective* address (H1/L7)
+# ---------------------------------------------------------------------------
+
+
+def test_serve_refuses_a_non_loopback_host_without_a_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`serve --host 0.0.0.0` must not slip past the check on the configured host."""
+    forbid_uvicorn_run(monkeypatch)
+    monkeypatch.setenv("AGENT_VOICE_HOST", "127.0.0.1")  # config itself is safe
+    monkeypatch.delenv("AGENT_VOICE_API_KEY", raising=False)
+    reset_settings_cache()
+
+    result = runner.invoke(app, ["serve", "--host", "0.0.0.0"])
+    output = _assert_exit(result, 1)
+
+    assert "AGENT_VOICE_API_KEY" in output
+    assert "0.0.0.0" in output
+    # Nothing was started and nothing was left behind.
+    assert not (get_settings().data_dir / "daemon.pid").exists()
+
+
+def test_serve_allows_a_non_loopback_host_when_a_key_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = fake_uvicorn_run(monkeypatch)
+    monkeypatch.setenv("AGENT_VOICE_HOST", "127.0.0.1")
+    monkeypatch.setenv("AGENT_VOICE_API_KEY", "secret-key")
+    reset_settings_cache()
+
+    result = runner.invoke(app, ["serve", "--host", "0.0.0.0"])
+    _assert_exit(result, 0)
+
+    assert seen["host"] == "0.0.0.0"
+    assert seen["target"] == "agent_voice.api.app:create_app"
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+def test_serve_allows_a_loopback_host_override(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    """The override is what is judged: a LAN-configured box may be narrowed to loopback."""
+    seen = fake_uvicorn_run(monkeypatch)
+    monkeypatch.setenv("AGENT_VOICE_HOST", "0.0.0.0")  # unsafe as configured
+    monkeypatch.delenv("AGENT_VOICE_API_KEY", raising=False)
+    reset_settings_cache()
+
+    result = runner.invoke(app, ["serve", "--host", host, "--port", "8123"])
+    _assert_exit(result, 0)
+
+    assert seen["host"] == host
+    assert seen["port"] == 8123
+
+
+def test_serve_forwards_port_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L7: `--port 0` means "any free port", so `or` must not fall back to 8000."""
+    seen = fake_uvicorn_run(monkeypatch)
+    monkeypatch.setenv("AGENT_VOICE_HOST", "127.0.0.1")
+    monkeypatch.setenv("AGENT_VOICE_PORT", "8000")
+    reset_settings_cache()
+
+    result = runner.invoke(app, ["serve", "--port", "0"])
+    _assert_exit(result, 0)
+
+    assert seen["port"] == 0
+    # No --host given: the configured host is used verbatim.
+    assert seen["host"] == "127.0.0.1"
+    assert seen["reload"] is False

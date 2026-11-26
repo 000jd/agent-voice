@@ -43,7 +43,7 @@ from ..cache import SynthesisCache
 from ..config import Settings, get_settings
 from ..engine_registry import EngineRegistry
 from ..job_store import JobStore
-from ..pronunciations import PronunciationStore
+from ..pronunciations import PronunciationStore, ScopedLexicon
 from ..schemas import (
     PROTOCOL_VERSION,
     AgentVoiceError,
@@ -99,6 +99,14 @@ class AppContext:
         )
         self.bindings = BindingStore(settings.bindings_path)
         self.pronunciations = PronunciationStore(settings.pronunciations_path)
+        # The same global file plus the project and voice scopes. Routes that need
+        # the merged map (and its protected spans) use this; the plain store stays
+        # for the single-scope history and the CLI-facing bits.
+        self.lexicon = ScopedLexicon(
+            settings.data_dir,
+            settings.voices_dir,
+            global_path=settings.pronunciations_path,
+        )
         self.jobs = JobStore(settings.jobs_dir)
         self.workers = WorkerManager(
             settings=settings,
@@ -121,8 +129,12 @@ def _refuse_unsafe_bind(settings: Settings) -> None:
     covered, including ``uvicorn --factory agent_voice.api.app:create_app`` and
     the MCP shim spawning the daemon. An unauthenticated voice server on a LAN
     address is an open TTS/cloning relay for anyone who can reach the port.
+
+    "No authentication" means the *stripped* key is empty: ``AGENT_VOICE_API_KEY=" "``
+    is whitespace, not a secret, and must not unlock a public bind.
     """
-    if settings.api_key or is_loopback_bind(settings.host):
+    api_key = (settings.api_key or "").strip()
+    if api_key or is_loopback_bind(settings.host):
         return
     raise AgentVoiceError(
         ErrorCode.BAD_REQUEST,
@@ -233,11 +245,12 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
 
     # One guard for HTTP *and* WebSocket. It rejects a forged Host/Origin and a
     # missing credential before the WebSocket handshake is accepted, and the
-    # parent middleware also covers the mounted /mcp app.
+    # parent middleware also covers the mounted /mcp app. The key is stripped so
+    # the guard and _refuse_unsafe_bind cannot disagree about "no key".
     app.add_middleware(
         GuardMiddleware,
         allowed_hosts=allowed_hosts,
-        api_key=settings.api_key,
+        api_key=(settings.api_key or "").strip(),
     )
 
     # -- error handling --------------------------------------------------

@@ -398,11 +398,27 @@ class SpeakRequest(BaseModel):
     is not given, so take=2 is reproducible and cache-stable."""
     pronunciations: dict[str, str] | None = None
     """Per-call word -> spoken-form overrides merged over data/pronunciations.json."""
+    markup: bool = True
+    """Interpret the whitelisted expressive tags. False passes every bracket
+    through literally, for narrating markup syntax itself."""
+    spell_identifiers: bool = False
+    """Expand code-like tokens before synthesis. Subtitles keep the written text."""
+    paragraph_gap_ms: int = Field(default=0, ge=0, le=5000)
+    """Silence inserted at each blank-line paragraph break inside this payload."""
+    project: str | None = None
+    """Named scoped-lexicon project (validated slug), merged over the global map."""
 
     @field_validator("pronunciations")
     @classmethod
     def _pronunciations(cls, value: dict[str, str] | None) -> dict[str, str] | None:
         validate_pronunciation_map(value)
+        return value
+
+    @field_validator("project")
+    @classmethod
+    def _project(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_slug(value)
         return value
 
 
@@ -461,6 +477,14 @@ class BeatSpec(BaseModel):
     quality: QualityTier | None = None
     """Omit to inherit ScriptRequest.quality; an explicit value wins."""
     language: str = "Auto"
+    markup: bool | None = None
+    """Omit to inherit ScriptRequest.markup; an explicit value wins."""
+    spell_identifiers: bool | None = None
+    """Omit to inherit ScriptRequest.spell_identifiers; an explicit value wins."""
+    paragraph_gap_ms: int | None = Field(default=None, ge=0, le=5000)
+    """Omit to inherit ScriptRequest.paragraph_gap_ms; an explicit value wins."""
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    """Base beat speed; [slow]/[fast] multiply it and the result is clamped."""
     target_duration_sec: float | None = None
     fit_mode: Literal["none", "pad", "atempo"] = "none"
     pause_after_sec: float = Field(default=0.0, ge=0.0, le=10.0)
@@ -483,11 +507,22 @@ class ScriptRequest(BaseModel):
     export_srt: bool = True
     pronunciations: dict[str, str] | None = None
     """Per-call overrides applied to every beat's spoken text."""
+    markup: bool = True
+    spell_identifiers: bool = False
+    paragraph_gap_ms: int = Field(default=0, ge=0, le=5000)
+    project: str | None = None
 
     @field_validator("pronunciations")
     @classmethod
     def _pronunciations(cls, value: dict[str, str] | None) -> dict[str, str] | None:
         validate_pronunciation_map(value)
+        return value
+
+    @field_validator("project")
+    @classmethod
+    def _project(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_slug(value)
         return value
 
 
@@ -508,6 +543,8 @@ class BeatTiming(BaseModel):
     mode: ModelMode = "clone"
     speaker: str | None = None
     instruct: str = ""
+    had_markup: bool = False
+    """True when the beat's spoken text came from parsed expressive markup."""
     cached: bool = False
     """True when re-rendering an edited script reused this beat from disk.
     Editing one beat of twelve should show eleven instant hits."""

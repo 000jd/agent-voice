@@ -13,7 +13,7 @@ from ..schemas import (
     ErrorCode,
     VoiceListResponse,
 )
-from ..security import ensure_within_base
+from ..security import resolve_ref_audio_path
 from ..services.voice_design_service import render_design
 
 router = APIRouter(tags=["voices"])
@@ -22,41 +22,19 @@ router = APIRouter(tags=["voices"])
 def _confined_path(request: Request, raw_path: str) -> Path:
     """Resolve a caller-supplied path under the safe confinement policy.
 
-    MCP_BASE_PATH wins; otherwise agent calls read only from the data inbox
-    unless the operator explicitly opts into arbitrary local paths. The CLI
-    `voices add` command bypasses this route and stays unrestricted.
+    The policy itself lives in ``security.resolve_ref_audio_path`` so REST and MCP
+    cannot drift apart: MCP_BASE_PATH wins, otherwise agent calls read only from
+    the data inbox unless the operator explicitly opts into arbitrary local paths
+    — and even then only absolute ones. The CLI `voices add` command bypasses this
+    route and stays unrestricted.
     """
-    ctx = request.app.state.ctx
-    settings = ctx.settings
-    base = settings.mcp_base_path
-    if base:
-        candidate = ensure_within_base(raw_path, base)
-    elif not settings.allow_any_path:
-        inbox = settings.inbox_dir
-        candidate = ensure_within_base(
-            raw_path,
-            inbox,
-            suggestion=(
-                f"Put the reference clip in {inbox} (the inbox), or set "
-                "AGENT_VOICE_ALLOW_ANY_PATH=true to allow any existing local path."
-            ),
-        )
-    else:
-        candidate = Path(raw_path).expanduser()
-        if not candidate.is_absolute():
-            raise AgentVoiceError(
-                ErrorCode.BAD_REQUEST,
-                f"relative ref_audio_path is ambiguous: {raw_path}",
-                "Pass an absolute path, or set MCP_BASE_PATH and use a relative one.",
-            )
-
-    if not candidate.is_file():
-        raise AgentVoiceError(
-            ErrorCode.BAD_REQUEST,
-            f"ref_audio_path not found: {raw_path}",
-            "Check the path exists and is readable by the daemon.",
-        )
-    return candidate
+    settings = request.app.state.ctx.settings
+    return resolve_ref_audio_path(
+        raw_path,
+        mcp_base_path=settings.mcp_base_path,
+        inbox_dir=settings.inbox_dir,
+        allow_any_path=settings.allow_any_path,
+    )
 
 
 async def create_voice_from_payload(

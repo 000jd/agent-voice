@@ -8,6 +8,7 @@ clock, 409 WORKER_BUSY vs force unload, and honest crash classification.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import uuid
@@ -610,3 +611,226 @@ def test_app_lifespan_prunes_stale_job_files(tmp_path):
         pass
 
     assert not path.exists(), "startup must prune records past the retention window"
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (H2): a force-unloaded queued job must not wedge the engine
+# ---------------------------------------------------------------------------
+
+
+async def _wait_for(predicate, attempts: int = 300, interval: float = 0.01) -> bool:
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return predicate()
+
+
+@pytest.mark.asyncio
+async def test_force_unload_with_a_queued_job_leaves_the_engine_usable(tmp_path):
+    """H2: the abandoned ``lock.acquire()`` used to win the lock and hold it forever.
+
+    A job queued behind a running stream races ``lock.acquire()`` against its own
+    future. When force-unload resolves the future first, v0.3.3 raised
+    JOB_CANCELLED and simply dropped the still-pending acquire. It acquired the
+    lock the moment the stream released it, and no code was left to release it —
+    so every later request for that engine blocked forever.
+    """
+    settings = _settings(tmp_path)
+    settings.ensure_dirs()
+    manager = _manager(settings)
+    await manager.start()
+    try:
+        stream_id, _queue, _mode = await manager.stream(
+            engine_id="mock", model_alias="mock-tone", text="word " * 80
+        )
+        assert await _wait_for(lambda: manager.in_flight_count() == 1)
+        handle = manager._workers["mock"]
+        stream_task = handle.stream_task
+
+        queued = asyncio.create_task(
+            manager.synthesize(
+                engine_id="mock", model_alias="mock-tone", text="queued behind the stream"
+            )
+        )
+        try:
+            assert await _wait_for(lambda: manager.queue_depth() == 1)
+
+            await manager.unload_models(force=True)
+
+            with pytest.raises(AgentVoiceError) as excinfo:
+                await queued
+            assert excinfo.value.error_code == ErrorCode.JOB_CANCELLED
+        finally:
+            if not queued.done():  # pragma: no cover - defensive cleanup
+                queued.cancel()
+                with contextlib.suppress(BaseException):
+                    await queued
+
+        # Let the cancelled stream finish tearing itself down before inspecting.
+        if stream_task is not None:
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(stream_task, timeout=30)
+        await asyncio.sleep(0)
+
+        assert not manager._engine_lock("mock").locked(), (
+            "a force-unloaded queued job left its pending acquire to win the engine "
+            "lock; nothing can release it any more"
+        )
+
+        # The real symptom: a later request for the same engine completes.
+        result = await asyncio.wait_for(
+            manager.synthesize(
+                engine_id="mock", model_alias="mock-tone", text="after the unload"
+            ),
+            timeout=90,
+        )
+        assert result.duration_sec > 0
+        assert stream_id is not None
+    finally:
+        await manager.stop()
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (L6): a stream setup failure must release the engine lock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_setup_failure_releases_the_engine_lock(tmp_path):
+    """L6: every failure between ``_begin_job`` and the ``try`` leaked the lock.
+
+    The capability lookup, the voice path and the payload setup all ran while the
+    engine lock was held but outside any handler, so raising there left the lock
+    held by a job that would never end.
+    """
+    settings = _settings(tmp_path)
+    settings.ensure_dirs()
+    manager = _manager(settings)
+    await manager.start()
+    try:
+        # Warm a worker so there is a live handle whose hello we can sabotage.
+        await manager.synthesize(engine_id="mock", model_alias="mock-tone", text="warm")
+        handle = manager._workers["mock"]
+        assert handle.hello.get("capabilities", {}).get("streaming") is True
+        # ``capabilities`` must be a mapping; None makes the lookup raise, which is
+        # exactly the "setup blew up while holding the lock" scenario.
+        handle.hello["capabilities"] = None
+
+        with pytest.raises(AttributeError):
+            await manager.stream(
+                engine_id="mock", model_alias="mock-tone", text="never streamed"
+            )
+
+        assert not manager._engine_lock("mock").locked(), (
+            "stream() failed during setup and never released the engine lock"
+        )
+        assert manager.queue_depth() == 0, "the aborted job must leave the queue"
+        assert manager.in_flight_count() == 0
+
+        # And the engine still works.
+        result = await asyncio.wait_for(
+            manager.synthesize(
+                engine_id="mock", model_alias="mock-tone", text="after the failed setup"
+            ),
+            timeout=90,
+        )
+        assert result.duration_sec > 0
+    finally:
+        await manager.stop()
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (M1): a worker death mid-stream is not a clean stream
+# ---------------------------------------------------------------------------
+
+
+async def _drain_until_closed(queue, timeout: float = 30.0) -> int:
+    """Read PCM chunks until the end-of-stream sentinel; return the chunk count."""
+    chunks = 0
+    while True:
+        chunk = await asyncio.wait_for(queue.get(), timeout=timeout)
+        if not chunk:
+            return chunks
+        chunks += 1
+
+
+@pytest.mark.asyncio
+async def test_worker_death_mid_stream_is_recorded_as_a_stream_error(tmp_path):
+    """The empty sentinel means "stopped", not "succeeded"."""
+    settings = _settings(tmp_path)
+    settings.ensure_dirs()
+    manager = _manager(settings)
+    await manager.start()
+    try:
+        stream_id, queue, _mode = await manager.stream(
+            engine_id="mock", model_alias="mock-tone", text="word " * 80
+        )
+        assert await _wait_for(lambda: manager.in_flight_count() == 1)
+        manager._workers["mock"].process.kill()
+
+        await _drain_until_closed(queue)
+
+        failure = manager.stream_error("mock", stream_id)
+        assert failure is not None, "a crashed worker's stream must not look successful"
+        assert failure["error_code"] == "WORKER_CRASHED"
+        assert failure["message"]
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_clean_stream_records_no_stream_error(tmp_path):
+    settings = _settings(tmp_path)
+    settings.ensure_dirs()
+    manager = _manager(settings)
+    await manager.start()
+    try:
+        stream_id, queue, _mode = await manager.stream(
+            engine_id="mock", model_alias="mock-tone", text="a short clean line"
+        )
+        assert await _drain_until_closed(queue) > 0
+        assert manager.stream_error("mock", stream_id) is None
+        assert manager.stream_error("no-such-engine", stream_id) is None
+    finally:
+        await manager.stop()
+
+
+def test_websocket_reports_worker_crash_instead_of_done(tmp_path):
+    """M1 end to end: the WS client gets an error frame, not ``done``."""
+    import json
+
+    from fastapi.testclient import TestClient
+
+    from agent_voice.api.app import create_app
+
+    settings = _settings(tmp_path)
+    app = create_app(settings=settings, mount_mcp=False)
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/audio/ws") as ws:
+            ws.send_json({"type": "speak", "text": "word " * 80})
+            started = ws.receive_json()
+            assert started["type"] == "started"
+
+            handle = app.state.ctx.workers._workers["mock"]
+            handle.process.kill()
+
+            final: dict | None = None
+            for _ in range(5000):
+                raw = ws.receive()
+                if raw.get("type") != "websocket.send":  # pragma: no cover - closed early
+                    break
+                if raw.get("bytes") is not None:
+                    continue
+                final = json.loads(raw["text"])
+                break
+
+            assert final is not None, "the socket closed without a final frame"
+            assert final["type"] == "error", (
+                f"a crashed worker was reported as {final['type']}, not an error"
+            )
+            assert final["error_code"] == "WORKER_CRASHED"
+
+            # The socket stays usable after a stream dies.
+            ws.send_json({"type": "ping"})
+            assert ws.receive_json() == {"type": "pong"}

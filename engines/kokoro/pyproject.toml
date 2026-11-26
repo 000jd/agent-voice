@@ -1,0 +1,41 @@
+[project]
+name = "agent-voice-engine-kokoro"
+version = "0.1.0"
+description = "Kokoro-82M CPU-only TTS backend for agent-voice"
+requires-python = ">=3.12,<3.13"
+
+# CPU-only, deliberately.
+#
+# torch must be a DIRECT dependency with an explicit CPU index. Listing it only
+# as kokoro's transitive dependency makes uv resolve the CUDA wheel from PyPI,
+# which drags in every nvidia-* package plus triton (~3 GB) for a model that
+# never touches the GPU. With the pin below `uv sync` installs torch==2.15.0+cpu
+# and nothing else from the accelerator stack.
+#
+# en-core-web-sm is misaki[en]'s spaCy model for English G2P. misaki downloads
+# it at first use through its *own* installer, which can target the active
+# interpreter instead of this venv (the Phase 0 spike saw it land in the repo
+# .venv, after which the pipeline failed with "Can't find model
+# 'en_core_web_sm'"). Declaring it as a direct URL dependency makes `uv sync`
+# install it here, where KPipeline actually looks.
+dependencies = [
+    "kokoro==0.9.4",
+    "torch==2.15.0",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+    "huggingface-hub>=0.26",
+]
+
+[tool.uv]
+# No build backend: this is a virtual project (worker.py is run, not installed),
+# so `uv sync` only materialises .venv.
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]

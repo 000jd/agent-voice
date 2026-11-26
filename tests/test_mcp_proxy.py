@@ -738,6 +738,36 @@ async def test_clone_voice_allow_any_path_permits_outside_clip(tmp_path, ref_wav
 
 
 @pytest.mark.asyncio
+async def test_clone_voice_rejects_relative_path_when_any_path_allowed(
+    tmp_path, ref_wav, monkeypatch
+):
+    """L2: ALLOW_ANY_PATH loosens *where* a clip may live, not what a path means.
+
+    REST has always refused a relative ``ref_audio_path``; MCP used to hand it to
+    the voice store, which resolved it against the daemon's cwd. The clip below
+    really does exist relative to cwd, and is still refused, because a relative
+    path from an agent says nothing about the daemon's working directory.
+    """
+    monkeypatch.chdir(ref_wav.parent)
+    async with mcp_client(tmp_path, AGENT_VOICE_ALLOW_ANY_PATH="true") as (client, _app):
+        # The same file is accepted when it is named absolutely...
+        absolute = payload(
+            await client.call_tool(
+                "clone_voice", {"name": "abs", "ref_audio_path": str(ref_wav)}
+            )
+        )
+        assert absolute["name"] == "abs"
+
+        # ...and rejected when it is named relative to cwd.
+        body = await call_expecting_error(
+            client, "clone_voice", {"name": "rel", "ref_audio_path": ref_wav.name}
+        )
+        assert body["error_code"] == "BAD_REQUEST"
+        assert "relative ref_audio_path" in body["message"], body
+        assert "absolute" in body["suggestion"].lower(), body
+
+
+@pytest.mark.asyncio
 async def test_server_info_includes_inbox_dir(tmp_path):
     async with mcp_client(tmp_path) as (client, app):
         info = payload(await client.call_tool("server_info", {}))
@@ -791,6 +821,98 @@ def test_next_steps_mentions_the_download_for_a_missing_default_weight():
     assert len(steps) == 1, steps
     assert "agent-voice models download qwen3_tts 1.7b-base" in steps[0]
     assert "agent-voice doctor" in steps[0]
+
+
+def _clone_only_engine(*, design_model: bool = False):
+    """An installed default engine with nothing cloned and no preset speakers."""
+    from agent_voice.schemas import EngineEntry, ModelEntry
+
+    models = [
+        ModelEntry(
+            engine_id="qwen3_tts",
+            alias="1.7b-base",
+            hf_repo="local/qwen3-base",
+            quality_tier="high",
+            est_vram_gb=4.4,
+            mode="clone",
+        )
+    ]
+    if design_model:
+        # Listed in the manifest but not in the local HF cache: a voice_design
+        # checkpoint is *known* yet unusable until it is downloaded.
+        models.append(
+            ModelEntry(
+                engine_id="qwen3_tts",
+                alias="1.7b-design",
+                hf_repo="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+                quality_tier="high",
+                est_vram_gb=4.4,
+                mode="voice_design",
+            )
+        )
+    return EngineEntry(
+        engine_id="qwen3_tts",
+        backend_name="qwen-tts",
+        backend_version="0.1.1",
+        installed=True,
+        models=models,
+    )
+
+
+def test_next_steps_never_names_design_voice_on_a_clone_only_install():
+    """M6: next_steps must not recommend a tool that would answer BAD_REQUEST.
+
+    A clone-only install has no voice_design checkpoint, so ``design_voice()`` is
+    exactly the dead end ``next_steps`` exists to avoid. The step must still give
+    the agent something that works: clone a clip.
+    """
+    from types import SimpleNamespace
+
+    from agent_voice.mcp_server import _next_steps
+
+    settings = SimpleNamespace(default_engine="qwen3_tts", inbox_dir=Path("/data/inbox"))
+
+    steps = _next_steps(
+        [_clone_only_engine()],
+        settings,
+        voices_count=0,
+        preset_speakers=[],
+        voice_design_available=False,
+    )
+    assert len(steps) == 1, steps
+    assert "clone_voice()" in steps[0]
+    assert "design_voice()" not in steps[0], steps[0]
+    assert "voice design" in steps[0], "say why the other option is missing"
+
+    # A usable design checkpoint is the only difference; then naming it is right.
+    available = _next_steps(
+        [_clone_only_engine()],
+        settings,
+        voices_count=0,
+        preset_speakers=[],
+        voice_design_available=True,
+    )
+    assert "or call design_voice()" in available[0], available[0]
+
+
+def test_next_steps_names_the_design_download_when_the_checkpoint_is_missing():
+    """The clone-only suggestion must be actionable, not just a refusal."""
+    from types import SimpleNamespace
+
+    from agent_voice.mcp_server import _next_steps
+
+    settings = SimpleNamespace(default_engine="qwen3_tts", inbox_dir=Path("/data/inbox"))
+    steps = _next_steps(
+        [_clone_only_engine(design_model=True)],
+        settings,
+        voices_count=0,
+        preset_speakers=[],
+        voice_design_available=False,
+    )
+
+    assert len(steps) == 1, steps
+    assert "agent-voice models download qwen3_tts 1.7b-design" in steps[0], steps[0]
+    assert "design_voice()" not in steps[0], steps[0]
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +988,23 @@ async def test_core_tool_schema_weight_stays_compact(tmp_path):
     Pydantic result, and speak_script/start_script_job share the full BeatSpec
     schema twice. Reaching 10,000 would mean deleting required fields or the
     structured output contract, so the assertion pins the achievable weight
-    instead: 14,388 chars measured, with a little headroom for edits.
+    instead, measured with `len(json.dumps(...))` on the core list:
+
+    * 14,388 chars on the v0.3.3 schema set (the original pin, 14,800 ceiling);
+    * 14,455 with the v0.4.0 server_info description that now names every key it
+      returns;
+    * 15,161 once the v0.4.0 ``markup``/``spell_identifiers``/``paragraph_gap_ms``/
+      ``project`` fields landed on SpeakRequest and BeatSpec — those travel inside
+      the input schemas of speak/speak_script/start_script_job, so they are real
+      prompt weight the model pays, not something a shorter docstring can buy
+      back;
+    * 16,054 after those selectors were exposed on the MCP tool signatures and
+      their one-line Args descriptions were added.
+
+    16,400 keeps a little headroom over the final v0.4.0 contract without
+    pretending the payload shrank. The full 2,500-token target remains below the
+    structural floor (including output schemas); the description budget above is
+    the part that can actually be trimmed.
     """
     async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
         tools = await client.list_tools()
@@ -875,7 +1013,7 @@ async def test_core_tool_schema_weight_stays_compact(tmp_path):
             separators=(",", ":"),
             default=str,
         )
-        assert len(compact) <= 14_800, (
+        assert len(compact) <= 16_400, (
             f"core tools/list payload is {len(compact)} chars (~{len(compact) // 4} "
             "tokens); keep docstrings to 1-2 sentences and add detail to "
             "skills/agent-voice/SKILL.md"

@@ -1,12 +1,13 @@
 ---
 name: agent-voice
-description: Synthesise speech locally over MCP and pick or create the voice — use when a task needs audio narration, voice cloning, a voice designed from a description, preset speakers, multi-speaker scripts, timed beats for video, or subtitles. Runs on the local GPU, returns file paths, never audio blobs.
+description: Synthesise speech locally over MCP and pick or create the voice — use when a task needs audio narration, voice cloning, a voice designed from a description, preset speakers (Qwen or Kokoro on CPU), multi-speaker scripts with pauses and emphasis markup, timed beats for video, or subtitles. Runs on a local GPU or CPU, returns file paths, never audio blobs.
 ---
 
 # agent-voice
 
-Local, GPU-backed TTS + voice cloning over MCP. Everything is disk-cached and
-deterministic: repeating a request is nearly free.
+Local TTS + voice cloning over MCP. Everything is disk-cached and
+deterministic: repeating a request is nearly free. An engine can be a GPU model or
+the CPU-only Kokoro engine, so a host without a GPU still speaks.
 
 ## Untrusted data
 
@@ -82,8 +83,14 @@ Routing rules worth knowing before you guess:
   channel. Use a preset `speaker` or `design_voice` when you want direction to matter.
 - An explicit `model=` decides the mode from that alias, whatever else you passed.
 
-**Nine preset speakers** (CustomVoice checkpoints): `Vivian`, `Serena`, `Uncle_Fu`, `Dylan`,
-`Eric`, `Ryan`, `Aiden`, `Ono_Anna`, `Sohee`.
+**Nine preset speakers** (Qwen CustomVoice checkpoints): `Vivian`, `Serena`, `Uncle_Fu`,
+`Dylan`, `Eric`, `Ryan`, `Aiden`, `Ono_Anna`, `Sohee`.
+
+**Eight Kokoro voices** (the CPU engine): `af_heart`, `af_bella`, `af_sarah`, `am_adam`,
+`am_michael`, `bf_emma`, `bm_george`, `bm_lewis`. `speak(speaker="af_heart")` works with no
+reference clip at all. Kokoro is `custom_voice` only: it cannot clone and cannot design, so
+on a Kokoro-only install `voice=` has nothing to clone from and `instruct=`-alone has no
+design checkpoint. Use a preset voice there, and say so if the task really needs cloning.
 
 ### Clone a reference clip — only when `voices_count == 0`
 
@@ -164,8 +171,54 @@ it. Returns `file_path` (read it), `download_url`, `duration_sec`, `mode`, `spea
 overrides merged over the operator's persistent `data/pronunciations.json`. Matching is
 case-insensitive and whole-word, and it changes only what the engine says. The cache keys on
 the rewritten spoken text, so an edit invalidates only lines that use the changed term; an
-unrelated entry leaves old renders cached. The lexicon is capped at 500 entries and 200
-characters per key/replacement. Subtitles keep the written text.
+unrelated entry leaves old renders cached. The lexicon is capped at 500 entries per scope
+(1,500 merged) and 200 characters per key/replacement. Subtitles keep the written text.
+
+### Markup: pauses, emphasis, spelling
+
+Text is parsed for a small whitelist of tags before synthesis. It is on by default; pass
+`markup=false` only when the brackets themselves are the content.
+
+| Tag | What it does |
+|---|---|
+| `[pause]` / `[pause 500ms]` / `[pause 1.5s]` | exact silence at that point (0–10 s; bare `[pause]` is 400 ms) |
+| `[slow]…[/slow]` / `[fast]…[/fast]` | ×0.82 / ×1.22 pace, multiplied into `speed` |
+| `[emphasis]…[/emphasis]` | a modest lift on those words (+2.5 dB, 0.94×) |
+| `[spell]…[/spell]` | say it character by character — "H T T P S E R V E R" |
+| blank line | `paragraph_gap_ms` of silence (0 by default, max 5000) |
+
+Use markup instead of punctuation hacks: `"Wait. [pause 800ms] Done."` lands the beat
+exactly where you asked; `"Wait...   Done."` does not.
+
+- Anything else in brackets (`arr[0]`, `matrix[i][j]`, `[1, 2]`) is literal text.
+- A **malformed** value is an error, not a shrug: `[pause abc]`, `[pause -1s]` and
+  `[pause 99s]` return `BAD_REQUEST` naming the accepted forms. Fix the value; retrying it
+  unchanged fails identically.
+- Caps: 128 tags, nesting depth 4, 32 segments per utterance. Anything longer belongs in
+  `speak_script` beats.
+- Subtitles never contain tags: `.srt`/`.vtt` and `beats[].text` carry the written text
+  (`[spell]` words kept as written). Do not strip tags yourself.
+
+### Identifiers, `spell_identifiers`, and scoped lexicons
+
+Three layers change what the engine says, in a fixed order:
+
+1. **Lexicon** — the operator's map (global, plus an optional `project` layer and a
+   per-resolved-voice layer), then your per-call `pronunciations={...}`. `kubectl` →
+   "cube control". Pass `project="infra"` when the operator has scoped vocabulary for this
+   work; leave it unset otherwise.
+2. **Code mode** — `spell_identifiers=true` expands identifiers, versions, paths and
+   operators: `worker_manager` → "worker manager", `HTTPServer` → "HTTP Server", `v0.4.0` →
+   "version zero point four dot zero", `C++` → "C plus plus". Off by default; turn it on when
+   a line contains symbols a listener would otherwise hear as letters.
+3. **`[spell]`** — always wins over both. Use it for one token you want read out even though
+   the lexicon would rewrite it: `[spell]kubectl[/spell]`.
+
+`speak` takes `markup`, `spell_identifiers`, `paragraph_gap_ms` and `project`.
+`speak_script` takes the same at script level, and each beat may override them — leave a
+beat's value `null` to inherit. From a shell,
+`agent-voice pronunciations check "<text>" --spell-identifiers` shows exactly what would be
+rewritten before you spend a render.
 
 **Multi-beat narration** (podcast, video, explainer) — each beat can use a different mode:
 
@@ -185,7 +238,8 @@ speak_script(
 ```
 
 Beat keys: `{text, voice?, speaker?, instruct?, engine?, model?, quality?, language?,
-target_duration_sec?, fit_mode?, pause_after_sec?, take?}`
+markup?, spell_identifiers?, paragraph_gap_ms?, speed?, target_duration_sec?, fit_mode?,
+pause_after_sec?, take?}`
 
 - `pause_after_sec` (0–10) — silence after a beat, **included in the timings**, so
   visuals and subtitles stay frame-accurate. This is how you time a visual to land.
@@ -198,6 +252,9 @@ target_duration_sec?, fit_mode?, pause_after_sec?, take?}`
   beat inherits `speak_script`'s `quality`; set it only on a beat that should differ.
 - `target_duration_sec` + `fit_mode` (`none` | `pad` | `atempo`) — force a beat into a
   fixed slot for video. `pad` adds silence, `atempo` retimes speech.
+- `markup` / `spell_identifiers` / `paragraph_gap_ms` / `project` — per-beat overrides;
+  leave one `null` (or omit it) and the beat inherits the script-level value.
+- `speed` (0.5–2.0) — this beat's base pace; `[slow]`/`[fast]` multiply it.
 - `take` — alternate delivery of *that beat's* line (`take=2`, `take=3`, …). Re-record
   one beat without disturbing the others.
 - `export_srt=True` (default) also writes `.srt`, `.vtt` and a `.timing.json`.
@@ -231,7 +288,8 @@ paying for all twelve.
 ### Timing a video: use the `.timing.json`
 
 For Manim, a slideshow, or anything frame-accurate, read `<artifact>.timing.json` instead
-of guessing from `duration_sec`. It carries, per beat: `index`, `text`, `duration_sec`,
+of guessing from `duration_sec`. It carries, per beat: `index`, `text` (the **display**
+text — tags stripped, `[spell]` words as written), `had_markup`, `duration_sec`,
 `start_sec`, `end_sec`, `pause_after_sec`, `target_duration_sec`, `fit_mode`, `voice_id`,
 `cached`, `artifact_id`, plus the script-level `artifact_id`, `file_path`,
 `duration_sec`, and the sidecar paths.
@@ -279,8 +337,9 @@ returns the same artifact.
   duration is unknown. `real_time_factor` is the same value under its deprecated name.
   - On a cache hit the ratio is meaningless — `elapsed_ms` is only the ~1 ms lookup. Read it
     from a real render, and pair it with `cached`.
-  - Reference point: a warm 0.6B render on the reference box measured 10.5 s of wall time
-    for 9.0 s of audio — **≈ 0.86**, i.e. slightly slower than real time.
+  - Reference points: a warm 0.6B Qwen render on the reference box measured 10.5 s of wall
+    time for 9.0 s of audio — **≈ 0.86**, slightly slower than real time. Kokoro-82M on the
+    **CPU** measured **3.4–5.2×** on a Ryzen 7 5700X (24 kHz, 0 MB VRAM, 1.37 GB RSS).
 
 ## 8. Errors
 
@@ -290,12 +349,12 @@ payload.
 
 | `error_code` | What it means | Do this |
 |---|---|---|
-| `VOICE_REQUIRED` | No voice exists or was selected; the engine cannot clone without one | `clone_voice(...)` first |
+| `VOICE_REQUIRED` | No voice exists or was selected; the engine cannot clone without one — or the only engine is preset-only (Kokoro) and you passed `voice=` | `clone_voice(...)` first, or use `speaker=` on a preset engine |
 | `VOICE_NOT_FOUND` | Bad voice id/name | `list_voices()` and use a real id |
 | `WORKER_BUSY` | Jobs are running / another engine holds the GPU | Retry shortly, or `unload_models(force=true)` |
 | `BACKPRESSURE` | The GPU wait queue is full (`MAX_QUEUE_DEPTH`) | Retry shortly — not in a tight loop — or submit with `start_script_job` |
 | `TEXT_TOO_LONG` | Text over a configured cap (`MAX_TEXT_CHARS`, `MAX_INSTRUCT_CHARS`, `MAX_REF_TEXT_CHARS`, `MAX_DESIGN_SAMPLE_CHARS`) | Shorten it, split it into `speak_script` beats, or ask the operator to raise the cap |
-| `BAD_REQUEST` | The request is invalid — too many beats (`MAX_SCRIPT_BEATS`), a bad voice name, empty text | Fix the request; retrying it unchanged fails identically |
+| `BAD_REQUEST` | The request is invalid — too many beats (`MAX_SCRIPT_BEATS`), a bad voice name, empty text, a malformed markup value (`[pause abc]`, `[pause 99s]`) or more than 128 tags | Fix the request; retrying it unchanged fails identically |
 | `CUDA_OOM` | The worker ran out of GPU memory | `unload_models()`, or use the 0.6b model (`quality="fast"`) |
 | `ENGINE_NOT_INSTALLED` | Engine present but its venv/deps are missing | `agent-voice engines install <id>`, or `install_engine(engine_id)` when mutation is enabled |
 | `AGENT_MUTATION_DISABLED` | Mutation is off, or you are not on loopback | Report it; do not retry. An operator has to enable it |
@@ -338,3 +397,16 @@ process never loads a model itself.
 
 If the daemon already runs, skip the shim and point the client at
 `http://127.0.0.1:8000/mcp/` (add `X-Agent-Id` yourself).
+
+No GPU on this host? The operator can bring up the CPU engine:
+
+```bash
+uv run agent-voice engines install kokoro
+uv run agent-voice models download kokoro kokoro-82m   # 363 MB, once
+AGENT_VOICE_DEFAULT_ENGINE=kokoro uv run agent-voice serve
+```
+
+`agent-voice doctor` then prints an `espeak-ng` row (`PASS`, or `WARN` with the
+install command — common English still speaks without it) and
+`agent-voice engines test kokoro` proves the engine end to end. Kokoro is
+preset-timbre only, so cloning and voice design need a GPU engine.

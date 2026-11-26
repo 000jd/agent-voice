@@ -4,6 +4,12 @@ Extracted from the FastAPI route so the MCP server can call it directly with an
 explicit ``agent_id`` and ``client_host`` instead of faking a Request object.
 That fake was not merely ugly: it reported ``client=None``, which silently
 disabled the loopback check on every mutation that went through MCP.
+
+Each beat is rendered by :mod:`agent_voice.services.utterance_service`, the same
+pipeline ``/v1/agent/speak`` uses, so markup, the scoped lexicon and code
+normalization cannot behave differently inside a script. What stays here is the
+part that is genuinely script-shaped: per-beat routing, ``fit_mode``, inter-beat
+pauses, the stitched master, and the timing arithmetic that subtitles depend on.
 """
 
 from __future__ import annotations
@@ -18,15 +24,17 @@ import soundfile as sf
 
 from ..api.routing import ResolvedTarget, resolve_target
 from ..audio_utils import (
+    CROSSFADE_MS,
     SAMPLE_RATE,
     crossfade_stitch,
     fit_segment,
     probe_duration,
     silence,
+    stitch_offsets,
     write_srt,
     write_vtt,
 )
-from ..pronunciations import apply_pronunciations
+from ..markup import MarkupScript, parse_markup
 from ..schemas import (
     AgentVoiceError,
     BeatSpec,
@@ -37,11 +45,10 @@ from ..schemas import (
     ScriptResult,
 )
 from ..security import resolve_artifact_path
+from ..text_norm import lexicon_mapping
+from .utterance_service import speak_utterance
 
 logger = logging.getLogger(__name__)
-
-CROSSFADE_MS = 20
-"""Seam crossfade used by :func:`crossfade_stitch`; also the unit of timing drift."""
 
 TIMING_TOLERANCE_SEC = 2e-3
 """Slack tolerated between the computed beat layout and the real master file."""
@@ -57,10 +64,17 @@ def _segment_frames(path: Path) -> int:
     frame count: approximating it would push every later onset off by a
     millisecond or two per seam.
     """
+    import soundfile as sf
+
     try:
         return int(sf.info(str(path)).frames)
     except (RuntimeError, OSError):
         return max(0, int(round(probe_duration(path) * SAMPLE_RATE)))
+
+
+def _effective(value, fallback):
+    """Per-beat setting with the script-level default applied when omitted."""
+    return fallback if value is None else value
 
 
 async def render_script(
@@ -72,8 +86,10 @@ async def render_script(
 ) -> ScriptResult:
     """Render a multi-beat script into one stitched artifact.
 
-    Each beat's spoken text passes through the pronunciation lexicon, but the
-    returned timings and subtitles keep the words as the caller wrote them.
+    Each beat's spoken text passes through markup, the scoped lexicon and
+    (optionally) code normalization, but the returned timings and subtitles keep
+    the words as the caller wrote them — minus the tags, which are instructions,
+    not content.
 
     Args:
         ctx: Application context (settings, registry, workers, voices, jobs).
@@ -97,10 +113,23 @@ async def render_script(
             "Split it into smaller scripts or raise MAX_SCRIPT_BEATS.",
         )
 
-    # One map for the whole script: the persistent lexicon plus this call's
-    # overrides. The rewritten text is what gets spoken and what the cache keys
-    # on, so an unrelated lexicon edit leaves existing beats cached.
-    pron_map = ctx.pronunciations.effective(payload.pronunciations)
+    # Parse every beat before any worker exists. A malformed tag or an over-cap
+    # beat near the end of a long script must not be discovered after the earlier
+    # beats have already been rendered — and paid for. Parsing is pure, so this
+    # costs nothing but a second pass over the text.
+    parsed: list[MarkupScript] = [
+        parse_markup(
+            beat.text,
+            markup=_effective(beat.markup, payload.markup),
+            paragraph_gap_ms=_effective(beat.paragraph_gap_ms, payload.paragraph_gap_ms),
+        )
+        for beat in payload.beats
+    ]
+
+    # One lexicon per (project, resolved voice) pair. The voice layer is why this
+    # cannot be hoisted before routing: an auto-selected voice brings its own
+    # vocabulary, and a multi-speaker podcast has one voice per beat.
+    dictionaries: dict[tuple[str | None, str | None], dict[str, str]] = {}
 
     # Every beat may name its own voice/engine/model — that is what makes a
     # multi-speaker podcast possible — but most scripts repeat the same tuple, so
@@ -155,36 +184,56 @@ async def render_script(
     spoken: dict[int, tuple[str | None, ModelMode, str | None, str]] = {}
     """beat index -> (voice_id, mode, speaker, instruct) that actually spoke it."""
     beat_cache: dict[int, tuple[bool, str]] = {}
+    beat_display: dict[int, str] = {}
+    """beat index -> text for subtitles, with tags stripped."""
+    beat_had_markup: dict[int, bool] = {}
     total_beats = len(payload.beats)
 
     try:
         for index, beat in enumerate(payload.beats):
             target = target_for(beat)
-            result = await ctx.workers.synthesize(
-                engine_id=target.engine_id,
-                model_alias=target.model_alias,
-                # Only the spoken text is rewritten; beat.text stays the caller's
-                # words for the timings and the subtitles.
-                text=apply_pronunciations(beat.text, pron_map),
-                voice_id=target.voice_id,
-                ref_text=target.ref_text,
-                x_vector_only=target.x_vector_only,
-                # Resolved, not raw: a beat that asked for a preset speaker must
-                # not reach the worker as a clone request, and a designed line must
-                # carry its instruction.
-                mode=target.mode,
-                speaker=target.speaker,
-                instruct=target.instruct,
+            spell_identifiers = _effective(
+                beat.spell_identifiers, payload.spell_identifiers
+            )
+            # A fit mode owns the duration of this beat, so a [slow]/[fast] in the
+            # text must not fight the tempo change that lands it on the target.
+            fitting = bool(beat.target_duration_sec) and beat.fit_mode != "none"
+
+            lexicon_key = (payload.project, target.voice_id)
+            mapping = dictionaries.get(lexicon_key)
+            if mapping is None:
+                mapping = lexicon_mapping(
+                    ctx,
+                    project=payload.project,
+                    voice_id=target.voice_id,
+                    overrides=payload.pronunciations,
+                )
+                dictionaries[lexicon_key] = mapping
+
+            outcome = await speak_utterance(
+                ctx,
+                text=beat.text,
+                script=parsed[index],
+                resolve=lambda target=target: target,
+                spell_identifiers=spell_identifiers,
+                project=payload.project,
+                overrides=payload.pronunciations,
+                mapping=mapping,
                 language=beat.language,
-                speed=1.0,
+                speed=beat.speed,
                 response_format="wav",
                 take=beat.take,
+                markup_speed=not fitting,
+                work_dir=work_dir,
             )
+            result = outcome.result
             segment = work_dir / f"beat-{index:03d}.wav"
             segment.write_bytes(Path(result.file_path).read_bytes())
             beat_cache[index] = (bool(result.cached), result.artifact_id)
+            beat_display[index] = outcome.display_text
+            beat_had_markup[index] = outcome.had_markup
 
-            if beat.target_duration_sec and beat.fit_mode != "none":
+            if fitting:
                 fitted = work_dir / f"beat-{index:03d}-fit.wav"
                 fit_segment(
                     segment,
@@ -227,47 +276,27 @@ async def render_script(
         crossfade_stitch(segments, master, crossfade_ms=CROSSFADE_MS)
         total = probe_duration(master)
 
-        # Timings must describe the audio we actually produced. A crossfade
+        # Timings must describe the audio we actually produced. The crossfade
         # overlaps each seam, so summing raw segment durations would drift past the
-        # real file length. Mirror the stitcher's own arithmetic exactly: it removes
-        # min(fade, accumulated, next) frames at each seam, and only when that is
-        # more than one frame.
-        counts = [_segment_frames(segment) for segment in segments]
-        fade = max(1, int(SAMPLE_RATE * CROSSFADE_MS / 1000))
-        losses: list[int] = []
-        accumulated = counts[0]
-        for count in counts[1:]:
-            overlap = min(fade, accumulated, count)
-            loss = overlap if overlap > 1 else 0
-            losses.append(loss)
-            accumulated += count - loss
-
-        onsets: list[float] = []
-        spans: list[float] = []
-        cursor = 0
-        for position, count in enumerate(counts):
-            loss = losses[position] if position < len(losses) else 0
-            span = max(0, count - loss)
-            onsets.append(cursor / SAMPLE_RATE)
-            spans.append(span / SAMPLE_RATE)
-            cursor += span
+        # real file length; stitch_offsets mirrors the stitcher's own arithmetic.
+        offsets = stitch_offsets([_segment_frames(segment) for segment in segments])
+        layout_end = sum(span for _onset, span in offsets)
 
         timings: list[BeatTiming] = []
         for position, (beat_index, is_pause) in enumerate(layout):
             if is_pause:
                 continue
             beat = payload.beats[beat_index]
-            start = onsets[position]
-            span = spans[position]
+            start, span = offsets[position]
             cached, beat_artifact = beat_cache.get(beat_index, (False, ""))
             voice_id, beat_mode, beat_speaker, beat_instruct = spoken[beat_index]
             timings.append(
                 BeatTiming(
                     index=beat_index,
-                    # Deliberately the original words: a pronunciation rewrite is
-                    # how the line is spoken, not what was scripted, so subtitles
-                    # must keep showing "kubectl" rather than "kube control".
-                    text=beat.text,
+                    # The display text: tags are instructions, so they are stripped
+                    # here; a pronunciation rewrite is how the line is spoken, not
+                    # what was scripted, so that stays in the subtitle too.
+                    text=beat_display.get(beat_index, beat.text),
                     duration_sec=round(span, 4),
                     start_sec=round(start, 4),
                     end_sec=round(start + span, 4),
@@ -278,6 +307,7 @@ async def render_script(
                     mode=beat_mode,
                     speaker=beat_speaker,
                     instruct=beat_instruct,
+                    had_markup=beat_had_markup.get(beat_index, False),
                     cached=cached,
                     artifact_id=beat_artifact,
                 )
@@ -286,13 +316,13 @@ async def render_script(
         # Internal consistency check, deliberately not an assert (that would abort a
         # finished render over a rounding artefact). The layout — spoken parts plus
         # pauses, minus the crossfades — has to land on the end of the file we wrote.
-        drift = abs(cursor / SAMPLE_RATE - total)
+        drift = abs(layout_end - total)
         if drift > TIMING_TOLERANCE_SEC:
             logger.warning(
                 "script %s: beat layout ends at %.4fs but master.wav is %.4fs "
                 "(drift %.4fs)",
                 artifact_id,
-                cursor / SAMPLE_RATE,
+                layout_end,
                 total,
                 drift,
             )

@@ -10,15 +10,18 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import typer
+from pydantic import ValidationError
+from pydantic_settings import SettingsError
 
-from .config import get_settings
+from .config import Settings, get_settings
 
 # Imported eagerly, unlike the engine/model/voice modules below: Typer evaluates
 # option defaults when this module is imported, so the `voices design` sample text
@@ -81,7 +84,31 @@ def serve(
     """Run the daemon. Holds no GPU memory until a synthesis request arrives."""
     import uvicorn
 
+    from .api.app import _refuse_unsafe_bind
+    from .schemas import AgentVoiceError
+
     settings = get_settings()
+
+    # `--host`/`--port` beat the settings file, so the safety check has to judge
+    # the address uvicorn is actually about to bind, not the configured one: an
+    # operator running `serve --host 0.0.0.0` on a loopback-configured checkout
+    # must not get an unauthenticated server on the LAN. `is not None`, not `or`:
+    # `--port 0` means "any free port" and must survive to uvicorn.
+    effective_host = host if host is not None else settings.host
+    effective_port = port if port is not None else settings.port
+    try:
+        _refuse_unsafe_bind(
+            settings.model_copy(update={"host": effective_host, "port": effective_port})
+        )
+    except AgentVoiceError as exc:
+        # One line and a suggestion, never a traceback: this is a configuration
+        # refusal, and the operator has to read the fix.
+        typer.secho(exc.message, fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Only now touch the filesystem: a refused bind leaves no pid file behind.
     settings.ensure_dirs()
 
     pid_file = settings.data_dir / "daemon.pid"
@@ -90,8 +117,8 @@ def serve(
     uvicorn.run(
         "agent_voice.api.app:create_app",
         factory=True,
-        host=host or settings.host,
-        port=port or settings.port,
+        host=effective_host,
+        port=effective_port,
         reload=reload,
         log_level="info",
     )
@@ -295,6 +322,11 @@ def _check_port(host: str, port: int, base_url: str) -> _Check:
     A bind is the only honest availability test. When it fails the port is taken,
     which is fine if the thing holding it answers `/health` (a running daemon);
     anything else would make `serve` fail with EADDRINUSE.
+
+    The address is resolved with `getaddrinfo` and the socket is built from the
+    first result, so the probe speaks the same family uvicorn will: an IPv6
+    loopback bind (`AGENT_VOICE_HOST=::1`) is a supported setup, and an
+    `AF_INET`-only socket could never bind it.
     """
     import socket
 
@@ -302,15 +334,28 @@ def _check_port(host: str, port: int, base_url: str) -> _Check:
 
     label = f"{host}:{port}"
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        family, socktype, proto, _canon, address = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )[0]
+    except OSError as exc:
+        return _Check(
+            "port",
+            "FAIL",
+            f"{label} cannot be resolved ({_one_line(exc)})",
+            "set AGENT_VOICE_HOST to an address this machine owns "
+            "(127.0.0.1 or ::1 for loopback)",
+        )
+    try:
+        with socket.socket(family, socktype, proto) as sock:
             # SO_REUSEADDR forgives TIME_WAIT, never a live listener.
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((host, port))
+            sock.bind(address)
     except OSError as exc:
         bind_error = _one_line(exc)
     else:
         return _Check("port", "PASS", f"{label} is free")
 
+    # `base_url` comes from the settings as-is: it is bracketed for an IPv6 host.
     try:
         response = httpx.get(f"{base_url}/health", timeout=2.0)
         healthy = response.status_code == 200 and bool(response.json())
@@ -421,31 +466,14 @@ def _inbox_check(settings) -> _Check:
     return _Check("inbox", "PASS", str(settings.inbox_dir))
 
 
-def _env_check(
-    *,
-    default_engine: str,
-    known: list[str],
-    installed: list[str],
-    engines_usable: bool = True,
-) -> _Check:
-    """`.env` presence, plus whether the configured default engine can serve.
+_STATUS_RANK = {"PASS": 0, "WARN": 1, "FAIL": 2}
 
-    `settings.default_engine` is the *effective* value (a shell variable beats the
-    file, as it does for the daemon), so this checks what would really be used.
-    Only engine ids are ever printed: a `.env` also holds API keys, and this
-    command's output is the kind of thing a user pastes into an issue.
-    """
+
+def _default_engine_check(
+    *, default_engine: str, known: list[str], installed: list[str]
+) -> _Check:
+    """Can the effective `AGENT_VOICE_DEFAULT_ENGINE` actually serve a request?"""
     fallback = installed[0] if installed else "mock"
-    if not (Path.cwd() / ".env").is_file():
-        return _Check(".env", "WARN", "absent, built-in defaults apply", "cp .env.example .env")
-    if not engines_usable:
-        # One root cause, one row: the engines row already carries the FAIL.
-        return _Check(
-            ".env",
-            "WARN",
-            "present; default engine not checked (engines are unusable)",
-            "fix the engines row first, then re-run doctor",
-        )
     if not default_engine:
         return _Check(
             ".env",
@@ -478,6 +506,116 @@ def _env_check(
     return _Check(".env", "PASS", f"AGENT_VOICE_DEFAULT_ENGINE={default_engine} (installed)")
 
 
+def _env_check(
+    *,
+    default_engine: str,
+    known: list[str],
+    installed: list[str],
+    engines_usable: bool = True,
+) -> _Check:
+    """`.env` presence, plus whether the configured default engine can serve.
+
+    The two are judged independently: a checkout with no `.env` is a supported
+    setup (WARN, `cp .env.example .env`), while the *effective* engine — whichever
+    of the shell variable and the file wins — is always validated against the
+    engines that really exist. Reporting presence alone used to hide a ghost
+    `AGENT_VOICE_DEFAULT_ENGINE` in the environment behind a green run.
+
+    Only engine ids are ever printed: a `.env` also holds API keys, and this
+    command's output is the kind of thing a user pastes into an issue.
+    """
+    present = (Path.cwd() / ".env").is_file()
+    presence = "present" if present else "absent, built-in defaults apply"
+    fixes = [] if present else ["cp .env.example .env"]
+
+    if not engines_usable:
+        # One root cause, one row: the engines row already carries the FAIL.
+        return _Check(
+            ".env",
+            "WARN",
+            f"{presence}; default engine not checked (engines are unusable)",
+            # The presence fix still applies; the engines row owns the other one.
+            fixes[0] if fixes else "fix the engines row first, then re-run doctor",
+        )
+
+    engine = _default_engine_check(
+        default_engine=default_engine, known=known, installed=installed
+    )
+    if engine.status != "PASS" and engine.fix:
+        fixes.append(engine.fix)
+    status = max(
+        ("PASS" if present else "WARN", engine.status), key=_STATUS_RANK.__getitem__
+    )
+    return _Check(".env", status, f"{presence}; {engine.detail}", "; ".join(fixes))
+
+
+def _validation_detail(exc: Exception) -> str:
+    """One line naming the first offending key, e.g. `AGENT_VOICE_PORT: ...`.
+
+    A pydantic `ValidationError` renders as five lines with a docs URL; a doctor
+    row is one line, and the key is the only part the operator has to see.
+    """
+    errors = exc.errors() if hasattr(exc, "errors") else []
+    if not errors:
+        return _one_line(exc)
+    first = errors[0]
+    key = ".".join(str(part) for part in first.get("loc", ())) or "settings"
+    detail = f"{key}: {first.get('msg', 'invalid value')}"
+    if len(errors) > 1:
+        detail += f" (+{len(errors) - 1} more)"
+    return _one_line(detail)
+
+
+def _fallback_settings() -> Settings:
+    """Built-in defaults with `.env` ignored: what a broken config falls back to.
+
+    `_env_file=None` drops the file, but a bad value exported in the *environment*
+    would raise again; `model_construct()` then returns the plain field defaults,
+    so the remaining doctor rows still print instead of a second traceback.
+    """
+    try:
+        return Settings(_env_file=None)
+    except (ValidationError, SettingsError):
+        return Settings.model_construct()
+
+
+def _espeak_install_hint() -> str:
+    """The one command that installs espeak-ng on this platform."""
+    if sys.platform == "darwin":
+        return "brew install espeak-ng"
+    if sys.platform.startswith("win"):
+        return (
+            "install espeak-ng (https://github.com/espeak-ng/espeak-ng/releases) "
+            "and put espeak-ng.exe on PATH"
+        )
+    return "sudo apt install espeak-ng (or your distribution's package)"
+
+
+def _espeak_check(entries) -> _Check | None:
+    """espeak-ng presence, reported only when the shipped Kokoro engine exists.
+
+    Kokoro's English G2P is spaCy-based; espeak-ng is its out-of-dictionary
+    fallback and the backend for every non-English voice. Common English still
+    speaks without it, so a missing binary is a WARN carrying the install
+    command — never a FAIL — and a checkout that does not ship `engines/kokoro/`
+    gets no row at all.
+    """
+    if "kokoro" not in {entry.engine_id for entry in entries}:
+        return None
+
+    from .kokoro_support import espeak_ng_status
+
+    path, version = espeak_ng_status()
+    if path is None:
+        return _Check(
+            "espeak-ng",
+            "WARN",
+            "not on PATH (Kokoro out-of-dictionary and non-English G2P)",
+            _espeak_install_hint(),
+        )
+    return _Check("espeak-ng", "PASS", f"{path} {version}" if version else path)
+
+
 @app.command()
 def doctor() -> None:
     """Check this machine and checkout: tools, GPU, port, engines, weights, config.
@@ -491,7 +629,22 @@ def doctor() -> None:
 
     from .engine_registry import EngineRegistry
 
-    settings = get_settings()
+    # A bad `.env` (a non-numeric port, an unknown enum value) must be a FAIL row,
+    # not a traceback: like the engines row, this is the command you run *because*
+    # the configuration is wrong. The rest of the run uses built-in defaults so
+    # every other row still reports.
+    settings_error: _Check | None = None
+    try:
+        settings = get_settings()
+    except (ValidationError, SettingsError) as exc:
+        settings_error = _Check(
+            "config",
+            "FAIL",
+            _validation_detail(exc),
+            "fix .env (or the AGENT_VOICE_* variable overriding it) and re-run doctor; "
+            "the rows below use built-in defaults",
+        )
+        settings = _fallback_settings()
     default_engine = settings.default_engine
 
     # A broken ENGINES_DIR must show up as a FAIL row, not a traceback: the
@@ -546,6 +699,14 @@ def doctor() -> None:
         checks.append(_Check("ffmpeg", "PASS", f"{ffmpeg} (ffprobe present)"))
 
     checks.append(_probe_gpu())
+    # Engine-specific tool rows (`espeak-ng` for Kokoro) belong with the tool
+    # probes above, before `.env` decides which engine is expected to be
+    # installed. A missing optional tool is a WARN, never a FAIL.
+    espeak = _espeak_check(entries)
+    if espeak is not None:
+        checks.append(espeak)
+    if settings_error is not None:
+        checks.append(settings_error)
     # `.env` before the engine rows: it decides which engine is *expected* to be
     # installed, and a bad value there explains a confusing engine row.
     checks.append(
@@ -926,6 +1087,37 @@ def _skip_rest(steps: list[_Step], reason: str) -> list[_Step]:
     return steps
 
 
+def _conformance_target(registry, engine_id: str) -> tuple[str, str | None, str]:
+    """Pick ``(mode, speaker, model_alias)`` for the conformance synthesize step.
+
+    A clone model comes first: cloning is the v1 path every engine had to support
+    before v0.4.0, and CustomVoice/VoiceDesign aliases can share its quality tier,
+    so an unfiltered pick could load a checkpoint that cannot clone.
+
+    A preset-only engine has no clone alias at all — Kokoro declares
+    ``voice_clone: false`` and a single ``custom_voice`` model — so it is
+    exercised through that model's first ``preset_speakers`` entry, with both
+    ``mode`` and ``speaker`` sent exactly as routing would for
+    ``speak(speaker=...)``. Without this fallback a healthy CPU engine could
+    never pass its own conformance gate.
+    """
+    from .schemas import AgentVoiceError
+
+    try:
+        alias = registry.default_model_alias(engine_id, mode="clone")
+        return "clone", None, alias
+    except AgentVoiceError as clone_error:
+        try:
+            alias = registry.default_model_alias(engine_id, mode="custom_voice")
+        except AgentVoiceError:
+            # Report the clone complaint: "no clone model" is the honest summary,
+            # and MODEL_NOT_FOUND for an empty engine is identical either way.
+            raise clone_error from None
+        spec = registry.model_spec(engine_id, alias)
+        speaker = spec.preset_speakers[0] if spec.preset_speakers else None
+        return "custom_voice", speaker, alias
+
+
 async def _run_conformance(*, record, registry, settings) -> list[_Step]:
     """Drive one worker: spawn → hello → load → synthesize → cancel → shutdown."""
     import asyncio
@@ -996,10 +1188,10 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
             return _skip_rest(steps, "hello handshake invalid")
 
         # -- load_model -------------------------------------------------
-        # Conformance exercises the clone protocol; CustomVoice/VoiceDesign can
-        # share the high tier, so an unfiltered pick could load a non-clone model.
+        # Clone first, preset timbres second: the target decides which mode and
+        # speaker the synthesize step sends, so it is resolved before any load.
         try:
-            alias = registry.default_model_alias(engine_id, mode="clone")
+            mode, speaker, alias = _conformance_target(registry, engine_id)
         except AgentVoiceError as exc:
             steps.append(_Step("load_model", False, exc.message))
             return _skip_rest(steps, "no model alias to load")
@@ -1014,7 +1206,7 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
 
         load_ok = reply.get("error_code") is None and reply.get("model_alias") == alias
         detail = (
-            f"alias={alias} loaded_models={reply.get('loaded_models')}"
+            f"alias={alias} mode={mode} loaded_models={reply.get('loaded_models')}"
             if reply.get("error_code") is None
             else f"{reply.get('error_code')}: {reply.get('message')}"
         )
@@ -1023,18 +1215,22 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
             return _skip_rest(steps, "model failed to load")
 
         # -- synthesize -------------------------------------------------
-        ref_wav, ref_text, x_vector_only = _reference_voice(voices)
-        if not ref_wav and record.manifest.capabilities.voice_clone:
-            # A cloning engine cannot synthesise without a reference, so a clean
-            # checkout would fail here. Register a synthetic one for the duration
-            # of the test instead of demanding manual setup.
-            probe = _probe_voice(voices, workdir)
-            ref_wav = str(voices.ref_wav_path(probe.voice_id))
-            ref_text = probe.ref_text
-            x_vector_only = probe.x_vector_only_mode
-            typer.echo(
-                "  (no voice registered: using a synthetic probe voice for conformance)"
-            )
+        # A clone target speaks a reference clip; a preset target must not send
+        # one (routing refuses voice + custom_voice), so it speaks its speaker.
+        ref_wav, ref_text, x_vector_only = "", "", False
+        if mode == "clone":
+            ref_wav, ref_text, x_vector_only = _reference_voice(voices)
+            if not ref_wav and record.manifest.capabilities.voice_clone:
+                # A cloning engine cannot synthesise without a reference, so a
+                # clean checkout would fail here. Register a synthetic one for the
+                # duration of the test instead of demanding manual setup.
+                probe = _probe_voice(voices, workdir)
+                ref_wav = str(voices.ref_wav_path(probe.voice_id))
+                ref_text = probe.ref_text
+                x_vector_only = probe.x_vector_only_mode
+                typer.echo(
+                    "  (no voice registered: using a synthetic probe voice for conformance)"
+                )
 
         wav_path = workdir / "conformance.wav"
         started = time.perf_counter()
@@ -1048,6 +1244,8 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
                     "ref_wav_path": ref_wav,
                     "ref_text": ref_text,
                     "x_vector_only_mode": x_vector_only,
+                    "mode": mode,
+                    "speaker": speaker,
                     "prompt_cache_path": None,
                     "wav_path": str(wav_path),
                     "language": "Auto",
@@ -1086,7 +1284,7 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
         stream_text = " ".join(["conformance"] * 60)
         try:
             voice_id = None
-            if ref_wav:
+            if mode == "clone" and ref_wav:
                 # Without a reference the cloning engines never decode at all, so
                 # the cancel below would acknowledge a stream that never started
                 # and prove nothing. Reuse whichever voice the synthesize step used.
@@ -1101,6 +1299,8 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
                 voice_id=voice_id,
                 ref_text=ref_text,
                 x_vector_only=x_vector_only,
+                mode=mode,
+                speaker=speaker,
             )
         except (AgentVoiceError, ConnectionError, TimeoutError, OSError) as exc:
             steps.append(_Step("cancel", False, f"stream did not start: {exc}"))
@@ -1569,27 +1769,233 @@ def voices_delete(voice_id: str) -> None:
 # pronunciations
 # ---------------------------------------------------------------------------
 
+# One flag definition per scope selector, so every command documents it the same
+# way. `--project` and `--voice` narrow the lexicon; the merged map that a request
+# actually speaks is `pronunciations show`.
+ProjectOption = Annotated[
+    str | None,
+    typer.Option("--project", help="Scope this entry to one project slug."),
+]
+VoiceOption = Annotated[
+    str | None,
+    typer.Option("--voice", help="Scope this entry to one registered voice id."),
+]
 
-@pronunciations_app.command("list")
-def pronunciations_list() -> None:
-    """Print the persistent word -> spoken-form map as JSON."""
+_ACRONYM = re.compile(r"\b[A-Z][A-Z0-9]{1,}\b")
+"""An ALL-CAPS token of two or more characters: the acronyms a listener trips on."""
+
+_VERSION_TOKEN = re.compile(
+    r"(?<![\w.])[vV][0-9]+(?:\.[0-9]+)+(?!\w|\.\d)"
+    r"|(?<![\w.])[0-9]+(?:\.[0-9]+){2,}(?!\w|\.\d)"
+)
+"""`v0.4.0` and `3.12.1`, mirroring `code_norm`'s version rules.
+
+`code_candidates` deliberately omits versions — code mode rewrites them
+deterministically, so they never need a lexicon entry — but `pronunciations check`
+still previews them, because "what will the engine say" is the question it answers.
+"""
+
+
+def _scoped(call, **kwargs):
+    """Call a scope resolver, turning an unresolvable scope into one clean line.
+
+    An unknown project slug or voice id is operator input, so it gets the same
+    treatment as every other CLI error: the message, the suggestion, and exit 1 —
+    never a traceback.
+    """
+    from .schemas import AgentVoiceError
+
+    try:
+        return call(**kwargs)
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.secho(f"invalid scope: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _check_single_scope(project: str | None, voice: str | None) -> None:
+    """Refuse `--project` + `--voice` where only one layer is being written."""
+    if project is not None and voice is not None:
+        typer.secho(
+            "pick one scope: --project or --voice, not both",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+def _scoped_lexicon():
+    """The scope-aware lexicon: global, then project, then voice."""
+    from .pronunciations import ScopedLexicon
+
+    settings = get_settings()
+    return ScopedLexicon(settings.data_dir, settings.voices_dir)
+
+
+def _store_for(project: str | None, voice: str | None):
+    """The PronunciationStore for one scope, or the global map when unscoped.
+
+    `ScopedLexicon.store_for` owns the scope -> file mapping (slug validation and
+    the voice-existence check), so the CLI never builds a lexicon path itself. The
+    unscoped case is the operator's `data/pronunciations.json`, the same file
+    `store_for(None, None)` returns, and it needs no scope resolution.
+    """
     from .pronunciations import PronunciationStore
 
-    store = PronunciationStore(get_settings().pronunciations_path)
-    _print(store.list())
+    if project is None and voice is None:
+        return PronunciationStore(get_settings().pronunciations_path)
+    return _scoped_lexicon().store_for(project=project, voice_id=voice)
+
+
+def _rewrites(text: str, mapping: dict[str, str]) -> list[dict[str, object]]:
+    """Lexicon terms that occur in `text`, longest key first, with hit counts.
+
+    Same whole-word, case-insensitive rule the pipeline applies (see
+    `pronunciations._compiled`), so the report cannot promise a rewrite that
+    synthesis would not perform. `term` is the spelling found in the text — the
+    actionable string for `pronunciations set` — not the merged map's lower-cased
+    key. Overlapping keys are counted separately: the longest one wins at that spot,
+    which is why it is listed first.
+    """
+    found: list[dict[str, object]] = []
+    for key, spoken in sorted(mapping.items(), key=lambda item: (-len(item[0]), item[0])):
+        matches = re.findall(rf"(?<!\w){re.escape(key)}(?!\w)", text, re.IGNORECASE)
+        if matches:
+            found.append({"term": matches[0], "spoken": spoken, "count": len(matches)})
+    return found
+
+
+def _unknown_acronyms(text: str, mapping: dict[str, str]) -> list[str]:
+    """ALL-CAPS tokens the lexicon does not cover, in first-use order."""
+    seen: dict[str, None] = {}
+    for match in _ACRONYM.finditer(text):
+        term = match.group(0)
+        if term.lower() not in mapping:
+            seen.setdefault(term, None)
+    return list(seen)
+
+
+def _unknown_identifiers(
+    text: str, mapping: dict[str, str], acronyms: list[str]
+) -> list[dict[str, str]]:
+    """Code-like tokens the effective lexicon does not cover, with both readings.
+
+    `code_norm.code_candidates` is the single definition of "code-like" in this
+    project, and it takes the effective map, so the not-in-the-lexicon rule here is
+    the same one synthesis applies. Each term carries how a `[spell]` span says it
+    (`spelled`, via `spell_out`) and how `spell_identifiers=true` rewrites it
+    (`code_mode`, via `spell_identifiers`). Terms already reported as unknown
+    acronyms are left out: they are on screen once.
+    """
+    from .code_norm import code_candidates, spell_identifiers, spell_out
+    from .pronunciations import normalize_lexicon_key
+
+    reported = set(acronyms)
+    terms = list(code_candidates(text, lexicon=mapping))
+    terms.extend(match.group(0) for match in _VERSION_TOKEN.finditer(text))
+
+    found: list[dict[str, str]] = []
+    for term in dict.fromkeys(terms):
+        if term in reported or normalize_lexicon_key(term) in mapping:
+            continue
+        found.append(
+            {
+                "term": term,
+                "spelled": spell_out(term),
+                "code_mode": spell_identifiers(term),
+            }
+        )
+    return found
+
+
+def _show_payload(*, project: str | None, voice: str | None) -> dict[str, object]:
+    """Every scope layer in play, plus the merged map and its hash."""
+    lexicon = _scoped_lexicon()
+    layers: list[tuple[str, str | None, str | None]] = [("global", None, None)]
+    if project:
+        layers.append((f"project:{project}", project, None))
+    if voice:
+        layers.append((f"voice:{voice}", None, voice))
+
+    scopes: list[dict[str, object]] = []
+    for name, layer_project, layer_voice in layers:
+        store = _store_for(layer_project, layer_voice)
+        scopes.append(
+            {"scope": name, "path": str(store.path), "entries": store.list()}
+        )
+
+    # Keys in the merged map are lower-cased: it is the map that reaches the
+    # regex, not a copy of any one file.
+    merged = lexicon.effective(project=project, voice_id=voice)
+    return {
+        "project": project,
+        "voice_id": voice,
+        "scopes": scopes,
+        "merged_entries": len(merged),
+        "effective": dict(sorted(merged.items())),
+        "pronunciation_hash": lexicon.hash(project=project, voice_id=voice),
+    }
+
+
+def _check_payload(
+    *,
+    text: str,
+    source: str,
+    project: str | None,
+    voice: str | None,
+    spell_identifiers: bool,
+) -> dict[str, object]:
+    """What the lexicon would rewrite in `text` — a report, never a render."""
+    lexicon = _scoped_lexicon()
+    merged = lexicon.effective(project=project, voice_id=voice)
+    acronyms = _unknown_acronyms(text, merged)
+    payload: dict[str, object] = {
+        "source": source,
+        "project": project,
+        "voice_id": voice,
+        "characters": len(text),
+        "lexicon_entries": len(merged),
+        "pronunciation_hash": lexicon.hash(project=project, voice_id=voice),
+        "rewritten": _rewrites(text, merged),
+        "unknown_acronyms": acronyms,
+    }
+    if spell_identifiers:
+        payload["unknown_identifiers"] = _unknown_identifiers(text, merged, acronyms)
+    return payload
+
+
+@pronunciations_app.command("list")
+def pronunciations_list(
+    project: ProjectOption = None, voice: VoiceOption = None
+) -> None:
+    """Print the lexicon for one scope as JSON (global when unscoped).
+
+    `--project`/`--voice` print that one layer. The merged map a request actually
+    speaks is `pronunciations show`.
+    """
+    _check_single_scope(project, voice)
+    _print(_scoped(_store_for, project=project, voice=voice).list())
 
 
 @pronunciations_app.command("set")
-def pronunciations_set(word: str, replacement: str) -> None:
-    """Set one entry. Matching is case-insensitive and whole-word.
+def pronunciations_set(
+    word: str,
+    replacement: str,
+    project: ProjectOption = None,
+    voice: VoiceOption = None,
+) -> None:
+    """Set one entry in the chosen scope. Matching is case-insensitive and whole-word.
 
     The map is read on every synthesis request, so an edit here reaches a running
     daemon immediately. The rewritten spoken text is what the cache keys on, so
     only lines that use the changed term are invalidated.
     """
-    from .pronunciations import PronunciationStore
-
-    store = PronunciationStore(get_settings().pronunciations_path)
+    _check_single_scope(project, voice)
+    store = _scoped(_store_for, project=project, voice=voice)
     try:
         entries = store.set(word, replacement)
     except ValueError as exc:
@@ -1599,11 +2005,14 @@ def pronunciations_set(word: str, replacement: str) -> None:
 
 
 @pronunciations_app.command("delete")
-def pronunciations_delete(word: str) -> None:
-    """Remove one entry. Exits non-zero when the word is not in the lexicon."""
-    from .pronunciations import PronunciationStore
-
-    store = PronunciationStore(get_settings().pronunciations_path)
+def pronunciations_delete(
+    word: str,
+    project: ProjectOption = None,
+    voice: VoiceOption = None,
+) -> None:
+    """Remove one entry from the chosen scope. Exits non-zero when it is absent."""
+    _check_single_scope(project, voice)
+    store = _scoped(_store_for, project=project, voice=voice)
     try:
         deleted = store.delete(word)
     except ValueError as exc:
@@ -1613,6 +2022,65 @@ def pronunciations_delete(word: str) -> None:
         typer.secho(f"no such pronunciation: {word}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     _print({"deleted": word})
+
+
+@pronunciations_app.command("show")
+def pronunciations_show(
+    project: ProjectOption = None, voice: VoiceOption = None
+) -> None:
+    """Print every scope, the merged map and its pronunciation_hash.
+
+    Read-only and daemon-free: this is the exact map the next request with these
+    selectors will use, so a surprising pronunciation is found without
+    synthesising anything. `pronunciation_hash` is observability only — the
+    synthesis cache keys on the rewritten spoken text, not on the lexicon.
+    """
+    _print(_scoped(_show_payload, project=project, voice=voice))
+
+
+@pronunciations_app.command("check")
+def pronunciations_check(
+    text_or_file: str = typer.Argument(
+        ..., help="Text to inspect, or the path of a UTF-8 file to read it from."
+    ),
+    project: ProjectOption = None,
+    voice: VoiceOption = None,
+    spell_identifiers: bool = typer.Option(
+        False,
+        "--spell-identifiers",
+        help=r"Also report code-like identifiers and how \[spell] would say them.",
+    ),
+) -> None:
+    """Predict lexicon and code-mode rewriting for a text — no synthesis, no daemon.
+
+    The argument is read as a file when it names an existing path, otherwise it is
+    treated as the text itself. The report lists the terms that will be rewritten
+    (with hit counts), ALL-CAPS acronyms the effective lexicon does not cover, and
+    — with `--spell-identifiers` — code-like tokens that `spell_identifiers=true`
+    would expand.
+    """
+    path = Path(text_or_file)
+    if path.is_file():
+        try:
+            text = path.read_text("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            typer.secho(f"cannot read {path}: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+        source = str(path)
+    else:
+        text = text_or_file
+        source = "(argument)"
+
+    _print(
+        _scoped(
+            _check_payload,
+            text=text,
+            source=source,
+            project=project,
+            voice=voice,
+            spell_identifiers=spell_identifiers,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

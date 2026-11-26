@@ -492,3 +492,335 @@ def test_ws_loopback_origin_connects_without_key(client):
     ) as ws:
         ws.send_json({"type": "ping"})
         assert ws.receive_json() == {"type": "pong"}
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (M2): the pre-accept refusal is the security property
+# ---------------------------------------------------------------------------
+
+
+def _ws_scope(headers: dict[str, str]) -> dict:
+    return {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "scheme": "ws",
+        "path": "/v1/audio/ws",
+        "raw_path": b"/v1/audio/ws",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(key.lower().encode(), value.encode()) for key, value in headers.items()],
+        "server": ("127.0.0.1", 8000),
+        "client": ("127.0.0.1", 12345),
+        "subprotocols": [],
+    }
+
+
+async def _drive_guard(scope: dict, *, api_key: str) -> tuple[list[dict], list[str]]:
+    """Run GuardMiddleware around a recording app and return what went on the wire."""
+    from agent_voice.api.guard import GuardMiddleware
+
+    reached: list[str] = []
+    sent: list[dict] = []
+
+    async def inner_app(asgi_scope, receive, send):  # pragma: no cover - never called
+        reached.append(asgi_scope["type"])
+
+    async def receive() -> dict:
+        return {"type": "websocket.connect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    guard = GuardMiddleware(
+        inner_app,
+        allowed_hosts=frozenset({"127.0.0.1", "localhost", "::1"}),
+        api_key=api_key,
+    )
+    await guard(scope, receive, send)
+    return sent, reached
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"host": "127.0.0.1", "origin": "http://evil.example.com"},
+        {"host": "evil.example.com"},
+        {"host": "127.0.0.1"},  # no credential, and the app requires one
+    ],
+)
+async def test_guard_refuses_websocket_before_accept_at_asgi_level(headers):
+    """M2: the refusal must be a close frame *before* ``websocket.accept``.
+
+    Starlette's TestClient reports this sequence as ``WebSocketDisconnect(1008)``.
+    A real uvicorn has not sent the ``101 Switching Protocols`` yet, so a
+    ``websocket.close`` in the CONNECTING state is a rejected HTTP upgrade and the
+    client sees **403 Forbidden** instead of a close code. That translation is
+    uvicorn's, not ours — the invariant that matters, and what this test pins, is
+    that the guard never accepts a socket it refuses.
+    """
+    sent, reached = await _drive_guard(_ws_scope(headers), api_key="secret-key")
+
+    assert reached == [], "a refused WebSocket must never reach the application"
+    assert sent, "the refusal must produce an ASGI message"
+    assert sent[0]["type"] == "websocket.close", (
+        f"first ASGI message must be the refusal, got {sent[0]['type']}"
+    )
+    assert not any(message["type"] == "websocket.accept" for message in sent)
+    assert sent[0]["code"] == 1008
+
+
+async def test_guard_accepts_authorized_websocket_at_asgi_level():
+    """The other half of the invariant: a good handshake is still accepted."""
+    from agent_voice.api.guard import GuardMiddleware
+
+    seen: list[str] = []
+
+    async def inner_app(scope, receive, send):
+        seen.append(scope["type"])
+        await send({"type": "websocket.accept", "subprotocol": None})
+
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "websocket.connect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    guard = GuardMiddleware(
+        inner_app,
+        allowed_hosts=frozenset({"127.0.0.1"}),
+        api_key="secret-key",
+    )
+    await guard(
+        _ws_scope(
+            {
+                "host": "127.0.0.1",
+                "authorization": "Bearer secret-key",
+            }
+        ),
+        receive,
+        send,
+    )
+    assert seen == ["websocket"]
+    assert [message["type"] for message in sent] == ["websocket.accept"]
+
+
+def test_real_uvicorn_turns_a_refused_websocket_into_http_403(tmp_path):
+    """What a browser actually sees: HTTP 403, not a WS close code.
+
+    The guard refuses *before* ``accept()``. Starlette's TestClient renders that as
+    ``WebSocketDisconnect(1008)`` because it speaks ASGI, but on the wire a real
+    uvicorn has not sent ``101 Switching Protocols`` yet, so the same sequence is a
+    rejected HTTP upgrade. This test runs a real server to pin the behaviour the
+    security invariant produces for browsers; the invariant itself (never accept)
+    is asserted at the ASGI level above.
+    """
+    import socket
+    import threading
+    import time
+
+    import httpx
+    import uvicorn
+
+    settings = _settings(tmp_path, AGENT_VOICE_API_KEY="secret-key")
+    app = create_app(settings=settings, mount_mcp=False)
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.time() + 15
+        while not server.started and time.time() < deadline:
+            time.sleep(0.01)
+        assert server.started, "uvicorn did not start"
+
+        response = httpx.get(
+            f"http://127.0.0.1:{port}/v1/audio/ws",
+            headers={
+                "Connection": "Upgrade",
+                "Upgrade": "websocket",
+                "Sec-WebSocket-Version": "13",
+                "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                "Origin": "http://evil.example.com",
+            },
+            timeout=10.0,
+        )
+        assert response.status_code == 403, (
+            "a pre-accept WebSocket refusal must surface as HTTP 403 under uvicorn"
+        )
+    finally:
+        server.should_exit = True
+        thread.join(timeout=15)
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (L3): echo the client's subprotocol spelling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("spelling", ["bearer", "Bearer", "BEARER"])
+def test_ws_subprotocol_echoes_client_spelling(authed_client, spelling):
+    """RFC 6455: the server selects one of the protocols the client offered.
+
+    v0.3.3 always answered ``bearer``; a client that offered ``Bearer`` got back a
+    token it never sent, which strict clients treat as a failed negotiation.
+    """
+    with authed_client.websocket_connect(
+        "/v1/audio/ws", subprotocols=[spelling, "secret-key"]
+    ) as ws:
+        assert ws.accepted_subprotocol == spelling
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json() == {"type": "pong"}
+
+
+def test_ws_subprotocol_not_echoed_for_header_auth(authed_client):
+    """Header auth never negotiated a subprotocol, so none is invented."""
+    with authed_client.websocket_connect(
+        "/v1/audio/ws", headers={"Authorization": "Bearer secret-key"}
+    ) as ws:
+        assert ws.accepted_subprotocol is None
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json() == {"type": "pong"}
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (L4): a trailing root dot is the same hostname
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["localhost.", "localhost.:8000", "127.0.0.1.:8000"])
+def test_host_with_trailing_dot_is_accepted(client, host):
+    """``localhost.`` is the FQDN spelling of ``localhost``."""
+    assert client.get("/health", headers={"Host": host}).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "origin", ["http://localhost.:8000", "http://127.0.0.1.:8000"]
+)
+def test_origin_with_trailing_dot_is_accepted(client, origin):
+    assert client.get("/health", headers={"Origin": origin}).status_code == 200
+
+
+def test_trailing_dot_normalisation_strips_exactly_one_dot():
+    from agent_voice.api.guard import _canonical_host, _origin_hostname
+
+    assert _canonical_host("localhost.") == "localhost"
+    assert _canonical_host("localhost.:8000") == "localhost"
+    assert _canonical_host("example.com..") == "example.com."
+    assert _origin_hostname("http://localhost.:8000") == "localhost"
+    # A dotted name is not a licence to skip the allow-list.
+    assert _canonical_host("evil.example.com.") == "evil.example.com"
+
+
+def test_foreign_host_with_trailing_dot_is_still_rejected(client):
+    response = client.get("/health", headers={"Host": "evil.example.com."})
+    assert response.status_code == 421
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (L5): an address-shaped *name* is not loopback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("127.0.0.1", True),
+        ("127.0.0.5", True),
+        ("127.0.0.1:8000", True),
+        ("localhost", True),
+        ("localhost.", True),
+        ("::1", True),
+        ("[::1]", True),
+        ("[::1]:8000", True),
+        # A DNS name that merely starts with 127. is NOT a loopback address.
+        ("127.evil.example", False),
+        ("127.0.0.1.evil.example", False),
+        ("127.0.0.1.nip.io", False),
+        ("0.0.0.0", False),
+        ("10.0.0.5", False),
+        ("example.com", False),
+        ("", False),
+    ],
+)
+def test_is_loopback_bind_only_accepts_real_loopback(host, expected):
+    from agent_voice.api.guard import is_loopback_bind
+
+    assert is_loopback_bind(host) is expected
+
+
+def test_address_lookalike_bind_without_key_refuses_to_start(tmp_path):
+    """``127.evil.example`` is a public DNS name, not the loopback interface."""
+    settings = _settings(tmp_path, AGENT_VOICE_HOST="127.evil.example", AGENT_VOICE_API_KEY="")
+    with pytest.raises(Exception) as excinfo:
+        create_app(settings=settings, mount_mcp=False)
+    message = str(excinfo.value).lower()
+    assert "api_key" in message or "api key" in message or "loopback" in message
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (L8): a whitespace key is not a key
+# ---------------------------------------------------------------------------
+
+
+def test_whitespace_api_key_is_treated_as_unset(tmp_path):
+    settings = _settings(tmp_path, AGENT_VOICE_API_KEY=" ")
+    assert settings.api_key == ""
+
+
+def test_whitespace_api_key_refuses_public_bind(tmp_path):
+    """v0.3.3 saw " " as a secret and served an unauthenticated LAN interface."""
+    settings = _settings(tmp_path, AGENT_VOICE_HOST="0.0.0.0", AGENT_VOICE_API_KEY=" ")
+    with pytest.raises(Exception) as excinfo:
+        create_app(settings=settings, mount_mcp=False)
+    message = str(excinfo.value).lower()
+    assert "api_key" in message or "api key" in message or "loopback" in message
+
+
+def test_whitespace_api_key_does_not_turn_on_auth(tmp_path):
+    """The guard must agree with the bind check: no key means no Bearer required."""
+    settings = _settings(tmp_path, AGENT_VOICE_API_KEY=" ")
+    app = create_app(settings=settings, mount_mcp=False)
+    with TestClient(app) as test_client:
+        assert test_client.get("/v1/voices").status_code == 200
+
+
+def test_api_key_surrounding_whitespace_is_stripped(tmp_path):
+    settings = _settings(tmp_path, AGENT_VOICE_API_KEY="  secret-key  ")
+    assert settings.api_key == "secret-key"
+
+    app = create_app(settings=settings, mount_mcp=False)
+    with TestClient(app) as test_client:
+        assert test_client.get("/v1/voices").status_code == 401
+        assert (
+            test_client.get(
+                "/v1/voices", headers={"Authorization": "Bearer secret-key"}
+            ).status_code
+            == 200
+        )
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (M5, config half): base_url must be a valid URL for IPv6
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("127.0.0.1", "http://127.0.0.1:8000"),
+        ("localhost", "http://localhost:8000"),
+        ("::1", "http://[::1]:8000"),
+        ("[::1]", "http://[::1]:8000"),
+    ],
+)
+def test_base_url_brackets_ipv6_hosts(tmp_path, host, expected):
+    assert _settings(tmp_path, AGENT_VOICE_HOST=host).base_url == expected

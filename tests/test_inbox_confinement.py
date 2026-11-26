@@ -88,3 +88,59 @@ def test_rest_clone_allow_any_path_permits_outside_clip(tmp_path, ref_wav):
 
     assert response.status_code == 200, response.text
     assert response.json()["name"] == "outsidevoice"
+
+
+def test_rest_clone_allow_any_path_rejects_relative_path(tmp_path, ref_wav, monkeypatch):
+    """L2: opting into arbitrary paths does not make the daemon's cwd a base.
+
+    The clip below exists relative to cwd and is still refused, so the refusal is
+    about the meaning of the path rather than about the file being absent.
+    """
+    monkeypatch.chdir(ref_wav.parent)
+    settings = _settings(tmp_path, AGENT_VOICE_ALLOW_ANY_PATH="true")
+    app = create_app(settings=settings, mount_mcp=False)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/voices",
+            json={"name": "relvoice", "ref_audio_path": ref_wav.name},
+        )
+
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error_code"] == "BAD_REQUEST"
+    assert "relative ref_audio_path" in body["message"], body
+    assert "absolute" in body["suggestion"].lower(), body
+
+
+def test_resolver_is_the_single_policy_for_both_surfaces(tmp_path, ref_wav):
+    """The three branches live in one function so REST and MCP cannot drift."""
+    from agent_voice.schemas import AgentVoiceError
+    from agent_voice.security import resolve_ref_audio_path
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    inside = inbox / "clip.wav"
+    shutil.copy(ref_wav, inside)
+
+    # MCP_BASE_PATH wins: a relative path is read inside the sandbox root.
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    shutil.copy(ref_wav, sandbox / "clip.wav")
+    assert resolve_ref_audio_path(
+        "clip.wav", mcp_base_path=str(sandbox), inbox_dir=inbox, allow_any_path=True
+    ) == Path(sandbox / "clip.wav").resolve()
+
+    # Default posture: the inbox only, and the refusal names it.
+    with pytest.raises(AgentVoiceError) as inbox_error:
+        resolve_ref_audio_path(str(ref_wav), inbox_dir=inbox, allow_any_path=False)
+    assert inbox_error.value.error_code == "PATH_OUTSIDE_BASE"
+    assert str(inbox) in inbox_error.value.suggestion
+
+    # allow_any_path: any absolute existing file, never a relative one.
+    assert resolve_ref_audio_path(
+        str(ref_wav), inbox_dir=inbox, allow_any_path=True
+    ) == Path(ref_wav)
+    with pytest.raises(AgentVoiceError) as relative_error:
+        resolve_ref_audio_path(ref_wav.name, inbox_dir=inbox, allow_any_path=True)
+    assert relative_error.value.error_code == "BAD_REQUEST"
+    assert "relative" in relative_error.value.message

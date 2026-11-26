@@ -11,7 +11,118 @@ given for every release so a tag can be verified against the history.
 
 No unreleased changes.
 
-## [0.3.3] — 2026-11-26 — `2650a4a`
+## [0.4.0] — 2026-11-26 — unreleased
+
+"Expressive markup, a zero-GPU Kokoro engine, scoped lexicons and code mode."
+
+### Added
+
+- **Inline expressive markup**, on by default (`markup: true`) on `speak`,
+  `speak_script` beats, the WebSocket `speak` frame and the PCM stream:
+  `[pause]` / `[pause 500ms]` / `[pause 1.5s]` (0–10 s), `[slow]` / `[fast]`
+  (×0.82 / ×1.22, clamped 0.5–2.0), `[emphasis]` (+2.5 dB and 0.94×, applied at
+  stitch time, peak-limited), `[spell]` (character by character) and blank-line
+  paragraph gaps (`paragraph_gap_ms`, 0–5000). Non-whitelisted brackets (`arr[0]`,
+  `matrix[i][j]`, `[1, 2]`) stay literal; a recognised tag with a malformed value
+  is `400 BAD_REQUEST`; caps (128 tags, depth 4, 32 segments) are enforced before
+  a worker spawns. `markup=false` passes every bracket through untouched.
+  Subtitles keep the written text (`display_text`).
+- **Kokoro-82M CPU engine** (`engines/kokoro/`, `kokoro==0.9.4`, Apache-2.0):
+  native 24 kHz mono, native PCM streaming and **0 MB of VRAM** — CPU-only torch
+  from the `pytorch-cpu` index, `CUDA_VISIBLE_DEVICES=""` and `device="cpu"` before
+  torch is imported. Eight English preset voices (`af_heart` … `bm_lewis`).
+  Measured 3.4–5.2× real time and 1.37 GB peak RSS on a Ryzen 7 5700X. No cloning,
+  no voice design, no `instruct`. The spike is recorded in
+  `docs/phase0-kokoro-report.md`.
+- **Scoped lexicons**: `data/pronunciations/<project>.json` (validated `project`
+  slug) and `<voices>/<voice_id>/pronunciations.json`, merged
+  global → project → voice → per-call. 500 entries per scope, 1,500 merged,
+  validated on load and again before compile.
+- **Code normalization** (`spell_identifiers`, default `false`): `snake_case`,
+  `camelCase`/`PascalCase`, versions, paths, operators and `C++`, applied after the
+  lexicon and only to its complement. `[spell]` spans are protected from both.
+- CLI: `pronunciations list|set|delete --project|--voice`, `pronunciations show`
+  (every layer, the merged map and `pronunciation_hash`) and
+  `pronunciations check <text-or-file> [--spell-identifiers]` — a read-only
+  prediction of what will be rewritten, plus unknown ALL-CAPS acronyms and
+  code-like identifiers with both their `[spell]` and code-mode readings. No
+  synthesis, no daemon.
+- `markup`, `spell_identifiers`, `paragraph_gap_ms` and `project` on
+  `SpeakRequest`, `ScriptRequest` and (as inheritable overrides) `BeatSpec`;
+  `BeatTiming.had_markup`; the same selectors on the MCP tools, the WebSocket
+  frame and the PCM stream.
+- `doctor`: an `espeak-ng` row whenever the Kokoro engine is discovered — PASS when
+  present, WARN with the platform install command when missing, never FAIL for
+  common English.
+- OpenAI builtin-voice fallback for Kokoro: `alloy` → `af_heart`,
+  `echo` → `am_adam`, `nova` → `af_bella`, `onyx` → `am_michael`,
+  `fable` → `bm_george`, `shimmer` → `bf_emma`.
+
+### Changed
+
+- `engines test` is **mode-aware**: a clone model is still preferred, but an engine
+  with no clone checkpoint (Kokoro) is exercised through its first `custom_voice`
+  model's first preset speaker, with `mode` and `speaker` sent on the synthesize and
+  stream steps. Clone engines keep the original v1 path exactly.
+- **Cache key:** `CACHE_KEY_FIELDS` is **unchanged**. The rewritten spoken text and
+  the effective `speed` already enter the key; pauses and paragraph gaps are local
+  silence and are never cached; `[emphasis]` gain is applied at stitch time, after
+  the segment cache; `project` is deliberately not keyed; `pronunciation_hash` is
+  observability only. Upgrading invalidates no existing render.
+- Docs: markup grammar and precedence, scoped-lexicon precedence, the Kokoro install
+  and measurement, the new caps, and the v0.3.3 corrections below.
+- `pyproject.toml`: version `0.4.0`, `kokoro` / CPU keywords and classifiers. No
+  dependency changes; the core venv still installs no torch.
+
+### Security
+
+- **H1** `agent-voice serve --host 0.0.0.0` now validates the **effective**
+  `(host, port)` before `uvicorn.run`, so an unauthenticated LAN bind is refused
+  even when `.env` says loopback (`--port 0` is still honoured).
+- **M7** pronunciation caps are enforced on load and again before compile, so a
+  hand-edited `data/pronunciations.json` or a raw WS/OpenAI map cannot compile an
+  unbounded regex.
+- **L8** a whitespace-only `AGENT_VOICE_API_KEY` is unset rather than a valid key,
+  and a non-loopback bind with it still refuses to start.
+- **L2** one path resolver in `security.py` now serves both MCP and REST
+  `clone_voice`; **L3** the WebSocket subprotocol echo preserves the client's
+  spelling; **L4** trailing-dot FQDNs (`localhost.`) are accepted; **L5**
+  `is_loopback_bind` uses `ipaddress`, so `127.evil.example` is not loopback.
+- **M2** the documented WebSocket refusal is corrected: the pre-`accept()` rejection
+  is an **HTTP 403** over real uvicorn, not a `1008` close (only Starlette's
+  in-process TestClient fabricates `1008`).
+
+### Fixed
+
+- **H2** a forced unload while a job is waiting no longer wedges the engine lock for
+  the rest of the daemon's life.
+- **M1** a worker death mid-stream is reported as a structured WS error / aborted
+  HTTP stream instead of a clean, apparently complete stream.
+- **M3** `doctor` reports an invalid `.env` as a `config` FAIL row instead of
+  tracing back; **M4** the effective default engine is validated even when `.env` is
+  absent; **M5** the port probe is address-family aware (`AGENT_VOICE_HOST=::1`
+  works) and `base_url` brackets IPv6 literals.
+- **M6** `server_info().next_steps` no longer recommends `design_voice()` when no
+  design checkpoint exists; **M8** a malformed WebSocket JSON frame, or a
+  recoverable request error, no longer closes the socket.
+- **L6** `stream()` releases the engine lock if it raises between `_begin_job` and
+  the `try`; **L7** `serve --port 0` is honoured.
+- **L10** the v0.3.3 entry below now pins the audited tag commit `3cce966` (it said
+  `2650a4a`).
+- Docs-only corrections: `/redoc` is listed as unauthenticated, `MAX_QUEUE_DEPTH` is
+  documented as global rather than per-engine, `streaming_mode` is documented as
+  present only on streamed responses, the `NORMALIZE_LUFS` wording now matches the
+  code (WAV is a bit-exact byte copy, `pcm` is never normalised, scripts are not
+  normalised), `server_info`'s field list is complete, and `/audio` URLs are
+  documented as needing the bearer header.
+
+### Known limitations
+
+- `models download --no-wait` is accepted but ignored (L1): the CLI always blocks
+  until the snapshot completes.
+- WAV output is intentionally bit-exact rather than loudness-normalised (L9).
+
+## [0.3.3] — 2026-11-26 — `3cce966`
 
 Security-hardening and governance release. No dependency changes; the core venv
 still installs no torch.
@@ -110,7 +221,7 @@ still installs no torch.
 - Admission caps `MAX_SCRIPT_BEATS`, `MAX_INSTRUCT_CHARS`,
   `MAX_DESIGN_SAMPLE_CHARS`, `MAX_REF_TEXT_CHARS`, enforced before routing and
   before any GPU time.
-- `MAX_QUEUE_DEPTH` admission: a full per-engine wait queue answers
+- `MAX_QUEUE_DEPTH` admission: a full global wait queue answers
   `429 BACKPRESSURE` instead of growing without bound. Concurrency tests cover
   20 clients and cache hits while the GPU is busy.
 - Voice-name validation (`^[\w .\-]{1,64}$`) for `clone_voice`,
@@ -248,7 +359,8 @@ Initial release.
 - `MCP_BASE_PATH` confinement for reference reads and artifact relocation.
 - Every external command run as an argv list with `shell=False`.
 
-[Unreleased]: https://github.com/000jd/agent-voice/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/000jd/agent-voice/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/000jd/agent-voice/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/000jd/agent-voice/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/000jd/agent-voice/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/000jd/agent-voice/compare/v0.3.0...v0.3.1

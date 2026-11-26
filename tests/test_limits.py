@@ -102,3 +102,86 @@ def test_websocket_rejects_oversized_text_without_closing(client):
         # The socket must stay usable for the next request.
         websocket.send_json({"type": "ping"})
         assert websocket.receive_json() == {"type": "pong"}
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 Wave 1 (M8): a bad frame is an error frame, not a closed socket
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        "{not json at all",
+        "",
+        "[1, 2, 3]",
+        '"just a string"',
+        "42",
+    ],
+)
+def test_websocket_survives_a_malformed_frame(client, frame):
+    """v0.3.3 let ``ValueError``/``AttributeError`` escape the receive loop.
+
+    The handler sat outside the loop, so one malformed frame closed the socket and
+    the client had to reconnect to say anything else.
+    """
+    with client.websocket_connect("/v1/audio/ws") as websocket:
+        websocket.send_text(frame)
+        error = websocket.receive_json()
+
+        assert error["type"] == "error"
+        assert error["error_code"] == "BAD_REQUEST"
+        assert error["suggestion"]
+
+        websocket.send_json({"type": "ping"})
+        assert websocket.receive_json() == {"type": "pong"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "speak", "text": "hi", "engine": "no-such-engine"},
+        {
+            "type": "speak",
+            "text": "hi",
+            "engine": "mock",
+            "model": "mock-custom",
+            "speaker": "Nobody",
+        },
+        {"type": "speak", "text": "hi", "voice": "v", "speaker": "Ryan"},
+    ],
+)
+def test_websocket_recoverable_errors_keep_the_socket_usable(client, payload):
+    """Unknown engine/speaker and contradictory timbres are caller mistakes.
+
+    They must come back as an error frame on the same socket — the handler used to
+    live outside the loop, so any of them terminated the connection.
+    """
+    with client.websocket_connect("/v1/audio/ws") as websocket:
+        websocket.send_json(payload)
+        error = websocket.receive_json()
+
+        assert error["type"] == "error"
+        assert error["error_code"] in {
+            "ENGINE_NOT_FOUND",
+            "BAD_REQUEST",
+            "VOICE_NOT_FOUND",
+            "VOICE_REQUIRED",
+        }
+
+        websocket.send_json({"type": "ping"})
+        assert websocket.receive_json() == {"type": "pong"}
+
+
+def test_websocket_still_answers_ping_after_a_malformed_frame_and_an_error(client):
+    """Several bad frames in a row must not degrade into a closed socket."""
+    with client.websocket_connect("/v1/audio/ws") as websocket:
+        for bad in ("{oops", "[]"):
+            websocket.send_text(bad)
+            assert websocket.receive_json()["error_code"] == "BAD_REQUEST"
+
+        websocket.send_json({"type": "speak", "text": "hi", "engine": "ghost"})
+        assert websocket.receive_json()["type"] == "error"
+
+        websocket.send_json({"type": "ping"})
+        assert websocket.receive_json() == {"type": "pong"}

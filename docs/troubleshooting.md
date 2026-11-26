@@ -9,14 +9,16 @@ uv run agent-voice engines test mock   # IPC v1 conformance without a GPU (~1 s)
 ```
 
 `doctor` prints one `PASS`/`FAIL`/`WARN` row per check — Python, `uv`, `ffmpeg`,
-the GPU (via `nvidia-smi`), the bind port (free, or already serving a healthy
-daemon), one row per engine, cached weights, the inbox and `.env` — with a `fix:`
-line under every problem. It exits non-zero only on a `FAIL`: a CPU-only box, an
-uninstalled GPU engine or a missing `.env` are warnings, not failures.
+the GPU (via `nvidia-smi`), `espeak-ng` (when the Kokoro engine ships), the bind
+port (free, or already serving a healthy daemon), one row per engine, cached
+weights, the inbox and `.env` — with a `fix:` line under every problem. It exits
+non-zero only on a `FAIL`: a CPU-only box, an uninstalled GPU engine, a missing
+`espeak-ng` or a missing `.env` are warnings, not failures.
 
 For a GPU engine, `agent-voice engines test qwen3_tts_fast` walks the same
 protocol end to end and isolates "the worker cannot start / cannot load" from
-"the request was wrong".
+"the request was wrong". For Kokoro, `agent-voice engines test kokoro` proves the
+CPU engine in about a second of decode after the weights are downloaded.
 
 ## CUDA graph capture fails (`qwen3_tts_fast`)
 
@@ -94,23 +96,123 @@ explicitly — see the fixed unit in
 [install/agent.md](install/agent.md#linux-systemd-user-unit). For an MCP stdio
 server, the `env` block in the client config is what the shim inherits.
 
+## `espeak-ng` is missing (Kokoro)
+
+**Symptoms.** `agent-voice doctor` prints a `WARN` row:
+
+```text
+espeak-ng   WARN   not on PATH (Kokoro out-of-dictionary and non-English G2P)
+                   fix: sudo apt install espeak-ng (or your distribution's package)
+```
+
+Kokoro's English G2P is spaCy-based and handles common words; `espeak-ng` is the
+**out-of-dictionary fallback** (names, invented words) and the backend for every
+non-English voice. So a missing binary is a warning, not a failure: ordinary
+English still speaks.
+
+**Fix.**
+
+```bash
+sudo apt install espeak-ng     # Debian/Ubuntu
+brew install espeak-ng         # macOS
+espeak-ng --version            # confirm the daemon's PATH sees it
+```
+
+A systemd unit or MCP client needs the binary on **its own** `PATH`, the same way
+ffmpeg does.
+
+## `Can't find model 'en_core_web_sm'` (Kokoro)
+
+**Symptoms.** The Kokoro worker dies on its first request, or `engines test kokoro`
+fails inside `load_model`, with:
+
+```text
+OSError: [E050] Can't find model 'en_core_web_sm'. It doesn't seem to be a Python
+package or a valid path to a data directory.
+```
+
+`misaki` (Kokoro's G2P) needs spaCy's small English model. Its own installer picks
+the **active** interpreter — in a spike it wrote into the repo's `.venv`, not the
+engine venv — so the model can be installed somewhere the worker never looks.
+
+**Fix.** Reinstall the engine; `engines/kokoro/pyproject.toml` pins
+`en-core-web-sm` as a direct URL dependency, so `uv sync` puts it in the right venv:
+
+```bash
+uv run agent-voice engines install kokoro
+```
+
+Then check the engine venv itself, not your shell:
+
+```bash
+engines/kokoro/.venv/bin/python -c "import spacy; spacy.load('en_core_web_sm')"
+```
+
+## Kokoro pulled a CUDA wheel (VRAM is not 0)
+
+**Symptoms.** `nvidia-smi` shows memory held by a Kokoro worker, or
+`engines/kokoro/.venv/bin/python -c "import torch; print(torch.version.cuda)"`
+prints a version instead of `None`, or `uv pip list` shows `nvidia-*` packages.
+
+**Cause.** `torch` resolved from PyPI instead of the CPU index. Installing
+`kokoro` alone makes torch a *transitive* dependency, and the PyPI wheel is the
+CUDA build — it drags in every `nvidia-*` package and lets `KPipeline` auto-select
+the GPU.
+
+**Fix.** Reinstall from the pinned project so the explicit CPU source applies:
+
+```bash
+uv run agent-voice engines install kokoro
+engines/kokoro/.venv/bin/python -c "import torch; print(torch.__version__, torch.version.cuda)"
+# expected: 2.x.y+cpu None
+```
+
+Do not `pip install torch` inside that venv by hand. The engine's
+`pyproject.toml` declares `[[tool.uv.index]] name = "pytorch-cpu"` and
+`[tool.uv.sources] torch = { index = "pytorch-cpu" }`; the exact lock is recorded in
+[phase0-kokoro-report.md](phase0-kokoro-report.md).
+
+## Markup is spoken aloud, or a line is rejected
+
+**Symptoms.** The audio says "bracket pause four hundred milliseconds" instead of
+pausing, or a request fails with `400 BAD_REQUEST` mentioning `[pause]`.
+
+- **A wanted tag was not parsed.** Only `[pause]`, `[slow]`, `[fast]`, `[emphasis]`
+  and `[spell]` exist, and paired tags need `[/slow]`-style closers. Tag names are
+  case-insensitive (`[Pause 500ms]` parses). `[pausex]`, `[div]` and `[[x]]` are
+  literal text and are spoken as written; a whitelisted tag inside literal brackets
+  still parses, so `[[pause]]` is a literal `[]` plus a pause (use `markup=false`
+  when the brackets themselves are the subject).
+- **A tag value is malformed.** `[pause abc]`, `[pause -1s]` and `[pause 99s]` are
+  a recognised tag with an impossible value: that is a `400 BAD_REQUEST` naming the
+  accepted forms, because silently narrating it would misrepresent the audio.
+- **The text is legitimate markup syntax.** Pass `markup=false` to speak brackets
+  literally — `arr[0]`, `matrix[i][j]` and `[1, 2]` are literal even with markup on.
+- **Too many tags.** 128 tags, nesting depth 4 and 32 segments per utterance are
+  structural caps; a longer line must be split into beats.
+- **Subtitles look wrong.** Captions come from `display_text` (tags stripped,
+  `[spell]` words kept as written). If a caption shows a tag, the tag was not
+  recognised — check the spelling against the table above.
+
 ## Common errors and what they mean
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `401 unauthorized` | `AGENT_VOICE_API_KEY` is set and the request had no/wrong bearer token | Send `Authorization: Bearer <key>`; on a WebSocket use `Sec-WebSocket-Protocol: bearer, <key>` |
-| WebSocket closes with `1008` | Host, Origin or token failed the guard | Connect via `127.0.0.1`/`localhost`; send the token; add a deliberate hostname to `AGENT_VOICE_ALLOWED_HOSTS` |
+| WebSocket handshake fails with `403` | Host, Origin or token failed the guard. The refusal happens **before** `accept()`, so a real client sees a failed HTTP upgrade, not a close code | Connect via `127.0.0.1`/`localhost`; send the token; add a deliberate hostname to `AGENT_VOICE_ALLOWED_HOSTS` |
 | `421 host not allowed` | The `Host` header is not loopback or in `AGENT_VOICE_ALLOWED_HOSTS` | Connect by loopback name, or add the name you front it with |
 | `403 origin not allowed` | A browser page on another origin called the daemon | Serve the page from loopback, or add its host to `AGENT_VOICE_ALLOWED_HOSTS` |
 | `404 VOICE_NOT_FOUND` for an artifact | Artifacts are ephemeral and the id is unknown/expired | Re-run the synthesis; ids are 16 lowercase hex chars |
 | `400 BAD_REQUEST` for an artifact id | The id contained path or glob syntax | Use the id exactly as returned |
+| `400 BAD_REQUEST` mentioning `[pause]` | A recognised markup tag with a value it cannot honour (`[pause abc]`, `[pause 99s]`) | Use `[pause]`, `[pause 500ms]` or `[pause 1.5s]` (0–10 s), or `markup=false` |
+| Markup tags are spoken aloud | The tag is not in the whitelist (`[pausex]`, `[div]`) or `markup=false` was sent | Check the spelling; tag names are case-insensitive; see [api.md](api.md#expressive-markup) |
 | `422 VOICE_REQUIRED` | No voice exists or was selected, and the engine cannot speak without one | Clone a voice (`voices add`), use `speaker=`, or `design_voice` |
 | `403 PATH_OUTSIDE_BASE` | An agent-supplied `ref_audio_path` escaped `MCP_BASE_PATH` or the inbox | Put the clip in `<DATA_DIR>/inbox/` (`server_info().inbox_dir`) or set `AGENT_VOICE_ALLOW_ANY_PATH=true` deliberately |
 | `403 AGENT_MUTATION_DISABLED` | Engine/model mutation is off, or the caller is not on loopback | Set `ALLOW_AGENT_ENGINE_MUTATION=true` **and** call from loopback, or make the change as the operator |
 | `409 WORKER_BUSY` | `unload` without `force` while a job runs, an engine switch while the active engine drains, or a minimum-residency window | Retry after the job, or `agent-voice unload --force` |
 | `409 ENGINE_NOT_INSTALLED` | The engine is discovered but its venv is missing | `agent-voice engines install <id>` |
 | `422 MANIFEST_INVALID` | `engine.yaml` failed validation | Fix the manifest; the message names the field |
-| `429 BACKPRESSURE` | The per-engine wait queue (`MAX_QUEUE_DEPTH`) is full, or a stream consumer stalled | Retry, raise `MAX_QUEUE_DEPTH` deliberately, or submit long work with `start_script_job` |
+| `429 BACKPRESSURE` | The global wait queue (`MAX_QUEUE_DEPTH`) is full, or a stream consumer stalled | Retry, raise `MAX_QUEUE_DEPTH` deliberately, or submit long work with `start_script_job` |
 | `413 TEXT_TOO_LONG` | `MAX_TEXT_CHARS`, `MAX_INSTRUCT_CHARS`, `MAX_DESIGN_SAMPLE_CHARS` or `MAX_REF_TEXT_CHARS` exceeded | Shorten the input or raise the cap |
 | `400 BAD_REQUEST` on a voice name | Name does not match `^[\w .\-]{1,64}$` | Use letters, digits, spaces, dots, hyphens, 1–64 chars |
 | `410 DAEMON_RESTARTED` | The job was pending/running when the daemon stopped; jobs cannot resume | Re-submit the script |
@@ -148,7 +250,13 @@ A bare `refs/main` pointer is not a model. `models list` reports
 
 ```bash
 uv run agent-voice models download qwen3_tts_fast 1.7b-base
+uv run agent-voice models download kokoro kokoro-82m
 ```
+
+`models download --no-wait` is accepted but ignored: the CLI always blocks until the
+snapshot is complete, because a background download would leave the caller with no
+job id to poll. Use the REST route (`POST /v1/models/{engine}/{alias}/download`) or
+`download_model()` when you want an asynchronous job.
 
 ## Cache looks stale or too large
 
@@ -158,10 +266,19 @@ uv run agent-voice cache clear   # deletes cached artifacts and sidecars, prints
 ```
 
 The cache key is a SHA-256 over the full synthesis parameter set, including the
-spoken (lexicon-rewritten) text, model alias, mode, speaker, instruct, seed, take
-and backend identity. Editing a pronunciation invalidates only the lines that use
-that term. If you suspect a stale entry, `cache clear` is safe — it only removes
-renders, never voices or pronunciation data.
+spoken text after the lexicon, the effective speed, model alias, mode, speaker,
+instruct, seed, take and backend identity. v0.4.0 added **no key fields**: `markup`,
+`spell_identifiers`, `paragraph_gap_ms` and `project` are not part of the key, but
+their effect on the spoken text and on `speed` is. So:
+
+- editing a pronunciation, or changing a tag that changes the spoken words or
+  speed, invalidates only the lines that use it;
+- a pause or paragraph gap is local silence and is never cached;
+- `[emphasis]` gain is applied at stitch time, after the per-segment cache entry;
+- `pronunciation_hash` is observability only (`pronunciations show`).
+
+If you suspect a stale entry, `cache clear` is safe — it removes renders, never
+voices or lexicon data.
 
 ## Streaming stalls
 
@@ -170,16 +287,21 @@ renders, never voices or pronunciation data.
   promptly or request shorter text.
 - `native` vs `emulated` streaming is reported per response
   (`x-agent-voice-streaming-mode`, or `streaming_mode` on the WebSocket
-  `started` frame). `qwen3_tts` is emulated by design.
+  `started` frame) — `streaming_mode` is present **only** on a streamed response.
+  `qwen3_tts` is emulated by design; `qwen3_tts_fast` and `kokoro` are native.
 - Barge-in (sending a new `speak` over the WebSocket while audio flows) cancels
   the in-flight stream first; a `cancel` message is acknowledged with
   `{"type":"cancelled"}`.
+- A bad frame does not close the socket: malformed JSON and recoverable errors
+  (`TEXT_TOO_LONG`, an unknown speaker) answer with an `error` frame and the
+  connection stays usable.
 
 ## Platform notes
 
-- **macOS.** Only the `mock` engine runs. There is no CUDA, so `qwen3_tts` and
-  `qwen3_tts_fast` cannot load; `doctor` flags the missing GPU as a `WARN`, which
-  is expected there. Use `AGENT_VOICE_DEFAULT_ENGINE=mock` for development.
+- **macOS.** The CPU engines run: `kokoro` and `mock`. There is no CUDA, so
+  `qwen3_tts` and `qwen3_tts_fast` cannot load; `doctor` flags the missing GPU as a
+  `WARN`, which is expected there. Use `AGENT_VOICE_DEFAULT_ENGINE=kokoro` (or
+  `mock`) for development.
 - **Windows.** Untested. The IPC transport switches to loopback TCP
   automatically. Engine venvs use the Windows layout (`Scripts/` rather than
   `bin/`) while the shipped manifests declare a POSIX `venv_python` path — that

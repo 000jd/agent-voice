@@ -14,6 +14,13 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from .pronunciations import (
+    MAX_LEXICON_ENTRIES,
+    MAX_MERGED_LEXICON_ENTRIES,
+    PROJECT_LEXICON_DIR,
+    PRONUNCIATION_FILE,
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -116,6 +123,20 @@ class Settings(BaseSettings):
             raise ValueError("NORMALIZE_LUFS must be between -40 and -5")
         return value
 
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def _strip_api_key(cls, value: object) -> object:
+        """Whitespace around a key is never part of it — and only whitespace is unset.
+
+        ``AGENT_VOICE_API_KEY=" "`` used to count as "a key is set", so the daemon
+        would happily bind a LAN address with effectively no authentication while
+        the guard compared incoming headers against a single space. Stripping here
+        is what makes the bind refusal and the guard agree on "no key".
+        """
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
     @field_validator("allowed_hosts", mode="before")
     @classmethod
     def _split_hosts(cls, value: object) -> object:
@@ -177,7 +198,31 @@ class Settings(BaseSettings):
 
     @property
     def pronunciations_path(self) -> Path:
-        return self.data_dir / "pronunciations.json"
+        return self.data_dir / PRONUNCIATION_FILE
+
+    @property
+    def pronunciations_dir(self) -> Path:
+        """Project-scoped lexicons: ``<data>/pronunciations/<project>.json``.
+
+        Deliberately separate from :attr:`pronunciations_path` so a project named
+        ``json`` could never collide with the global file.
+        """
+        return self.data_dir / PROJECT_LEXICON_DIR
+
+    @property
+    def max_lexicon_entries(self) -> int:
+        """Per-scope entry cap: the global, project, voice and per-call maps.
+
+        A read-only view of the module constant, not an env knob: the caps are a
+        security boundary (an unbounded alternation is an unbounded regex), so
+        they are raised only by editing the contract, deliberately.
+        """
+        return MAX_LEXICON_ENTRIES
+
+    @property
+    def max_merged_lexicon_entries(self) -> int:
+        """Cap on the merged global + project + voice + per-call map."""
+        return MAX_MERGED_LEXICON_ENTRIES
 
     @property
     def daemon_lock_path(self) -> Path:
@@ -185,7 +230,17 @@ class Settings(BaseSettings):
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        """The daemon's own URL, with an IPv6 literal bracketed.
+
+        ``http://::1:8000`` is not a URL: every colon in the literal is also the
+        host/port separator, so clients parse the port as ``1:8000``. RFC 3986
+        requires ``[::1]`` inside a URI authority, which is what callers of this
+        property (the CLI, the MCP proxy) hand to httpx.
+        """
+        host = self.host.strip()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"http://{host}:{self.port}"
 
     def ensure_dirs(self) -> None:
         for path in (
@@ -195,6 +250,7 @@ class Settings(BaseSettings):
             self.cache_dir,
             self.jobs_dir,
             self.artifacts_dir,
+            self.pronunciations_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

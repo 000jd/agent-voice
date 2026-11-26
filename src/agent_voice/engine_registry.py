@@ -135,7 +135,10 @@ def hf_model_downloaded(hf_repo: str) -> bool:
         if not revision.is_dir():
             continue
         for entry in revision.iterdir():
-            if entry.suffix in {".safetensors", ".bin", ".pt", ".gguf"}:
+            # .pth is Kokoro's 327 MB checkpoint; without it a fully working
+            # install is reported as "not downloaded" and the OpenAI preset
+            # fallback refuses to speak.
+            if entry.suffix in {".safetensors", ".bin", ".pt", ".pth", ".gguf"}:
                 try:
                     if entry.resolve().stat().st_size > 0:
                         return True

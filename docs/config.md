@@ -13,8 +13,9 @@ cp .env.example .env
 - Precedence: **process environment** > `.env` in the current working directory >
   code defaults. Names are case-insensitive; unknown variables are ignored.
 - Settings are read once (cached) at startup. Editing `.env` requires a daemon
-  restart. The one exception is `data/pronunciations.json`, which is re-read on
-  every request.
+  restart. The one exception is the pronunciation lexicon — `data/pronunciations.json`,
+  `data/pronunciations/<project>.json` and each voice's `pronunciations.json` — which
+  is re-read on every request.
 - A handful of values are validated at load: `NORMALIZE_LUFS` must be between
   `-40` and `-5`, `MAX_ACTIVE_ENGINES` between `1` and `2`, and all caps must be
   `>= 1`.
@@ -26,9 +27,9 @@ cp .env.example .env
 
 | Variable | Default | Effect |
 |---|---|---|
-| `AGENT_VOICE_HOST` | `127.0.0.1` | Bind address. A non-loopback value without an API key refuses to start |
+| `AGENT_VOICE_HOST` | `127.0.0.1` | Bind address. A non-loopback value without an API key refuses to start. IPv6 literals (`::1`) work and are bracketed in generated URLs |
 | `AGENT_VOICE_PORT` | `8000` | Bind port, and the base for every generated `download_url` |
-| `AGENT_VOICE_API_KEY` | *(empty)* | When set, `/v1/*`, `/audio/*` and `/mcp/*` require `Authorization: Bearer <key>`; `/health`, `/docs` and `/openapi.json` stay open. WebSockets accept the same header or `Sec-WebSocket-Protocol: bearer, <key>` |
+| `AGENT_VOICE_API_KEY` | *(empty)* | When set, `/v1/*`, `/audio/*` and `/mcp/*` require `Authorization: Bearer <key>`; `/health`, `/docs`, `/redoc` and `/openapi.json` stay open. `/audio` artifacts need the header too, so a `download_url` is not a capability. WebSockets accept the same header or `Sec-WebSocket-Protocol: bearer, <key>`. A whitespace-only value counts as unset |
 
 ## Defaults
 
@@ -48,7 +49,7 @@ cp .env.example .env
 | `MIN_ENGINE_RESIDENCY_SECONDS` | `60` | Hysteresis: minimum residency before the scheduler may switch engines, which stops ping-ponging |
 | `MIN_FREE_VRAM_GB` | `2.0` | VRAM pressure-yield threshold: when free VRAM drops below this and nothing is in flight, idle workers are killed so another GPU application can use the card |
 | `ENABLE_VRAM_PRESSURE_YIELD` | `true` | Master switch for the pressure yield above; `false` keeps idle workers resident until `MODEL_IDLE_TTL_SECONDS` |
-| `MAX_QUEUE_DEPTH` | `64` | Uncached jobs allowed to wait per engine. A full queue answers `429 BACKPRESSURE` instead of growing without bound |
+| `MAX_QUEUE_DEPTH` | `64` | Uncached jobs allowed to wait **across all engines** — a global admission cap, not a per-engine one. When it is reached, the request answers `429 BACKPRESSURE` instead of growing without bound |
 
 Cache hits and read-only calls (`server_info`, `gpu_status`, `list_voices`) never
 enter this queue; they are answered before an engine slot is requested.
@@ -66,9 +67,44 @@ enter this queue; they are answered before an engine slot is requested.
 | `MAX_REF_TEXT_CHARS` | `2000` | Cap on `clone_voice(ref_text=…)`. Violation: `413 TEXT_TOO_LONG` |
 | `NORMALIZE_LUFS` | `-16.0` | Integrated loudness target for rendered audio; allowed range `-40` to `-5` |
 
+`NORMALIZE_LUFS` applies to a **converted** single-utterance render (`mp3`, `opus`,
+`flac`): ffmpeg runs one `loudnorm` pass after stitching. It deliberately does
+**not** apply to:
+
+- a `wav` render — the engine's (or stitched) bytes are copied byte-for-byte, so
+  WAV stays bit-exact rather than loudness-normalised;
+- a `pcm` response, which is never normalised;
+- a script render (`speak_script` / `/v1/agent/script`), whose master is stitched
+  from per-beat WAVs and converted without a loudnorm stage.
+
+The value is part of the synthesis cache key, so changing it re-renders converted
+output rather than serving a stale file.
+
 The four input caps are enforced at admission — before routing, before a worker
 is spawned and before any GPU time is spent. A rejected request creates no cache
 entry and no scratch directory.
+
+## Markup and lexicon limits
+
+These are structural caps in code, not environment variables: they bound a
+security boundary (an unbounded tag nest or an unbounded alternation is an
+unbounded regex), so they are raised only by editing the contract deliberately.
+
+| Limit | Value | Applies to |
+|---|---|---|
+| Markup tags | 128 | one utterance or beat |
+| Markup nesting depth | 4 | `[slow][fast][emphasis][spell]` is already 4 |
+| Markup segments | 32 | speech runs + pauses per utterance |
+| `[pause]` | 0–10 s | one pause, `ms` or `s` |
+| `paragraph_gap_ms` | 0–5000 | per request or beat |
+| Lexicon entries | 500 | each scope (global, project, voice, per-call) |
+| Lexicon entries, merged | 1,500 | global + project + voice + per-call |
+| Lexicon key/replacement | 200 chars each | every scope |
+
+Scopes live at `<DATA_DIR>/pronunciations.json` (global),
+`<DATA_DIR>/pronunciations/<project>.json` (project, validated slug) and
+`<DATA_DIR>/voices/<voice_id>/pronunciations.json` (voice). Precedence is global →
+project → voice → per-call; see [api.md](api.md#pronunciation-lexicon-scopes-and-code-mode).
 
 ## Streaming
 
@@ -94,19 +130,34 @@ entry and no scratch directory.
 | `AGENT_VOICE_ALLOW_ANY_PATH` | `false` | `false` (safe default) confines **agent-supplied** `clone_voice` paths to `<DATA_DIR>/inbox/`. `true` allows any existing absolute local path. The CLI `agent-voice voices add` is an operator command and stays unrestricted either way. `MCP_BASE_PATH`, when set, takes precedence over this |
 
 Rejected requests: foreign `Host` → `421`, foreign `Origin` → `403`, missing or
-wrong bearer token → `401`, a WebSocket failing any check → close code `1008`
-before `accept()`. See [api.md](api.md#auth-and-hostorigin-rules).
+wrong bearer token → `401`, and a WebSocket that fails any check is refused before
+`accept()` — over a real uvicorn that is an **HTTP `403`** on the handshake, not a
+close frame. See [api.md](api.md#auth-and-hostorigin-rules).
 
 ## Paths
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DATA_DIR` | `./data` | Root for `voices/`, `inbox/`, `cache/`, `jobs/`, `artifacts/`, `bindings.json`, `pronunciations.json`, `daemon.lock`, `daemon.pid`, `daemon.log`, `mutations.log`. Resolved to an absolute path at load |
+| `DATA_DIR` | `./data` | Root for `voices/`, `inbox/`, `cache/`, `jobs/`, `artifacts/`, `pronunciations/`, `bindings.json`, `pronunciations.json`, `daemon.lock`, `daemon.pid`, `daemon.log`, `mutations.log`. Resolved to an absolute path at load |
 | `ENGINES_DIR` | `./engines` | Where engine plugins are discovered. Resolved to an absolute path at load |
 
 Relative values are resolved against the daemon's working directory at startup,
 because workers are spawned with `cwd=<engine dir>` and a relative IPC socket path
 would otherwise resolve somewhere else.
+
+## Engine prerequisites
+
+Some engines need a system package or a model that is not a pip dependency. These
+are read-only checks in `agent-voice doctor`; none of them is an environment
+variable.
+
+| Prerequisite | Needed by | If missing |
+|---|---|---|
+| `ffmpeg` + `ffprobe` | every engine (reference canonicalisation, format conversion) | `FAIL` row — the daemon cannot produce non-WAV audio |
+| `espeak-ng` | `kokoro` (English out-of-dictionary fallback, non-English G2P) | `WARN` row with the platform install command; common English still speaks |
+| `en_core_web_sm` (spaCy) | `kokoro` English G2P | pinned as a direct dependency in `engines/kokoro/pyproject.toml`, so `engines install kokoro` brings it |
+| CPU-only `torch` | `kokoro` | pinned to the `pytorch-cpu` index in the engine's `pyproject.toml`; a CUDA wheel there would defeat the zero-VRAM guarantee |
+| NVIDIA driver + GPU | `qwen3_tts`, `qwen3_tts_fast` | `WARN` row ("mock/CPU only"); `kokoro` and `mock` still work |
 
 ## MCP stdio shim
 
@@ -139,10 +190,10 @@ Do not set these yourself; they are part of the engine IPC contract (see
 1. Edit `.env`, not the host environment, so the value is reviewable in the repo.
 2. Restart the daemon (`Ctrl-C` then `agent-voice serve`, or
    `systemctl --user restart agent-voice`).
-3. Confirm with `agent-voice doctor` (environment, `ffmpeg`, engines, models) and
-   `agent-voice status` (health + GPU state). `server_info()` reports the effective
-   `default_engine`, `default_voice`, `inbox_dir` and GPU snapshot from inside an
-   agent.
+3. Confirm with `agent-voice doctor` (environment, `ffmpeg`, the GPU, `espeak-ng`
+   when Kokoro ships, engines, models, the port) and `agent-voice status` (health +
+   GPU state). `server_info()` reports the effective `default_engine`,
+   `default_voice`, `inbox_dir` and GPU snapshot from inside an agent.
 4. For anything security-relevant (`ALLOW_AGENT_ENGINE_MUTATION`,
    `AGENT_VOICE_ALLOW_ANY_PATH`, `AGENT_VOICE_API_KEY`,
    `AGENT_VOICE_ALLOWED_HOSTS`), read [SECURITY.md](../SECURITY.md) first.

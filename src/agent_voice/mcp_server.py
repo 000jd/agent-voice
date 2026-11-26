@@ -31,7 +31,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers, get_http_request
 from mcp_types import ToolAnnotations
 
-from .pronunciations import prepare_text, validate_pronunciation_map
+from .pronunciations import check_pronunciation_map
 from .schemas import (
     DEFAULT_DESIGN_SAMPLE_TEXT,
     AgentVoiceError,
@@ -49,7 +49,7 @@ from .schemas import (
     SynthesisResult,
     VoiceListResponse,
 )
-from .security import is_loopback_client
+from .security import is_loopback_client, resolve_ref_audio_path
 from .services.script_service import render_script
 from .services.voice_design_service import render_design
 from .settings_types import SettingsLike
@@ -150,15 +150,7 @@ def _with_default_pause(beats: list[BeatSpec], pause_after_sec: float) -> list[B
 
 def _check_pronunciations(pronunciations: dict[str, str] | None) -> None:
     """Reject an oversized per-call map as a structured tool error."""
-    try:
-        validate_pronunciation_map(pronunciations)
-    except ValueError as exc:
-        raise AgentVoiceError(
-            ErrorCode.BAD_REQUEST,
-            f"invalid pronunciations: {exc}",
-            "Use at most 500 entries; each key and replacement may be at most "
-            "200 characters.",
-        ) from exc
+    check_pronunciation_map(pronunciations)
 
 
 def _preset_speech_surface(
@@ -193,17 +185,49 @@ def _preset_speech_surface(
     return speakers, design_available
 
 
+def _design_checkpoint_step(
+    default: EngineEntry | None, settings: SettingsLike
+) -> str:
+    """How to get a voice_design checkpoint, given what the default engine lists.
+
+    Naming the exact ``models download`` invocation is the difference between an
+    agent that can fix a clone-only install and one that only learns that
+    ``design_voice()`` is unavailable.
+    """
+    design = next(
+        (
+            model
+            for model in (default.models if default is not None else [])
+            if model.mode == "voice_design"
+        ),
+        None,
+    )
+    if design is None:
+        return (
+            "voice design is unavailable: the "
+            f"{settings.default_engine} manifest lists no `voice_design` checkpoint."
+        )
+    return (
+        "voice design needs its checkpoint downloaded: run "
+        f"`agent-voice models download {settings.default_engine} {design.alias}`."
+    )
+
+
 def _next_steps(
     entries: list[EngineEntry],
     settings: SettingsLike,
     *,
     voices_count: int,
     preset_speakers: list[str],
+    voice_design_available: bool = False,
 ) -> list[str]:
     """Actionable advice for a server that cannot speak yet; empty when ready.
 
     Reads manifests only, like the rest of ``server_info()``: it must never spawn
-    a worker or touch the GPU.
+    a worker or touch the GPU. A tool that cannot run is never recommended:
+    ``design_voice()`` is named only when a ``voice_design`` checkpoint is
+    actually usable on the default engine, and a clone-only install is told how
+    to get one instead.
     """
     default = next(
         (entry for entry in entries if entry.engine_id == settings.default_engine), None
@@ -222,10 +246,14 @@ def _next_steps(
             f"`agent-voice models download{download}` or `agent-voice doctor`."
         )
     if not voices_count and not preset_speakers:
-        steps.append(
+        clone = (
             f"Put a 3-10 s reference clip in {settings.inbox_dir} and call "
-            "clone_voice(), or call design_voice()."
+            "clone_voice()"
         )
+        if voice_design_available:
+            steps.append(f"{clone}, or call design_voice().")
+        else:
+            steps.append(f"{clone}; {_design_checkpoint_step(default, settings)}")
     return steps
 
 
@@ -310,9 +338,10 @@ def build_mcp_server(ctx) -> FastMCP:
     async def server_info() -> dict[str, Any]:
         """Call this first: a free, GPU-free snapshot of what this machine can do.
 
-        Read: default_engine, default_voice, voices_count, inbox_dir,
-        preset_speakers[], installed_engines[] and next_steps[], which says what to
-        fix when the server is not ready to speak.
+        Read: version, default_engine, default_voice, voices_count, voices[],
+        inbox_dir, preset_speakers[], voice_design_available, installed_engines[],
+        engines[], gpu_status and next_steps[], which says what to fix when the
+        server is not ready to speak.
         """
         from . import __version__
 
@@ -348,6 +377,7 @@ def build_mcp_server(ctx) -> FastMCP:
                 settings,
                 voices_count=len(voices),
                 preset_speakers=preset_speakers,
+                voice_design_available=voice_design_available,
             ),
             "engines": [
                 {
@@ -377,6 +407,10 @@ def build_mcp_server(ctx) -> FastMCP:
         speed: float = 1.0,
         take: int | None = None,
         pronunciations: dict[str, str] | None = None,
+        markup: bool = True,
+        spell_identifiers: bool = False,
+        paragraph_gap_ms: int = 0,
+        project: str | None = None,
     ) -> SynthesisResult:
         """Synthesise ONE utterance to a file; use speak_script() for several beats.
 
@@ -388,8 +422,13 @@ def build_mcp_server(ctx) -> FastMCP:
         Args:
             take: Alternate delivery of the same line, with a repeatable seed.
             pronunciations: Per-call word -> spoken-form overrides.
+            markup: Interpret [pause]/[slow]/[fast]/[emphasis]/[spell] tags.
+            spell_identifiers: Expand code-like tokens before synthesis.
+            paragraph_gap_ms: Silence at each blank-line paragraph break.
+            project: Scoped-lexicon project slug.
         """
         from .api.routing import resolve_target
+        from .services.utterance_service import speak_utterance
 
         try:
             _check_pronunciations(pronunciations)
@@ -407,6 +446,10 @@ def build_mcp_server(ctx) -> FastMCP:
                 speed=speed,
                 take=take,
                 pronunciations=pronunciations,
+                markup=markup,
+                spell_identifiers=spell_identifiers,
+                paragraph_gap_ms=paragraph_gap_ms,
+                project=project,
             )
             if len(request.text) > settings.max_text_chars:
                 raise AgentVoiceError(
@@ -415,43 +458,41 @@ def build_mcp_server(ctx) -> FastMCP:
                     f"{settings.max_text_chars}",
                     "Split it up or use speak_script.",
                 )
-            # Rewritten after the limit check: the caller is told off for what it
-            # sent, not for a spoken form an expansion made longer.
-            spoken_text = prepare_text(
-                ctx.pronunciations, request.text, request.pronunciations
-            )
-            target = resolve_target(
-                settings=settings,
-                registry=ctx.registry,
-                voices=ctx.voices,
-                bindings=ctx.bindings,
-                agent_id=_agent_id(),
-                voice=request.voice,
-                speaker=request.speaker,
-                instruct=request.instruct,
-                engine=request.engine,
-                model=request.model,
-                quality=request.quality,
-            )
-            return await ctx.workers.synthesize(
-                engine_id=target.engine_id,
-                model_alias=target.model_alias,
-                text=spoken_text,
-                voice_id=target.voice_id,
-                ref_text=target.ref_text,
-                x_vector_only=target.x_vector_only,
-                # Resolved values: the canonical speaker spelling, and no instruct
-                # when a clone checkpoint spoke (it has no instruct channel, so
-                # carrying one would only widen the cache key).
-                mode=target.mode,
-                speaker=target.speaker,
-                instruct=target.instruct,
+
+            def resolve():
+                return resolve_target(
+                    settings=settings,
+                    registry=ctx.registry,
+                    voices=ctx.voices,
+                    bindings=ctx.bindings,
+                    agent_id=_agent_id(),
+                    voice=request.voice,
+                    speaker=request.speaker,
+                    instruct=request.instruct,
+                    engine=request.engine,
+                    model=request.model,
+                    quality=request.quality,
+                )
+
+            # The same pipeline the REST and script surfaces use. Speaking
+            # through a second copy of the rewrite rules is how MCP and REST
+            # would drift; the admission caps above still apply to the raw text.
+            outcome = await speak_utterance(
+                ctx,
+                text=request.text,
+                resolve=resolve,
+                markup=request.markup,
+                spell_identifiers=request.spell_identifiers,
+                paragraph_gap_ms=request.paragraph_gap_ms,
+                project=request.project,
+                overrides=request.pronunciations,
                 language=request.language,
                 seed=request.seed,
                 speed=request.speed,
                 response_format=request.format,
                 take=request.take,
             )
+            return outcome.result
         except AgentVoiceError as exc:
             _raise_tool_error(exc)
 
@@ -465,6 +506,10 @@ def build_mcp_server(ctx) -> FastMCP:
         export_srt: bool = True,
         pause_after_sec: float = 0.0,
         pronunciations: dict[str, str] | None = None,
+        markup: bool = True,
+        spell_identifiers: bool = False,
+        paragraph_gap_ms: int = 0,
+        project: str | None = None,
     ) -> ScriptResult:
         """Synthesise a multi-beat script into one stitched file with exact timings.
 
@@ -482,6 +527,10 @@ def build_mcp_server(ctx) -> FastMCP:
                 format=format,
                 export_srt=export_srt,
                 pronunciations=pronunciations,
+                markup=markup,
+                spell_identifiers=spell_identifiers,
+                paragraph_gap_ms=paragraph_gap_ms,
+                project=project,
             )
             return await render_script(ctx, payload, agent_id=_agent_id())
         except AgentVoiceError as exc:
@@ -497,6 +546,10 @@ def build_mcp_server(ctx) -> FastMCP:
         export_srt: bool = True,
         pause_after_sec: float = 0.0,
         pronunciations: dict[str, str] | None = None,
+        markup: bool = True,
+        spell_identifiers: bool = False,
+        paragraph_gap_ms: int = 0,
+        project: str | None = None,
     ) -> dict[str, Any]:
         """Start a script render in the background and return a job id immediately.
 
@@ -512,6 +565,10 @@ def build_mcp_server(ctx) -> FastMCP:
                 format=format,
                 export_srt=export_srt,
                 pronunciations=pronunciations,
+                markup=markup,
+                spell_identifiers=spell_identifiers,
+                paragraph_gap_ms=paragraph_gap_ms,
+                project=project,
             )
             job = ctx.jobs.create("script")
             # Captured before the task starts: get_http_headers() is only valid
@@ -586,25 +643,15 @@ def build_mcp_server(ctx) -> FastMCP:
         without MCP_BASE_PATH the clip must be in the inbox. Read: voice_id (pass as
         `voice`) and warnings[].
         """
-        from .security import ensure_within_base
-
         try:
-            base = settings.mcp_base_path
-            if base:
-                source = ensure_within_base(ref_audio_path, base)
-            elif not settings.allow_any_path:
-                inbox = settings.inbox_dir
-                source = ensure_within_base(
-                    ref_audio_path,
-                    inbox,
-                    suggestion=(
-                        f"Put the reference clip in {inbox} (the inbox), or set "
-                        "AGENT_VOICE_ALLOW_ANY_PATH=true to allow any existing "
-                        "local path."
-                    ),
-                )
-            else:
-                source = Path(ref_audio_path).expanduser()
+            # The same resolver REST uses, so a relative path is refused here too
+            # even when ALLOW_ANY_PATH is on: the daemon's cwd is not the caller's.
+            source = resolve_ref_audio_path(
+                ref_audio_path,
+                mcp_base_path=settings.mcp_base_path,
+                inbox_dir=settings.inbox_dir,
+                allow_any_path=settings.allow_any_path,
+            )
             return ctx.voices.add(
                 name=name,
                 source_path=source,

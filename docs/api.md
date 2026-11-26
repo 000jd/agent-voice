@@ -10,10 +10,10 @@
   (`agent-voice mcp`) for clients that cannot speak HTTP.
 
 The wire contract lives in `src/agent_voice/schemas.py` and is treated as frozen:
-fields are added, never silently repurposed. This document describes v0.3.3.
+fields are added, never silently repurposed. This document describes v0.4.0.
 
-Default base URL: `http://127.0.0.1:8000`. Interactive schema: `/docs` and
-`/openapi.json`.
+Default base URL: `http://127.0.0.1:8000`. Interactive schema: `/docs`, `/redoc`
+and `/openapi.json`.
 
 ## Auth and Host/Origin rules
 
@@ -26,12 +26,13 @@ rules apply to every route, including the mounted `/mcp` app.
 | `Host` | Must canonicalise to `127.0.0.1`, `localhost`, `[::1]`/`::1`, or a name in `AGENT_VOICE_ALLOWED_HOSTS` | `421` with `{"error_code":"BAD_REQUEST","message":"host not allowed: …"}` |
 | `Origin` | If the header is present, its host must be in the same allowed set (an opaque `null` origin is rejected) | `403` |
 | `Authorization` | Required when `AGENT_VOICE_API_KEY` is set, for `/v1/*`, `/audio/*` and `/mcp/*` | `401` |
-| Exempt paths | `/health`, `/docs`, `/openapi.json` (and anything not under `/v1`, `/audio`, `/mcp`) | — |
+| Exempt paths | `/health`, `/docs`, `/redoc`, `/openapi.json` (and anything not under `/v1`, `/audio`, `/mcp`) | — |
 
 Notes:
 
-- For a WebSocket, a failed check is not an HTTP status: the socket is closed
-  with code **`1008`** before `accept()` (see
+- For a WebSocket, a failed check is not an HTTP status either: over a real
+  uvicorn the pre-`accept()` refusal surfaces as **HTTP `403`** on the handshake,
+  not as a WebSocket close frame (see
   [WebSocket](#websocket-v1audiows)).
 - `AGENT_VOICE_ALLOWED_HOSTS` **extends** the loopback defaults; it never replaces
   them. Both `a,b` and `["a","b"]` forms are accepted.
@@ -47,9 +48,11 @@ Notes:
   ```
 
   A plain `Authorization: Bearer <key>` also works. A handshake that fails Host,
-  Origin or auth is closed with code **`1008`** (RFC 6455 policy violation)
-  *before* `accept()`, so no audio ever flows. When the token arrives in the
-  subprotocol list the server selects and echoes the `bearer` subprotocol.
+  Origin or auth is refused **before** `accept()`, so no audio ever flows and the
+  client sees a failed handshake rather than a close code. When the token arrives in
+  the subprotocol list the server selects and echoes the matched subprotocol
+  spelling (the list is matched case-insensitively; the server echoes what the
+  client sent).
 
 `X-Agent-Id: <name>` selects a per-agent voice/engine binding. It is convenience
 routing on a local single-user box, **not** an authorization boundary.
@@ -86,7 +89,7 @@ Every failure — REST, MCP tool result, IPC reply — uses one body:
 | `INVALID_SLUG` | 422 | Engine id / alias failed validation |
 | `MANIFEST_INVALID` | 422 | `engine.yaml` could not be parsed or validated |
 | `TIMEOUT` | 504 | The operation exceeded its deadline |
-| `BACKPRESSURE` | 429 | The per-engine wait queue is full, or a stream consumer stalled |
+| `BACKPRESSURE` | 429 | The global wait queue is full, or a stream consumer stalled |
 | `DAEMON_RESTARTED` | 410 | A job was interrupted by a restart and cannot resume |
 | `BAD_REQUEST` | 400 | Malformed request, bad field, unknown enum value |
 | `INTERNAL_ERROR` | 500 | Unhandled daemon error; read the logs |
@@ -129,7 +132,7 @@ A request-body validation failure is a `422` whose `error_code` is also
 ### `GET /health`
 
 ```json
-{"status": "ok", "version": "0.3.3", "protocol_version": 1, "torch_loaded": false}
+{"status": "ok", "version": "0.4.0", "protocol_version": 1, "torch_loaded": false}
 ```
 
 `torch_loaded` is reported by looking for `torch` in the core daemon's
@@ -157,6 +160,9 @@ Returns the audio bytes with `Content-Type` matching the format, a
 | `x-agent-voice-model` | Model alias |
 | `x-agent-voice-speaker` | Present only when a preset-timbre fallback answered |
 
+This body is **strict**: there is no `markup`, `spell_identifiers`,
+`paragraph_gap_ms` or `project` here. Use `/v1/agent/speak` when you need them.
+
 **Builtin OpenAI voice fallback.** A real OpenAI client sends `alloy`, `echo`, …,
 which do not exist locally. Rather than answering `VOICE_NOT_FOUND`, a builtin
 name is resolved in this order:
@@ -169,15 +175,31 @@ name is resolved in this order:
    `onyx` → `Uncle_Fu`, `nova` → `Serena`, `shimmer` → `Vivian`.
 
 Step 4 is why a fresh install works: a `custom_voice` checkpoint needs no
-reference audio. Any other unknown voice name still fails with
-`VOICE_NOT_FOUND` — papering over a typo would be worse than an error.
+reference audio. On a **Kokoro** model the same six names map to its own presets —
+`alloy` → `af_heart`, `echo` → `am_adam`, `nova` → `af_bella`, `onyx` →
+`am_michael`, `fable` → `bm_george`, `shimmer` → `bf_emma` — because Kokoro's
+preset names are not Qwen's. Any other unknown voice name still fails with
+`VOICE_NOT_FOUND`: papering over a typo would be worse than an error.
 
 ### `POST /v1/agent/speak`
 
-Body is `SpeakRequest`: `text` plus optional `voice`, `speaker`, `instruct`,
-`engine`, `model`, `quality` (`high`/`fast`), `language`, `format`, `seed`,
-`speed`, `take`, `pronunciations`. Returns a `SynthesisResult` object (see
+Body is `SpeakRequest`. Returns a `SynthesisResult` object (see
 [Return fields](#return-fields-worth-reading)).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `text` | string | required | What to say, markup included |
+| `voice` / `speaker` / `instruct` | string | null / `""` | Picks the mode; `voice` and `speaker` together is an error |
+| `engine` / `model` / `quality` | — | — | Target selection (`quality`: `high`/`fast`) |
+| `language` | string | `"Auto"` | Language hint |
+| `format` | enum | `"wav"` | `wav`, `mp3`, `opus`, `flac`, `pcm` |
+| `speed` | float | `1.0` | Base speed; `[slow]`/`[fast]` multiply it |
+| `seed` / `take` | int | null | Reproducibility and alternate deliveries |
+| `pronunciations` | object | null | Per-call lexicon overrides (500-entry cap) |
+| `markup` | bool | `true` | Parse the tag whitelist; `false` speaks every bracket literally |
+| `spell_identifiers` | bool | `false` | Expand code-like tokens — see [code mode](#code-mode-spell_identifiers) |
+| `paragraph_gap_ms` | int | `0` | Silence inserted at each blank-line break, 0–5000 |
+| `project` | string | null | Scoped-lexicon project slug (lowercase, 2–41 chars) |
 
 ```bash
 curl -s -X POST localhost:8000/v1/agent/speak \
@@ -188,7 +210,10 @@ curl -s -X POST localhost:8000/v1/agent/speak \
 ### `POST /v1/audio/speech/pcm-stream`
 
 The same routing as `speak`, but the body is raw 24 kHz mono int16 LE PCM as it
-is generated. Response headers:
+is generated. The body accepts the same selectors as `/v1/agent/speak`, including
+`markup`, `spell_identifiers`, `paragraph_gap_ms` and `project`; pauses are emitted
+as exact-length silence and the `[spell]`/`[emphasis]` handling is identical.
+Response headers:
 
 | Header | Value |
 |---|---|
@@ -259,7 +284,8 @@ tells you whether it is present.
 ### Scripts and jobs
 
 `POST /v1/agent/script` — body `ScriptRequest` (`beats`, `default_voice`,
-`engine`, `quality`, `format`, `export_srt`, `pronunciations`).
+`engine`, `quality`, `format`, `export_srt`, `pronunciations`, `markup`,
+`spell_identifiers`, `paragraph_gap_ms`, `project`).
 
 - Synchronous by default: returns `ScriptResult`.
 - `?async=true` (legacy `?async_=true` also works) returns
@@ -312,7 +338,9 @@ agent named by the `X-Agent-Id` header (missing header → `400 BAD_REQUEST`).
 lowercase hex characters returned by a synthesis call. An unknown but
 well-formed id is `404 VOICE_NOT_FOUND` ("Artifacts are ephemeral; re-run
 speak()"); path or glob syntax is `400 BAD_REQUEST` and never reaches the
-filesystem.
+filesystem. When `AGENT_VOICE_API_KEY` is set, fetching a `download_url` needs the
+same `Authorization: Bearer <key>` header as any other `/audio` request — the URL
+is an address, not a capability.
 
 ### MCP mount
 
@@ -325,16 +353,24 @@ covered by the same guard, so a key protects `/mcp/*` too.
 Bidirectional: the client sends JSON control messages, the server sends binary
 PCM frames (24 kHz mono int16 LE) interleaved with JSON events.
 
-Handshake requirements (v0.3.3): a loopback `Host`, no foreign `Origin`, and — if
-`AGENT_VOICE_API_KEY` is set — a valid credential via `Authorization: Bearer …`
-or `Sec-WebSocket-Protocol: bearer, <key>`. Any failure closes the socket with
-code **1008** before `accept()`.
+Handshake requirements (v0.4.0): a loopback `Host`, no foreign `Origin`, and — if
+`AGENT_VOICE_API_KEY` is set — a valid credential via `Authorization: Bearer …` or
+`Sec-WebSocket-Protocol: bearer, <key>`.
+
+A failed handshake is refused **before** `accept()`. Over a real uvicorn that
+surfaces as **HTTP `403`** on the upgrade request — there is no WebSocket yet, so
+there is no close frame to carry 1008 and no audio ever flows. Only Starlette's
+in-process `TestClient` fabricates a `1008` close for the same refusal; the
+regression test asserts the real-uvicorn `403` because that is what a client sees.
+When the credential arrives in the subprotocol list, the server echoes the matched
+spelling back (`Bearer` stays `Bearer`, `bearer` stays `bearer`), so a browser
+handshake built from `["Bearer", key]` completes.
 
 Client → server:
 
 | Message | Fields | Effect |
 |---|---|---|
-| `{"type": "speak", "text": "..."}` | `text`/`input`, `voice`, `speaker`, `instruct`, `engine`, `model`, `quality`, `language`, `speed`, `pronunciations` | Start synthesis |
+| `{"type": "speak", "text": "..."}` | `text`/`input`, `voice`, `speaker`, `instruct`, `engine`, `model`, `quality`, `language`, `speed`, `pronunciations`, `markup`, `spell_identifiers`, `paragraph_gap_ms`, `project` | Start synthesis |
 | `{"type": "cancel"}` | — | Cancel the in-flight stream |
 | `{"type": "ping"}` | — | Liveness check |
 
@@ -356,6 +392,14 @@ Server → client:
 caller is rejected for what it sent, before any rewrite or worker spawn. A
 stalled consumer produces `BACKPRESSURE` and closes the generation.
 
+A **bad frame** does not close the socket. Malformed JSON is answered with an
+`error` frame (`BAD_REQUEST`, with the three accepted message shapes named), and
+recoverable request errors — `TEXT_TOO_LONG`, `VOICE_REQUIRED`, an unknown speaker
+or engine — are sent as `error` frames and the loop `continue`s, so a client can
+fix the message and retry on the same connection. Only a disconnect (or a
+worker failure mid-stream, reported as an `error` frame for that generation) ends
+the loop.
+
 ```javascript
 // Browser sketch: the key travels in the subprotocol list.
 const ws = new WebSocket("ws://127.0.0.1:8000/v1/audio/ws", ["bearer", "secret-key"]);
@@ -375,7 +419,7 @@ client from spawning a second GPU owner. Direct HTTP clients can mount
 | Tool | Surface | Purpose |
 |---|---|---|
 | `server_info` | core | **Call first.** Free snapshot — version, defaults, voices, engines, `inbox_dir`, GPU state |
-| `speak` | core | One utterance → file path. `voice`, `speaker` or `instruct`, per-call `pronunciations` |
+| `speak` | core | One utterance → file path. `voice`, `speaker` or `instruct`, `markup`, `spell_identifiers`, `paragraph_gap_ms`, `project`, per-call `pronunciations` |
 | `speak_script` | core | Multi-beat script with exact timings plus SRT/VTT |
 | `start_script_job` | core | Start the same render in the background, return a `job_id` |
 | `get_job` | core | Poll a job |
@@ -421,7 +465,7 @@ questions that otherwise cost a failed synthesis round-trip:
 
 ```json
 {
-  "version": "0.3.3",
+  "version": "0.4.0",
   "default_engine": "qwen3_tts_fast",
   "default_voice": "a1b2c3d4e5f6",
   "voices_count": 1,
@@ -470,10 +514,12 @@ path:
 
 Also present: `artifact_id`, `duration_sec`, `sample_rate` (always 24000),
 `format`, `engine_id`, `model_alias`, `backend_name`, `backend_version`,
-`voice_id`, `streaming_mode` (`native`/`emulated`).
+`voice_id`, and `streaming_mode` (`native`/`emulated`) — the last one **only on a
+streamed response**; a file render leaves it `null`.
 
-Reference point: a warm 0.6B render measured **≈ 0.86** (slightly slower than
-real time) on the reference card.
+Reference points: a warm 0.6B Qwen render measured **≈ 0.86** (slightly slower than
+real time) on the reference card; **Kokoro-82M on the CPU measured 3.4–5.2×** on a
+Ryzen 7 5700X, with 1.37 GB peak RSS and 0 MB VRAM.
 
 ## Alternate takes
 
@@ -520,6 +566,83 @@ request creates no cache entry and leaves no scratch directory, so retrying it
 unchanged fails identically. Shorten the input, split a long script, or raise the
 cap deliberately.
 
+Two more sets of limits are structural rather than configurable, and just as
+admission-time: **markup** allows 128 tags, nesting depth 4 and 32 segments per
+utterance, and the **lexicon** allows 500 entries per scope with 1,500 merged.
+
+## Expressive markup
+
+Markup is parsed on the **raw** text before routing and before any rewriting
+(`agent_voice/markup.py`), so a lexicon replacement that itself contains `[` or `]`
+can neither fabricate nor destroy a tag. It is on by default for `speak`, script
+beats, the WebSocket `speak` frame and the PCM stream; `POST /v1/audio/speech`
+(OpenAI shape) stays strict and never parses markup. `markup=false` bypasses the
+parser entirely.
+
+| Tag | Meaning |
+|---|---|
+| `[pause]` | 400 ms of silence |
+| `[pause 500ms]`, `[pause 1.5s]` | 0–10 s of silence (`ms` or `s`, fractional allowed) |
+| `[slow]…[/slow]` | speed ×0.82 |
+| `[fast]…[/fast]` | speed ×1.22 |
+| `[emphasis]…[/emphasis]` | speed ×0.94 and +2.5 dB, applied at stitch time, peak-limited |
+| `[spell]…[/spell]` | say the inner text character by character |
+| blank line (`\n\n`) | `paragraph_gap_ms` of silence (0 by default, so a blank line is just a break) |
+
+Rules that matter:
+
+- **Only the whitelist is a tag.** `arr[0]`, `matrix[i][j]`, `[a, b]`, `[1, 2]`,
+  `[pausex]`, `[]` and `[[x]]` are literal text and round-trip byte for byte.
+- **Unrecognised is not malformed.** A bracket that is not a tag is spoken as
+  written; a *recognised* tag with a value it cannot honour (`[pause abc]`,
+  `[pause -1s]`, `[pause 99s]`) is `400 BAD_REQUEST` naming the accepted forms.
+  Narrating "pause abc" would be a confident lie about what was rendered.
+- **Nothing fails silently.** An unclosed opener auto-closes at the end of the text
+  with a warning; a stray closer is dropped with a warning. Warnings are reported on
+  the script result, never as an error.
+- **Caps before work.** 128 tags, nesting depth 4 and 32 segments (speech + pause
+  runs) are checked before any worker is spawned, so an over-cap line costs one
+  round trip and no GPU time.
+- **Speed is multiplicative and clamped** to 0.5–2.0: `[slow][fast]…[/fast][/slow]`
+  with `speed=1.2` is `1.2 × 0.82 × 1.22`. A beat's `fit_mode` retiming still wins
+  over markup speed for that beat.
+- **`[emphasis]` is deliberately modest.** +2.5 dB at 0.94×, peak-limited, applied to
+  the segment audio at stitch time — after the segment cache — so it survives the
+  master loudness stage without turning into a limiter artefact.
+
+Precedence, strongest first:
+
+1. `fit_mode` retiming for a beat with `target_duration_sec`;
+2. the request's `speed`;
+3. `[slow]` / `[fast]` / `[emphasis]` multipliers, clamped 0.5–2.0;
+4. the engine's default pace.
+
+### Subtitles keep the written text
+
+`display_text` is the raw text minus tags, with the inner words of `[spell]` kept
+exactly as written. `.srt`, `.vtt`, `BeatTiming.text` and `beats[].text` all come
+from it, so a caption never shows `[pause 400ms]` or the spelled-out form. With
+`markup=false`, brackets and all, the written text round-trips byte for byte.
+
+### Markup over the three transports
+
+```bash
+# REST / agent endpoint
+curl -s -X POST localhost:8000/v1/agent/speak -H 'content-type: application/json' \
+  -d '{"text":"Ship it [pause 400ms] — [emphasis]read the diff[/emphasis] first."}'
+```
+
+```json
+// WebSocket: same body fields as the speak request
+{"type": "speak", "text": "Ship it [pause 400ms] — [emphasis]read the diff[/emphasis] first."}
+```
+
+```python
+# MCP
+speak("Ship it [pause 400ms] — but [emphasis]read the diff[/emphasis] first.")
+speak_script(beats=[{"text": "Chapter one.[pause 800ms]", "markup": True}])
+```
+
 ## Scripts: beats, timings and multi-speaker
 
 `speak_script` takes a list of beats; every key is optional except `text`:
@@ -535,12 +658,14 @@ speak_script(beats=[
 
 | Key | Effect |
 |---|---|
-| `text` | What to say (required) |
+| `text` | What to say, markup included (required) |
 | `voice` | Voice id or name for **this beat** — enables multi-speaker scripts; the result's `beats[].voice_id` records who spoke |
-| `speaker` | Preset timbre for this beat (`Vivian` … `Sohee`), answered by a `custom_voice` checkpoint. No reference clip needed |
+| `speaker` | Preset timbre for this beat (`Vivian` … `Sohee`, or a Kokoro voice), answered by a `custom_voice` checkpoint. No reference clip needed |
 | `instruct` | Delivery direction. With `speaker` it steers that preset and needs `supports_instruct`; with no `voice`/`speaker` it routes the beat to `voice_design`; a cloned beat ignores it |
 | `engine` / `model` / `quality` | Per-beat overrides. Omit `quality` to inherit the script's quality |
 | `language` | `"Auto"` or a language name |
+| `markup` / `spell_identifiers` / `paragraph_gap_ms` | Per-beat overrides; leave `null` to inherit the script-level value |
+| `speed` | Base speed for this beat, 0.5–2.0; `[slow]`/`[fast]` multiply it and the result is clamped |
 | `target_duration_sec` + `fit_mode` | Fit the beat into a fixed slot (`none`, `pad`, `atempo`) |
 | `pause_after_sec` | 0–10 s of silence **after** the beat, included in the reported timings |
 | `take` | Alternate delivery of this beat's line |
@@ -551,10 +676,11 @@ or better. (Before v0.3.1 every beat defaulted to `high`, which quietly overrode
 a `quality="fast"` script.)
 
 `BeatTiming` reports `start_sec`, `end_sec`, `pause_after_sec`, `voice_id`,
-`mode`, `speaker`, `instruct`, `cached` and `artifact_id` per beat. `end_sec` is
-the end of the spoken portion; the next beat starts at
-`end_sec + pause_after_sec`. That is what makes a Manim or slideshow timeline
-land on the frame you expect.
+`mode`, `speaker`, `instruct`, `cached`, `artifact_id` and `had_markup` per beat;
+`text` is the beat's **display** text (tags stripped, `[spell]` words kept as
+written). `end_sec` is the end of the spoken portion; the next beat starts at
+`end_sec + pause_after_sec`. That is what makes a Manim or slideshow timeline land
+on the frame you expect.
 
 ### The `.timing.json` file
 
@@ -571,6 +697,7 @@ the serialised `ScriptResult`:
     {
       "index": 0,
       "text": "Welcome back to the show.",
+      "had_markup": false,
       "duration_sec": 2.4123,
       "start_sec": 0.0,
       "end_sec": 2.4123,
@@ -587,6 +714,7 @@ the serialised `ScriptResult`:
     {
       "index": 1,
       "text": "Everything, honestly.",
+      "had_markup": true,
       "duration_sec": 3.4012,
       "start_sec": 3.9123,
       "end_sec": 7.3135,
@@ -620,6 +748,7 @@ the serialised `ScriptResult`:
 | `beats[].mode` / `speaker` / `instruct` | How the beat was rendered |
 | `beats[].cached` | `true` when the beat was reused from disk. Edit one beat of twelve and see eleven instant hits |
 | `beats[].artifact_id` | This beat's own artifact, so one beat can be fetched or re-rendered |
+| `beats[].had_markup` | `true` when the beat's text contained at least one parsed tag, so a markup render is distinguishable from a literal one |
 | `srt_path` / `vtt_path` / `timing_json_path` | Where the sidecars landed |
 
 ### Consuming it from Manim
@@ -689,41 +818,101 @@ uv pip install -e ".[demo]"      # adds manim; the core daemon stays lean
 uv run python examples/manim_demo/run_demo.py --engine mock   # no GPU needed
 ```
 
-## Pronunciation lexicon
+## Pronunciation lexicon, scopes and code mode
 
 Some words are written one way and spoken another: `kubectl`, a surname, an
-acronym. The lexicon rewrites them before synthesis without changing the text you
-asked to speak.
+acronym, an identifier. Three layers rewrite them before synthesis without changing
+the text you asked to speak.
 
-- **Persistent map.** `data/pronunciations.json` is a plain `{word: replacement}`
-  object. Matching is case-insensitive and whole-word, so `async` never rewrites
-  `asynchronously`, and a multi-word key is matched before any shorter key it
-  contains. The file is read on every request, so an edit reaches a running
-  daemon immediately.
+- **Persistent maps.** `data/pronunciations.json` is a plain `{word: replacement}`
+  object. Matching is case-insensitive, whole-word and NFC-normalised, so `async`
+  never rewrites `asynchronously`, and a multi-word key is matched before any
+  shorter key it contains. Files are read on every request, so an edit reaches a
+  running daemon immediately.
 - **Per-call overrides.** `speak(..., pronunciations={"kubectl": "cube control"})`
-  and `speak_script(..., pronunciations={...})` merge on top of the persistent
-  map for that call only; nothing is written to disk. On a script the map applies
-  to every beat.
-- **The cache follows the spoken text.** Rewriting happens before the cache key is
-  computed, so editing a term invalidates only lines that actually use it; adding
-  an unrelated entry leaves existing renders cached. The lexicon is capped at
-  **500 entries**, with keys and replacements at most **200 characters** each
-  (enforced by the CLI/store and per-call maps).
-- **Subtitles keep the written text.** `.srt`, `.vtt` and `.timing.json` carry the
-  beat text you passed in, not the rewritten spoken form — captions show
-  `kubectl`, the audio says "cube control".
+  and `speak_script(..., pronunciations={...})` merge on top for that call only;
+  nothing is written to disk. On a script the map applies to every beat.
 
-Manage the persistent map from a shell, no daemon required:
+### Four scopes, merged in order
+
+| Layer | File | Written by |
+|---|---|---|
+| global | `<DATA_DIR>/pronunciations.json` | `pronunciations set` with no scope |
+| project | `<DATA_DIR>/pronunciations/<project>.json` | `pronunciations set --project <slug>` |
+| voice | `<DATA_DIR>/voices/<voice_id>/pronunciations.json` | `pronunciations set --voice <voice_id>` |
+| per-call | the request body | `pronunciations={...}` |
+
+Later layers win. `project` is a lowercase slug (2–41 characters) and **is not**
+part of the cache key; the voice layer needs a registered voice and is merged after
+the voice is resolved, which is why `speak(speaker="af_heart")` never picks up a
+cloned voice's vocabulary.
+
+Caps: **500 entries per scope**, **1,500 merged**, keys and replacements at most
+200 characters. They are enforced when a map is loaded and again before it is
+compiled, so a hand-edited file or a raw WebSocket map cannot compile an unbounded
+regex.
+
+Manage the maps from a shell — no daemon, no GPU:
 
 ```bash
-agent-voice pronunciations list
+agent-voice pronunciations list                          # global map
 agent-voice pronunciations set kubectl "cube control"
-agent-voice pronunciations delete kubectl
+agent-voice pronunciations set k8s "K eight S" --project infra
+agent-voice pronunciations delete kubectl --voice 9f2c1d
+agent-voice pronunciations show --project infra --voice 9f2c1d
+agent-voice pronunciations check "kubectl get pods on GPU" --spell-identifiers
 ```
 
-`set` replaces an existing entry case-insensitively and prints the resulting map
-as JSON; `delete` removes every casing of the word, prints `{"deleted": "<word>"}`
-and exits non-zero when the word is not in the lexicon.
+`show` prints every layer in play, the merged map and `pronunciation_hash` — a
+SHA-256 of the canonical merged map that is **observability only**, never a cache
+key. `check` is a read-only report: the terms that will be rewritten (with hit
+counts), the ALL-CAPS acronyms the lexicon does not cover, and — with
+`--spell-identifiers` — the code-like tokens code mode would expand, each with its
+`[spell]` reading and its code-mode reading. Its argument is treated as a file when
+it names an existing path, else as the text. Neither command synthesises anything.
+
+### Code mode: `spell_identifiers`
+
+Opt-in per request (`spell_identifiers: true`, default `false`; a beat inherits the
+script's value unless it sets its own):
+
+| Written | Spoken |
+|---|---|
+| `worker_manager` | worker manager |
+| `HTTPServer` | HTTP Server |
+| `iOS` | i O S |
+| `v0.4.0` | version zero point four dot zero |
+| `3.12.1` | three point twelve point one |
+| `src/app.py` | src slash app dot py |
+| `C++` | C plus plus |
+| `->` / `=>` | to / maps to |
+
+The order is fixed and structural: **lexicon → code mode**, with the spans the
+lexicon rewrote protected, so a mapping such as `kubectl -> "cube control"` wins over
+the heuristic and is never expanded a second time. `[spell]` spans are protected
+from both layers.
+
+### `[spell]` and subtitles
+
+`[spell]HTTPServer[/spell]` says "H T T P S E R V E R" whatever the lexicon or code
+mode would have done, and both are skipped inside the span. Subtitles keep the
+**written** text: `.srt`, `.vtt` and `.timing.json` show `kubectl` while the audio
+says "cube control".
+
+### Cache semantics: no new key fields
+
+`CACHE_KEY_FIELDS` is unchanged in v0.4.0. The rewritten **spoken text** and the
+effective `speed` already enter the key, so:
+
+- a markup or lexicon edit that changes the spoken words or speed changes the key,
+  and only the lines that use it are invalidated;
+- pauses and paragraph gaps are local silence and are never cached;
+- `[emphasis]` gain is applied at stitch time, after the per-segment cache;
+- `project` is deliberately not keyed — the spoken text is the discriminator;
+- `pronunciation_hash` is observability only.
+
+The same rules apply to `markup`, `spell_identifiers` and `paragraph_gap_ms`: they
+are not key fields, but their effect on the spoken text (and on `speed`) is.
 
 ## OpenAI-compatible clients
 
@@ -731,6 +920,10 @@ and exits non-zero when the word is not in the lexicon.
 `response_format` and `speed` all work, and `model` accepts `tts-1` (fast tier),
 `tts-1-hd` (high tier) or an explicit `engine:model` selector. The voice fallback
 rules are described [above](#post-v1audiospeech-openai-compatible).
+
+This surface stays **strict**: no markup, no `project`, no `spell_identifiers` —
+the body is the OpenAI shape and nothing else. It uses the global and resolved-voice
+lexicon layers, so an operator's lexicon still applies.
 
 ```python
 from openai import OpenAI

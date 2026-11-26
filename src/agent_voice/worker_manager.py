@@ -56,6 +56,14 @@ _OOM_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_STREAM_ERROR_HISTORY = 64
+"""How many crashed-stream verdicts to keep after their worker is gone.
+
+Only fatal worker deaths are recorded, and a consumer reads its own entry by
+stream id moments after the queue closes, so a small ring is ample. Bounding it
+is what stops a long-lived daemon from accumulating one dict per crash forever.
+"""
+
 
 @dataclass
 class QueuedJob:
@@ -92,6 +100,13 @@ class WorkerHandle:
     manager cannot tell which in-flight request belongs to which stream, and a
     cancel would have to abort an arbitrary job."""
     stream_task: asyncio.Task[None] | None = None
+    stream_errors: dict[uuid.UUID, dict[str, Any]] = field(default_factory=dict)
+    """stream_id -> the classified failure that ended it.
+
+    A worker that dies mid-stream closes its PCM queue with the same empty
+    sentinel a clean finish uses, so the sentinel alone cannot tell a consumer
+    which happened. Recording the error before the crash handler kills the worker
+    is what lets :meth:`WorkerManager.stream_error` answer afterwards."""
 
     @property
     def alive(self) -> bool:
@@ -177,6 +192,13 @@ class WorkerManager:
         self._running = False
         self._spawn_count = 0
         self._health_connections: dict[str, AsyncConnection] = {}
+        self._stream_errors: dict[tuple[str, uuid.UUID], dict[str, Any]] = {}
+        """Failures for streams whose worker has already been killed.
+
+        The handle an error is recorded on is dropped by ``_kill_worker`` before
+        the consumer notices the closed queue, so the record has to outlive it.
+        Bounded: only crashes land here and each entry is tiny, but a daemon that
+        never restarts must not accumulate them without limit."""
         # Optional sync housekeeping callback run on every reaper tick. The app
         # wires JobStore.prune here so job retention does not require importing
         # the job store into the GPU manager.
@@ -512,6 +534,41 @@ class WorkerManager:
         with contextlib.suppress(ValueError):
             jobs.remove(job)
 
+    @staticmethod
+    async def _abandon_acquire(acquire: asyncio.Task[bool], lock: asyncio.Lock) -> None:
+        """Tear down a pending lock acquire, giving the lock back if it won.
+
+        ``asyncio.Lock.acquire`` cannot be called off once it is scheduled: left
+        pending, it takes the lock the moment the current holder releases it, and
+        the caller that already gave up is not around to release it. That is how a
+        force-unload with a queued job used to wedge an engine for the rest of the
+        daemon's life, so every exit path funnels through here.
+
+        The release runs from a done-callback rather than inline because the caller
+        may itself be cancelled at this point — an ``await`` here can be
+        interrupted — while the acquire task still has to be accounted for whenever
+        it finally settles. The callback fires exactly once per abandoned acquire
+        and holds the only reference to it, so no release can be duplicated.
+        """
+
+        def _release_if_won(task: asyncio.Task[bool]) -> None:
+            if task.cancelled():
+                return
+            try:
+                won = task.result()
+            except BaseException:  # pragma: no cover - acquire() raises nothing
+                return
+            if won and lock.locked():
+                lock.release()
+
+        acquire.add_done_callback(_release_if_won)
+        if not acquire.done():
+            acquire.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            # Drive the cancellation to completion so the waiter is off the lock's
+            # queue before this returns.
+            await acquire
+
     async def _await_engine_lock(self, job: QueuedJob, lock: asyncio.Lock) -> None:
         """Wait for the engine lock, abandoning the wait if we are force-cancelled.
 
@@ -519,6 +576,10 @@ class WorkerManager:
         that future is raced against ``lock.acquire()``. Without the race a queued
         caller would sit out the whole current GPU job even though the manager had
         already decided it was cancelled.
+
+        The acquire task is owned here and torn down on *every* exit, including the
+        cancellation path: an acquire that is merely forgotten keeps waiting and
+        takes the lock later, with nobody left to release it.
         """
         while True:
             self._raise_if_cancelled(job)
@@ -527,27 +588,22 @@ class WorkerManager:
                 # Waiting on the lock *and* on cancellation at once means a
                 # force-unload never has to wait for the GPU to go idle.
                 await asyncio.wait({acquire, job.future}, return_when=asyncio.FIRST_COMPLETED)
-            except BaseException:
-                # The caller was cancelled (or the loop is shutting down). If our
-                # acquire happened to win the lock, give it back before leaving —
-                # otherwise the engine could never be used again.
-                if not acquire.done():
-                    acquire.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await acquire
-                elif not acquire.cancelled() and lock.locked():
-                    lock.release()
-                raise
-            acquired = acquire.done() and not acquire.cancelled()
-            if job.future.done():
-                if acquired:
-                    lock.release()
-                    acquired = False
-                # Raises JOB_CANCELLED: either the exception an unload installed,
-                # or ourselves if the future was merely cancelled.
+                # Deliberately inside the try: when the future finished first this
+                # raises JOB_CANCELLED and the handler must still tear the pending
+                # acquire down.
                 self._raise_if_cancelled(job)
-            if acquired:
-                return
+            except BaseException:
+                await self._abandon_acquire(acquire, lock)
+                raise
+            if acquire.done() and not acquire.cancelled():
+                failure = acquire.exception()
+                if failure is None:
+                    # The lock is ours; ownership passes to the caller.
+                    return
+                raise failure
+            # Woken with neither a held lock nor a cancellation: re-race rather
+            # than spin on a dead acquire.
+            await self._abandon_acquire(acquire, lock)
 
     @staticmethod
     def _raise_if_cancelled(job: QueuedJob) -> None:
@@ -1101,83 +1157,122 @@ class WorkerManager:
             engine_id=engine_id, model_alias=model_alias, kind="stream"
         )
 
-        stream_id = uuid.uuid4()
-        queue = handle.connection.open_stream(stream_id)
-        request_id = uuid.uuid4().hex
-        handle.last_used_at = self.clock.now()
-
-        streaming_mode = (
-            "native" if handle.hello.get("capabilities", {}).get("streaming") else "emulated"
-        )
-
-        # Same rule as synthesize: only a clone render has a reference voice.
-        is_clone = mode == "clone"
-        ref_wav_path = str(self.voices.ref_wav_path(voice_id)) if is_clone and voice_id else ""
-        payload_ref_text = ref_text if is_clone else ""
-        payload_x_vector_only = x_vector_only if is_clone else False
-
-        started = asyncio.Event()
-
-        async def run() -> None:
-            try:
-                handle.in_flight.add(request_id)
-                # Record the mapping before the RPC so cancel_stream() can target
-                # this exact request, and so an early consumer cancel never has
-                # to guess which in-flight request belongs to which stream.
-                handle.stream_requests[stream_id] = request_id
-                started.set()
-                try:
-                    reply = await handle.connection.request(
-                        {
-                            "id": request_id,
-                            "method": "stream_pcm",
-                            "stream_id": str(stream_id),
-                            "model_alias": model_alias,
-                            "text": text,
-                            "ref_wav_path": ref_wav_path,
-                            "ref_text": payload_ref_text,
-                            "x_vector_only_mode": payload_x_vector_only,
-                            "prompt_cache_path": None,
-                            "mode": mode,
-                            "speaker": speaker,
-                            "instruct": instruct,
-                            "language": language,
-                            "seed": resolved_seed,
-                            "speed": speed,
-                        },
-                        timeout=1800.0,
-                    )
-                    if reply.get("error_code") == ErrorCode.JOB_CANCELLED:
-                        return
-                except asyncio.CancelledError:
-                    raise
-                except (ConnectionError, OSError) as exc:
-                    await self._handle_worker_death(handle, exc)
-                finally:
-                    handle.in_flight.discard(request_id)
-                    handle.stream_requests.pop(stream_id, None)
-                    handle.last_used_at = self.clock.now()
-                    handle.model_last_used[model_alias] = self.clock.now()
-                    # Push the end-of-stream sentinel so consumers stop immediately
-                    # instead of waiting out their read timeout and mistaking a
-                    # clean finish for backpressure.
-                    self._close_stream(queue)
-                    handle.connection.close_stream(stream_id)
-            finally:
-                self._end_job(job)
-
+        # Everything from here until the background task exists runs with the
+        # engine lock held, so every failure has to release it: an exception that
+        # escapes without _end_job leaves the lock held forever and the engine
+        # unusable for the rest of the daemon's life.
+        run_task: asyncio.Task[None] | None = None
         try:
-            handle.stream_task = asyncio.create_task(run())
+            stream_id = uuid.uuid4()
+
+            streaming_mode = (
+                "native"
+                if handle.hello.get("capabilities", {}).get("streaming")
+                else "emulated"
+            )
+
+            # Same rule as synthesize: only a clone render has a reference voice.
+            is_clone = mode == "clone"
+            ref_wav_path = (
+                str(self.voices.ref_wav_path(voice_id)) if is_clone and voice_id else ""
+            )
+            payload_ref_text = ref_text if is_clone else ""
+            payload_x_vector_only = x_vector_only if is_clone else False
+
+            handle.last_used_at = self.clock.now()
+            # Registered last: nothing below can fail, so an aborted setup cannot
+            # leave a queue behind for a stream id that nobody will ever read.
+            queue = handle.connection.open_stream(stream_id)
+            request_id = uuid.uuid4().hex
+            started = asyncio.Event()
+
+            async def run() -> None:
+                try:
+                    handle.in_flight.add(request_id)
+                    # Record the mapping before the RPC so cancel_stream() can
+                    # target this exact request, and so an early consumer cancel
+                    # never has to guess which in-flight request belongs to which
+                    # stream.
+                    handle.stream_requests[stream_id] = request_id
+                    started.set()
+                    try:
+                        reply = await handle.connection.request(
+                            {
+                                "id": request_id,
+                                "method": "stream_pcm",
+                                "stream_id": str(stream_id),
+                                "model_alias": model_alias,
+                                "text": text,
+                                "ref_wav_path": ref_wav_path,
+                                "ref_text": payload_ref_text,
+                                "x_vector_only_mode": payload_x_vector_only,
+                                "prompt_cache_path": None,
+                                "mode": mode,
+                                "speaker": speaker,
+                                "instruct": instruct,
+                                "language": language,
+                                "seed": resolved_seed,
+                                "speed": speed,
+                            },
+                            timeout=1800.0,
+                        )
+                        if reply.get("error_code") == ErrorCode.JOB_CANCELLED:
+                            return
+                    except asyncio.CancelledError:
+                        raise
+                    except (ConnectionError, OSError) as exc:
+                        # Classify and record the failure *before* the crash
+                        # handler kills the worker: the closed queue below is the
+                        # same sentinel a clean finish uses, so without this a mid
+                        # stream death would be reported to the caller as `done`.
+                        error = self._death_error(handle, exc)
+                        self._record_stream_error(handle, stream_id, error)
+                        await self._handle_worker_death(handle, exc, error=error)
+                    finally:
+                        handle.in_flight.discard(request_id)
+                        handle.stream_requests.pop(stream_id, None)
+                        handle.last_used_at = self.clock.now()
+                        handle.model_last_used[model_alias] = self.clock.now()
+                        # Push the end-of-stream sentinel so consumers stop
+                        # immediately instead of waiting out their read timeout
+                        # and mistaking a clean finish for backpressure.
+                        self._close_stream(queue)
+                        handle.connection.close_stream(stream_id)
+                finally:
+                    self._end_job(job)
+
+            run_task = asyncio.create_task(run())
+            # The crash verdict reaches the caller through stream_error() and the
+            # closed queue, so the task's own exception is only a maintenance
+            # detail — but leaving it unretrieved logs a spurious "Task exception
+            # was never retrieved" on every worker death.
+            run_task.add_done_callback(self._log_stream_task_result)
+            handle.stream_task = run_task
             # Wait until the request is registered so callers can immediately
             # observe it via health/gpu_status, and so unload(force=false) sees it
             # as busy.
             await started.wait()
         except BaseException:
             # Setup failed before the background task owned the job: release the
-            # engine lock here so the whole engine does not wedge.
+            # engine lock here so the whole engine does not wedge. A task that did
+            # start is cancelled first, because it owns the job from the moment it
+            # exists and its own finally releases the lock for us.
+            if run_task is not None and not run_task.done():
+                run_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await run_task
             self._end_job(job)
             raise
         return stream_id, queue, streaming_mode
+
+    @staticmethod
+    def _log_stream_task_result(task: asyncio.Task[None]) -> None:
+        """Retrieve a finished stream task's outcome so it is never "unretrieved"."""
+        if task.cancelled():
+            return
+        failure = task.exception()
+        if failure is not None:
+            logger.debug("stream task ended with %r", failure)
 
     async def cancel_stream(self, engine_id: str, stream_id: uuid.UUID) -> bool:
         handle = self._workers.get(engine_id)
@@ -1206,6 +1301,25 @@ class WorkerManager:
         if queue is not None:
             self._close_stream(queue)
         return bool(reply.get("cancelled"))
+
+    def stream_error(self, engine_id: str, stream_id: uuid.UUID) -> dict[str, Any] | None:
+        """The failure that ended a stream, or ``None`` when it finished cleanly.
+
+        Public because every PCM consumer needs it: a worker that dies mid-stream
+        closes its queue exactly like a successful stream, so "the queue gave me
+        the empty sentinel" is not evidence of success. An empty result here means
+        the stream really did finish.
+
+        The entry survives the crash: it is recorded on the handle *before* the
+        worker is killed, then carried into a manager-level ring in
+        :meth:`_kill_worker`.
+        """
+        handle = self._workers.get(engine_id)
+        if handle is not None:
+            found = handle.stream_errors.get(stream_id)
+            if found is not None:
+                return found
+        return self._stream_errors.get((engine_id, stream_id))
 
     # -- unload / reaping ----------------------------------------------
     async def unload_models(self, *, force: bool = False) -> dict[str, Any]:
@@ -1261,6 +1375,11 @@ class WorkerManager:
         handle = self._workers.pop(engine_id, None)
         if handle is None:
             return
+        # Carry stream failures past the handle: the consumer only learns a queue
+        # closed, which it must still be able to attribute after the worker is gone.
+        for stream_id, payload in handle.stream_errors.items():
+            self._stream_errors[(engine_id, stream_id)] = payload
+        self._trim_stream_errors()
 
         with contextlib.suppress(Exception):
             await asyncio.wait_for(
@@ -1289,32 +1408,77 @@ class WorkerManager:
         if reason == "engine switch" and self._active_engine == engine_id:
             self._active_engine = None
 
-    async def _handle_worker_death(
-        self, handle: WorkerHandle, exc: BaseException
+    def _record_stream_error(
+        self, handle: WorkerHandle, stream_id: uuid.UUID, error: AgentVoiceError
     ) -> None:
+        """Attach the classified failure to a stream that is ending badly.
+
+        Called *before* the crash handler kills the worker, because the kill is
+        what closes the PCM queue and the consumer may run the instant that
+        sentinel lands.
+        """
+        handle.stream_errors[stream_id] = {
+            **error.to_response().model_dump(mode="json"),
+            "details": error.details,
+        }
+
+    def _trim_stream_errors(self) -> None:
+        """Keep the post-crash record bounded (only crashes ever land here)."""
+        overflow = len(self._stream_errors) - _STREAM_ERROR_HISTORY
+        if overflow <= 0:
+            return
+        for key in list(self._stream_errors)[:overflow]:
+            self._stream_errors.pop(key, None)
+
+    def _death_error(
+        self, handle: WorkerHandle, exc: BaseException
+    ) -> AgentVoiceError:
+        """Classify a worker death without raising.
+
+        Split out of :meth:`_handle_worker_death` so a stream can record the
+        classified error before the worker is killed: the stderr tail can only be
+        read once, and reading it again after the kill would lose the OOM hint.
+        """
         stderr = handle.stderr_tail()
-        await self._kill_worker(handle.engine_id, reason="crash")
         if not self._running:
             # Shutdown races are not crashes; surfacing WORKER_CRASHED here would
             # be a lie that confuses callers during a clean stop.
-            raise AgentVoiceError(
+            return AgentVoiceError(
                 ErrorCode.JOB_CANCELLED,
                 "the daemon shut down while this job was running",
                 "Resubmit once the daemon is running again.",
-            ) from exc
+            )
         if _OOM_PATTERN.search(stderr) or _OOM_PATTERN.search(str(exc)):
-            raise AgentVoiceError(
+            return AgentVoiceError(
                 ErrorCode.CUDA_OOM,
                 "the worker ran out of GPU memory",
                 "Unload other GPU applications, use the 0.6b model, or raise MIN_FREE_VRAM_GB.",
                 details={"stderr_tail": stderr},
-            ) from exc
-        raise AgentVoiceError(
+            )
+        return AgentVoiceError(
             ErrorCode.WORKER_CRASHED,
             f"worker for '{handle.engine_id}' died: {exc}",
             "Retry; the worker is respawned lazily on the next request.",
             details={"stderr_tail": stderr},
-        ) from exc
+        )
+
+    async def _handle_worker_death(
+        self,
+        handle: WorkerHandle,
+        exc: BaseException,
+        *,
+        error: AgentVoiceError | None = None,
+    ) -> None:
+        """Kill the dead worker, then raise the classified error.
+
+        ``error`` lets a caller that already classified the failure (a stream
+        recording it before the queue closes) hand the verdict in instead of
+        re-reading the stderr tail a second time.
+        """
+        failure = error if error is not None else self._death_error(handle, exc)
+        await self._kill_worker(handle.engine_id, reason="crash")
+        raise failure from exc
+
 
     async def _reaper_loop(self) -> None:
         interval = max(1.0, min(30.0, self.settings.model_idle_ttl_seconds / 10.0))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -115,3 +116,112 @@ def test_store_set_enforces_caps_and_allows_replacing_at_the_cap(tmp_path: Path)
         store.set("new", "y")
     # Updating an existing key does not grow the map, so it remains allowed.
     assert store.set("w0", "z")["w0"] == "z"
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 M7: the caps are enforced at the store and raw-entry boundaries too
+# ---------------------------------------------------------------------------
+
+
+def test_over_cap_store_file_is_ignored_with_a_warning(tmp_path: Path, caplog):
+    """A hand-edited file must never compile an unbounded regex.
+
+    Dropping the whole map is the recoverable answer: the daemon still speaks,
+    just without the operator's expansions, and the log says why. Crashing on a
+    file an operator can edit by hand would take the daemon down with it.
+    """
+    path = tmp_path / "pronunciations.json"
+    oversized = {f"w{i}": "x" for i in range(MAX_LEXICON_ENTRIES + 1)}
+    path.write_text(json.dumps(oversized), "utf-8")
+    store = PronunciationStore(path)
+
+    with caplog.at_level(logging.WARNING, logger="agent_voice.pronunciations"):
+        assert store.list() == {}
+        assert store.effective() == {}
+        assert prepare_text(store, "w0 and w1") == "w0 and w1"
+
+    assert any("trimmed" in record.getMessage() for record in caplog.records), caplog.text
+    # Writing would replace the operator's over-cap file with one entry, so the
+    # mutators refuse instead of quietly destroying the rest of the lexicon.
+    with pytest.raises(ValueError, match="trim"):
+        store.set("nginx", "engine x")
+    with pytest.raises(ValueError, match="trim"):
+        store.delete("w0")
+    assert len(json.loads(path.read_text("utf-8"))) == MAX_LEXICON_ENTRIES + 1
+
+
+def test_over_cap_effective_map_is_a_bad_request_with_a_trim_suggestion(tmp_path: Path):
+    """The merged map is what reaches the regex, so it is what must pass the caps.
+
+    A valid 400-entry file plus a valid 150-entry per-call map is a 550-alternative
+    pattern: each map is within the limits, the merge is not.
+    """
+    from agent_voice.schemas import AgentVoiceError
+
+    store = PronunciationStore(tmp_path / "pronunciations.json")
+    (tmp_path / "pronunciations.json").write_text(
+        json.dumps({f"w{i}": "x" for i in range(400)}), "utf-8"
+    )
+    overrides = {f"o{i}": "y" for i in range(150)}
+
+    with pytest.raises(AgentVoiceError) as excinfo:
+        store.effective(overrides)
+
+    error = excinfo.value
+    assert error.error_code == "BAD_REQUEST"
+    assert "500" in error.message
+    assert "delete unused terms" in error.suggestion
+    # Both surfaces that speak go through prepare_text, so they inherit the same
+    # structured error instead of turning it into an INTERNAL_ERROR.
+    with pytest.raises(AgentVoiceError):
+        prepare_text(store, "w0", overrides)
+
+
+def test_over_cap_map_never_reaches_the_regex_compiler():
+    """`_compiled` is the expensive, unbounded step: the caps must fire first."""
+    from agent_voice.schemas import AgentVoiceError
+
+    _compiled.cache_clear()
+    oversized = {f"w{i}": "x" for i in range(MAX_LEXICON_ENTRIES + 1)}
+
+    with pytest.raises(AgentVoiceError) as excinfo:
+        apply_pronunciations("w0", oversized)
+
+    assert excinfo.value.error_code == "BAD_REQUEST"
+    assert "500" in excinfo.value.message
+    assert _compiled.cache_info().misses == 0, "an over-cap map must never compile"
+
+
+async def test_openai_surface_rejects_a_raw_over_cap_map():
+    """routes_openai takes free-form maps too, so it validates before use."""
+    from types import SimpleNamespace
+
+    from agent_voice.api.routes_openai import run_synthesis
+    from agent_voice.schemas import AgentVoiceError
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                ctx=SimpleNamespace(settings=SimpleNamespace(max_text_chars=500))
+            )
+        )
+    )
+
+    with pytest.raises(AgentVoiceError) as excinfo:
+        await run_synthesis(
+            request,
+            text="hello",
+            voice=None,
+            engine=None,
+            model=None,
+            quality="high",
+            language="Auto",
+            response_format="wav",
+            seed=None,
+            speed=1.0,
+            pronunciations={f"w{i}": "x" for i in range(MAX_LEXICON_ENTRIES + 1)},
+        )
+
+    assert excinfo.value.error_code == "BAD_REQUEST"
+    assert "500" in excinfo.value.message
+    assert excinfo.value.suggestion

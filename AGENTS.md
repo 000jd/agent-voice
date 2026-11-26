@@ -4,18 +4,23 @@
 drives over MCP or HTTP. The agent asks for speech, gets back a file path or a PCM stream, and
 the GPU stays at 0 MB the rest of the time.
 
-## Architecture, in six bullets
+## Architecture, in seven bullets
 
 - **The core daemon never imports torch.** `src/agent_voice/` (FastAPI + MCP + CLI) holds no
   model code; that is a structural guarantee of the idle-GPU claim, not a convention.
 - **Isolated per-engine venvs.** Each engine is a directory under `engines/<engine_id>/` with an
   `engine.yaml` manifest and a `worker.py`, installed into its own `uv` venv. Two engines that
   need mutually exclusive dependency sets coexist without conflict.
-- **Five checkpoints, three modes.** `engine.yaml` declares five Qwen3-TTS 12Hz aliases — two
-  `clone` (`1.7b-base`, `0.6b-base`), two `custom_voice` (`1.7b-custom`, `0.6b-custom`, nine
+- **Four engines.** `qwen3_tts_fast` (CUDA graphs) and `qwen3_tts` (official) run on the GPU;
+  `kokoro` (`kokoro==0.9.4`, CPU-only torch) and `mock` run on the CPU. Kokoro is preset-timbre
+  only (`voice_clone: false`, `voice_design: false`, `instruct_control: false`) and never
+  initialises CUDA: `CUDA_VISIBLE_DEVICES=""` before the torch import, `device="cpu"` on
+  `KPipeline`, `gpu_vram_mb: 0`.
+- **Five Qwen checkpoints, three modes.** `engine.yaml` declares five Qwen3-TTS 12Hz aliases —
+  two `clone` (`1.7b-base`, `0.6b-base`), two `custom_voice` (`1.7b-custom`, `0.6b-custom`, nine
   `preset_speakers`, `supports_instruct` on the 1.7B only) and one `voice_design`
   (`1.7b-design`). Routing picks a model by `mode`, so a `speaker=` request never lands on a
-  checkpoint that can only clone.
+  checkpoint that can only clone. Kokoro adds one `custom_voice` model with eight voices.
 - **IPC v1 is a frozen contract.** Length-prefixed, multiplexed frames over a Unix domain socket
   (loopback TCP on Windows). Correlation ids let `cancel` and `health` land while a decode is
   running. See `src/agent_voice/ipc/protocol.py` and `src/agent_voice/ipc/transport.py` — do not
@@ -46,6 +51,7 @@ AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""
 
 # end-to-end IPC v1 conformance against a live worker (~1 s, no GPU)
 .venv/bin/agent-voice engines test mock
+.venv/bin/agent-voice engines test kokoro     # CPU engine, needs the downloaded weights
 
 # environment + client onboarding
 .venv/bin/agent-voice doctor
@@ -59,16 +65,26 @@ AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""
 .venv/bin/agent-voice voices design probe --engine mock --model mock-design \
   --instruct "quiet and precise"
 
-# pronunciation lexicon — persistent data/pronunciations.json, applies to every render
+# pronunciation lexicon — global, project- and voice-scoped
 .venv/bin/agent-voice pronunciations list
 .venv/bin/agent-voice pronunciations set kubectl "cube control"
+.venv/bin/agent-voice pronunciations set k8s "K eight S" --project infra
 .venv/bin/agent-voice pronunciations delete kubectl
+.venv/bin/agent-voice pronunciations show --project infra     # every layer + merged + hash
+.venv/bin/agent-voice pronunciations check "HTTPServer v0.4.0" --spell-identifiers
 ```
 
 `engines test <id>` is the fastest way to prove an engine still speaks protocol v1: it spawns a
 real worker and walks `spawn+connect → hello → load_model → synthesize → cancel → health → shutdown`,
 printing a pass/fail row per step and exiting non-zero on any failure. Use it after touching
-anything in the worker, the transport or the manager.
+anything in the worker, the transport or the manager. It picks a clone model first; an engine
+with none (Kokoro) is exercised through its first `custom_voice` model's first preset speaker,
+with `mode` and `speaker` sent on the synthesize and stream steps.
+
+`pronunciations check <text-or-file>` is the read-only prediction of the rewrite pipeline
+(lexicon terms with hit counts, unknown ALL-CAPS acronyms, and — with `--spell-identifiers` —
+code-like tokens with their `[spell]` and code-mode readings). It reads a file when the
+argument is one, never synthesises, and is the cheapest way to debug "why did it say that".
 
 `voices design` is the same in-process pattern the conformance test and the Manim demo use: build
 an `AppContext`, `await ctx.workers.start()`, call the service, `await ctx.workers.stop()` inside
@@ -87,21 +103,32 @@ command body. `--candidates 2..5` renders several takes to audition and saves no
 - **Loopback by default end to end.** The server binds `127.0.0.1`, a pure ASGI Host/Origin guard
   rejects DNS-rebinding attempts on HTTP **and** WebSocket handshakes, and `/audio` sits behind
   the bearer token because an artifact is the user's own speech. Set `AGENT_VOICE_API_KEY` before
-  exposing anything. A WebSocket without a valid token is closed with code `1008` before
-  `accept()`; browser clients may carry the key in
-  `Sec-WebSocket-Protocol: bearer, <key>` (the server echoes `bearer`).
+  exposing anything. A whitespace-only key counts as unset. A WebSocket that fails the guard is
+  refused **before** `accept()` — that is an **HTTP 403** over real uvicorn, not a `1008` close
+  (only Starlette's TestClient fabricates 1008); browser clients may carry the key in
+  `Sec-WebSocket-Protocol: bearer, <key>` and the server echoes the matched spelling.
+  `agent-voice serve --host 0.0.0.0` validates the effective bind, so a non-loopback address
+  without a key refuses to start whatever `.env` says.
 - **Agent clone paths are confined.** `AGENT_VOICE_ALLOW_ANY_PATH=false` (default): `clone_voice`
   over REST/MCP reads only `<DATA_DIR>/inbox/` unless `MCP_BASE_PATH` is set. A rejected path is
-  `PATH_OUTSIDE_BASE` before any ffmpeg probe. The CLI `voices add` is a human operator path and
-  remains unrestricted.
+  `PATH_OUTSIDE_BASE` before any ffmpeg probe, and MCP and REST share one resolver. The CLI
+  `voices add` is a human operator path and remains unrestricted.
 - **Input caps are admission control.** `MAX_SCRIPT_BEATS=200`, `MAX_INSTRUCT_CHARS=1000`,
   `MAX_DESIGN_SAMPLE_CHARS=500` and `MAX_REF_TEXT_CHARS=2000` are checked before routing and
   before a worker is spawned, so an oversized request costs a round-trip and no GPU time.
-  Oversized text is `413 TEXT_TOO_LONG`; an over-long beat list is `BAD_REQUEST`. A new cap
-  belongs at admission too, never after the expensive part.
+  Oversized text is `413 TEXT_TOO_LONG`; an over-long beat list is `BAD_REQUEST`. Markup
+  (128 tags, depth 4, 32 segments) and lexicon (500 per scope, 1,500 merged) caps are checked at
+  the same point. A new cap belongs at admission too, never after the expensive part.
+- **Lexicon caps are a regex bound.** A merged map is validated on load and again before
+  `_compiled`, so a hand-edited file or a raw WS/OpenAI map cannot compile an unbounded
+  alternation.
 - `REQUIRE_ENGINE_APPROVAL` defaults to `true` in code as well as in `.env.example`: an
   agent-authored plugin is staged under `engines/.pending/<id>/` until an operator promotes
   it with `agent-voice engines approve <id>`.
+- **Optional tools are WARNs, not FAILs.** A missing `espeak-ng` degrades Kokoro's
+  out-of-dictionary words only, so `doctor` reports it as a WARN with the platform install
+  command. A missing GPU is a WARN too; only a broken required tool (`ffmpeg`, `uv`, a bad port)
+  is a FAIL, and only a FAIL exits non-zero.
 
 ## Error taxonomy
 
@@ -124,11 +151,21 @@ fastmcp) are legitimately present.
   builds a shell string, and none should be added.
 - Cache hits and read-only calls (`server_info`, `gpu_status`, `list_voices`) never wait behind
   the GPU lock. Uncached jobs queue FIFO per engine, and `MAX_QUEUE_DEPTH=64` turns a full wait
-  queue into `429 BACKPRESSURE` instead of unbounded latency.
+  queue into `429 BACKPRESSURE` instead of unbounded latency. `MAX_QUEUE_DEPTH` is **global**,
+  not a per-engine budget.
 - `qwen3_tts_fast` stays strictly serialized: its CUDA graphs are captured at batch 1, so there
   is no micro-batching to add there. Throughput comes from the cache and the queue.
+- **The rewrite order is structural, not stylistic:** parse markup on the *raw* text →
+  `resolve_target` (the voice scope needs the resolved `voice_id`) → scoped lexicon → code
+  normalization on the lexicon's complement → per-segment synthesis. Lexicon first means an
+  operator mapping always wins over a heuristic, and `[spell]` spans are protected from both.
+  Do not reorder these steps at a call site; go through `services/utterance_service.py`.
 - The rewritten spoken text is what the synthesis cache keys on: a lexicon edit invalidates
   only lines that use the changed term, and unrelated entries leave old renders cached.
-  Subtitles keep the original written text, never the spoken form.
+  Subtitles keep the original written text (`display_text`), never the spoken form.
+- **`CACHE_KEY_FIELDS` does not change for markup.** `markup`, `spell_identifiers`,
+  `paragraph_gap_ms` and `project` are not key fields; the rewritten text and effective `speed`
+  are, pauses are local silence, `[emphasis]` gain is applied after the segment cache, and
+  `pronunciation_hash` is observability only.
 - Typer sub-commands must not import torch. Defer heavy imports into command bodies.
 - `pyproject.toml`'s core `dependencies` must never gain torch.

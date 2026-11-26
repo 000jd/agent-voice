@@ -31,6 +31,14 @@ from .security import (
 
 METADATA_NAME = "metadata.json"
 REF_WAV_NAME = "ref.wav"
+LEXICON_NAME = "pronunciations.json"
+"""A voice's own scoped lexicon, beside ``metadata.json`` in its directory.
+
+``ScopedLexicon`` reads this file; ``pronunciations.py`` imports the name from
+here (lazily, to avoid a cycle) so there is exactly one definition of it. Deleting
+a voice removes its lexicon with the rest of the directory — the lexicon belongs
+to the voice and outliving it would resurrect it on a reused id.
+"""
 
 
 def sha256_file(path: Path) -> str:
@@ -75,6 +83,15 @@ class VoiceStore:
 
     def ref_wav_path(self, voice_id: str) -> Path:
         return self.voice_dir(voice_id) / REF_WAV_NAME
+
+    def lexicon_path(self, voice_id: str) -> Path:
+        """Where this voice's scoped pronunciation lexicon lives (may not exist).
+
+        A path only: writing one is the operator's/CLI's call, and the file is
+        optional — a voice without a lexicon simply contributes nothing to the
+        spoken-text merge.
+        """
+        return self.voice_dir(voice_id) / LEXICON_NAME
 
     def exists(self, voice_id: str) -> bool:
         return (self.voice_dir(voice_id) / METADATA_NAME).is_file()

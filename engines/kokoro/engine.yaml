@@ -1,0 +1,35 @@
+engine_id: kokoro
+display_name: Kokoro (82M, CPU)
+backend_name: kokoro
+backend_version: "0.9.4"
+protocol_version: 1
+venv_python: .venv/bin/python
+
+# CPU-only by construction: the engine venv installs torch from the explicit
+# pytorch-cpu index, so no CUDA wheel (and no nvidia-*) can ever be present.
+# The worker also sets CUDA_VISIBLE_DEVICES="" before importing torch and passes
+# device="cpu" to KPipeline, whose default auto-selects CUDA when one exists.
+# Measured in docs/phase0-kokoro-report.md: 2.05 s load, 1.37 GB peak RSS,
+# 3.4-5.2x realtime on a Ryzen 7 5700X, 0 GPU memory. espeak-ng is the English
+# out-of-dictionary fallback (present at /usr/bin/espeak-ng on the reference host).
+
+capabilities:
+  streaming: true
+  pcm_native: true
+  voice_clone: false
+  custom_voice: true
+  voice_design: false
+  instruct_control: false
+  # English only: the English G2P path is the one verified end to end. Other
+  # Kokoro languages need extra misaki extras and an espeak-ng verification pass.
+  languages: [Auto, English]
+
+models:
+  - alias: kokoro-82m
+    hf_repo: hexgrad/Kokoro-82M
+    quality_tier: fast
+    est_vram_gb: 0.0
+    default: true
+    mode: custom_voice
+    supports_instruct: false
+    preset_speakers: [af_heart, af_bella, af_sarah, am_adam, am_michael, bf_emma, bm_george, bm_lewis]

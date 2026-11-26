@@ -5,18 +5,20 @@ An **engine** is a plugin directory under `engines/<engine_id>/` containing an
 never imports model code; it spawns a worker lazily, routes work to it, and reaps
 it when idle. Adding an engine never requires touching the daemon.
 
-Three engines ship:
+Four engines ship:
 
 | Engine id | Backend | Venv | Streaming | When to use |
 |---|---|---|---|---|
-| `qwen3_tts_fast` | `faster-qwen3-tts` (CUDA graphs) | own `uv` venv | native PCM | default; fastest, real streaming |
-| `qwen3_tts` | `qwen-tts` (official) | own `uv` venv | emulated | fallback when graph capture misbehaves |
+| `qwen3_tts_fast` | `faster-qwen3-tts` (CUDA graphs) | own `uv` venv | native PCM | default GPU; fastest, real streaming |
+| `qwen3_tts` | `qwen-tts` (official) | own `uv` venv | emulated | GPU fallback when graph capture misbehaves |
+| `kokoro` | `kokoro==0.9.4` (CPU PyTorch) | own `uv` venv | native PCM | **no GPU**: 82M, 24 kHz, 3.4–5.2× real time |
 | `mock` | built-in tone generator | core interpreter | native PCM | CPU-only testing of the full routing surface |
 
 The two Qwen backends need **mutually exclusive** dependency universes
 (`transformers==4.57.3` for `qwen-tts`, `transformers==5.15.1` for
 `faster-qwen3-tts`), which is why they are separate plugins with separate venvs.
-They cannot share an environment.
+They cannot share an environment. `kokoro` is separate for a different reason: its
+venv pins CPU-only torch, so it can never see a CUDA device even on a GPU box.
 
 ## Five checkpoints, three modes
 
@@ -30,6 +32,10 @@ it can do:
 | `1.7b-custom` | 1.7B | ~4.4 GB | `custom_voice` | not needed | yes | nine preset speakers, plus `instruct` |
 | `0.6b-custom` | 0.6B | ~2.2 GB | `custom_voice` | not needed | no | nine preset speakers, no `instruct` |
 | `1.7b-design` | 1.7B | ~4.4 GB | `voice_design` | not needed | yes | design a voice from a description |
+
+Kokoro adds a fourth engine with a single checkpoint: `kokoro-82m` in
+`custom_voice` mode, `est_vram_gb: 0.0`, eight preset speakers and no clone or
+design mode — see [Kokoro-82M](#kokoro-82m-the-cpu-engine).
 
 The `mode` field is the routing contract:
 
@@ -165,6 +171,89 @@ uv run agent-voice voices design narrator \
 Measured with the official `qwen3_tts` backend, not `qwen3_tts_fast`. Full
 numbers and dependency findings: [phase0-report.md](phase0-report.md).
 
+## Kokoro-82M: the CPU engine
+
+`kokoro` is the zero-GPU engine: a real neural TTS model (82M parameters,
+Apache-2.0) that runs on the CPU at 3.4–5.2× real time, uses **0 MB of VRAM** and
+emits native 24 kHz mono audio. Nothing about it touches CUDA — the engine venv
+installs torch from the `pytorch-cpu` index, and the worker sets
+`CUDA_VISIBLE_DEVICES=""` before importing torch and passes `device="cpu"` to
+`KPipeline` (whose default would auto-select CUDA on a GPU box).
+
+| | |
+|---|---|
+| Model | `kokoro-82m` — `hexgrad/Kokoro-82M` (Apache-2.0), 82M parameters |
+| Backend | `kokoro==0.9.4` (Apache-2.0), CPU-only PyTorch, `engines/kokoro/.venv` |
+| Weights | 363 MB repo, 327 MB `kokoro-v1_0.pth`, fetched through the HF cache |
+| Native rate | 24,000 Hz mono int16 — no resampling |
+| VRAM | **0 MB**: `gpu_vram_mb: 0`, `torch.version.cuda is None`, no `nvidia-*` wheel |
+| Modes | `custom_voice` only — no clone, no design, no `instruct` |
+| Languages | `Auto`, `English` |
+| Streaming | native: one chunk per pipeline result, cancelled between chunks |
+| Measured | 3.41× / 5.23× / 4.71× real time, 1.37 GB peak RSS, 2.05 s warm load |
+
+### Install and verify
+
+```bash
+uv run agent-voice engines install kokoro
+uv run agent-voice models download kokoro kokoro-82m   # 363 MB, once
+uv run agent-voice doctor                               # espeak-ng row + weights present
+uv run agent-voice engines test kokoro                  # 7/7 IPC v1 conformance
+```
+
+`engines test` is **mode-aware**: an engine with no clone checkpoint is exercised
+through its first `preset_speakers` entry, with `mode` and `speaker` sent on both
+the synthesize and the stream step — exactly what `speak(speaker=...)` does. A
+clone-only or clone-first engine keeps the original v1 path unchanged.
+
+### The eight voices
+
+Kokoro ships 54 voices across 8 languages upstream; the manifest advertises the
+eight English voices that were verified end to end:
+
+`af_heart` · `af_bella` · `af_sarah` · `am_adam` · `am_michael` · `bf_emma` · `bm_george` · `bm_lewis`
+
+`a` = American English, `b` = British English; the first letter is also Kokoro's
+`lang_code`. Pass one as `speaker=` — there is no reference clip to supply or
+reuse:
+
+```python
+speak("Zero GPU, twenty-four kilohertz.", speaker="af_heart")
+```
+
+An OpenAI-shaped client keeps working without changes: `alloy` → `af_heart`,
+`echo` → `am_adam`, `nova` → `af_bella`, `onyx` → `am_michael`, `fable` →
+`bm_george`, `shimmer` → `bf_emma`.
+
+### espeak-ng and the spaCy G2P model
+
+Kokoro's English G2P is spaCy-based (`en_core_web_sm`); `espeak-ng` is the
+out-of-dictionary fallback and the backend for every non-English voice. Common
+English works without it, so `doctor` reports a missing binary as a **WARN with the
+platform install command** — never a FAIL:
+
+```bash
+sudo apt install espeak-ng     # Debian/Ubuntu
+brew install espeak-ng         # macOS
+```
+
+Both prerequisites are pinned in `engines/kokoro/pyproject.toml`. `en-core-web-sm`
+is a **direct URL dependency** because misaki's own installer picks the *active*
+interpreter rather than the engine venv, and `torch` is a **direct dependency with
+an explicit CPU index** because a transitive torch resolves the CUDA wheel and
+drags in every `nvidia-*` package. The exact lock is in
+[phase0-kokoro-report.md](phase0-kokoro-report.md).
+
+### What Kokoro cannot do
+
+No `voice_clone`, no `voice_design`, no `instruct_control`. A cloned voice or a
+designed timbre is refused before a worker spawns — use a Qwen checkpoint for
+those. It is English-only for now: other Kokoro languages need the extra `misaki`
+extras and an espeak-ng verification pass. The lighter `kokoro-onnx` backend is
+documented as the alternative but is not shipped: its weights are GitHub release
+assets, not Hugging Face ones, so `models download` and `hf_model_downloaded()`
+would need a custom downloader.
+
 ## Adding an engine
 
 The full contract is in
@@ -178,16 +267,16 @@ engines/<engine_id>/
 ```
 
 ```yaml
-engine_id: kokoro
-display_name: Kokoro (82M)
-backend_name: kokoro          # PyPI distribution name — part of the cache key
-backend_version: "0.9.4"      # must match what is installed — part of the cache key
+engine_id: example_tts
+display_name: Example engine
+backend_name: example-tts     # PyPI distribution name — part of the cache key
+backend_version: "1.2.3"      # must match what is installed — part of the cache key
 protocol_version: 1
 venv_python: .venv/bin/python # null => run in the core interpreter (zero-dep engines)
 
 capabilities:
-  streaming: false            # true only if PCM arrives during decode
-  pcm_native: false           # true only if it emits 24 kHz mono int16 directly
+  streaming: true             # true only if PCM arrives during decode
+  pcm_native: true            # true only if it emits 24 kHz mono int16 directly
   voice_clone: false
   custom_voice: true
   voice_design: false
@@ -195,15 +284,20 @@ capabilities:
   languages: [English]
 
 models:
-  - alias: kokoro-82m
-    hf_repo: hexgrad/Kokoro-82M
+  - alias: example-1
+    hf_repo: local/example-1  # a local/ repo counts as present without a download
     quality_tier: fast        # high | fast
-    est_vram_gb: 0.3
+    est_vram_gb: 0.0
     default: true
     mode: custom_voice        # clone | custom_voice | voice_design
     supports_instruct: false
-    preset_speakers: [af_heart, af_bella, am_michael]
+    preset_speakers: [Ash, Blair]
 ```
+
+The shipped `engines/kokoro/engine.yaml` is the worked example of a CPU engine:
+`est_vram_gb: 0.0`, `voice_clone: false`, one `custom_voice` model, eight preset
+speakers. The shipped Qwen manifests are the worked example of the three-mode
+routing surface.
 
 Rules that keep the system honest:
 
@@ -230,7 +324,10 @@ uv run agent-voice engines test <engine_id>   # full IPC v1 conformance, exits n
 
 `engines test` walks `spawn+connect → hello → load_model → synthesize → cancel →
 health → shutdown`, printing a pass/fail row per step. Skipped steps are `SKIP`
-with a reason, never a pass. `mock` needs no GPU, so it is the reference runner:
+with a reason, never a pass. It picks a clone model first; when an engine has none
+(Kokoro), it uses the first `custom_voice` checkpoint's first preset speaker and
+sends `mode` + `speaker`, so a preset-only engine reaches 7/7 as well. `mock` needs
+no GPU, so it is the reference runner:
 
 ```bash
 uv run agent-voice engines test mock
@@ -246,7 +343,8 @@ skips the prompt).
 ## GPU lifecycle
 
 - **0 workers at boot, 0 MB VRAM.** Only the core daemon runs; it holds no model
-  code.
+  code. When a `kokoro` worker *is* resident it still contributes 0 MB of VRAM —
+  the model lives in system RAM.
 - **The cache is consulted before any worker is spawned.** A hit costs a disk
   read and never wakes the GPU.
 - **Workers are lazy and reapable.** A worker spawns on the first uncached request

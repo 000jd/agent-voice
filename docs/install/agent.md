@@ -210,6 +210,37 @@ client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed-unless-
 client.audio.speech.create(model="tts-1", voice="nova", input="Hello.").write_to_file("out.wav")
 ```
 
+## CPU-only install (Kokoro)
+
+An agent host without a GPU can still speak: Kokoro-82M runs on the CPU with
+**0 MB of VRAM** and native 24 kHz output.
+
+```bash
+uv run agent-voice engines install kokoro
+uv run agent-voice models download kokoro kokoro-82m   # 363 MB, once
+uv run agent-voice doctor                              # espeak-ng row + weights
+uv run agent-voice engines test kokoro                 # 7/7 IPC v1 conformance
+AGENT_VOICE_DEFAULT_ENGINE=kokoro uv run agent-voice serve
+```
+
+As soon as the Kokoro engine ships in `engines/`, `doctor` grows an `espeak-ng`
+row: `PASS` when the binary is on `PATH`, `WARN` with the platform install command
+when it is not — common English still speaks, so it never fails the run. Install it
+with `sudo apt install espeak-ng` (Debian/Ubuntu) or `brew install espeak-ng`
+(macOS).
+
+The eight preset voices — `af_heart`, `af_bella`, `af_sarah`, `am_adam`,
+`am_michael`, `bf_emma`, `bm_george`, `bm_lewis` — need no reference clip, so
+`clone_voice` is optional on this host:
+
+```python
+speak("Nightly build finished.", speaker="af_heart")
+```
+
+An OpenAI-shaped client keeps working unchanged: its six builtin names map to
+Kokoro presets (`alloy` → `af_heart`, `nova` → `af_bella`, …), and every response
+carries `x-agent-voice-speaker`.
+
 ## Autostart
 
 ### Linux (systemd user unit)
@@ -275,6 +306,10 @@ curl -s localhost:8000/health                    # {"status":"ok", ...}
 uv run agent-voice status                        # daemon health + GPU state
 uv run agent-voice doctor                        # full environment checklist
 ```
+
+`doctor` is the fastest triage when an agent reports "server failed to start": it
+prints one row per check — including `espeak-ng` once the Kokoro engine ships and
+`ffmpeg`/`ffprobe` always — and a `fix:` line under every `WARN`/`FAIL`.
 
 Then ask the agent to call **`server_info`** first. It is free, never spawns a
 worker, and tells the agent the version, default engine, registered voices,
