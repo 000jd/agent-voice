@@ -84,6 +84,10 @@ class ErrorCode(StrEnum):
     MANIFEST_INVALID = "MANIFEST_INVALID"
     TIMEOUT = "TIMEOUT"
     BACKPRESSURE = "BACKPRESSURE"
+    DAEMON_RESTARTED = "DAEMON_RESTARTED"
+    """A job was pending or running when the daemon stopped. It cannot be resumed,
+    so it is reconciled to failed on the next startup rather than lying as
+    "running" forever."""
     BAD_REQUEST = "BAD_REQUEST"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
@@ -106,6 +110,7 @@ HTTP_STATUS_BY_ERROR: dict[ErrorCode, int] = {
     ErrorCode.MANIFEST_INVALID: 422,
     ErrorCode.TIMEOUT: 504,
     ErrorCode.BACKPRESSURE: 429,
+    ErrorCode.DAEMON_RESTARTED: 410,
     ErrorCode.BAD_REQUEST: 400,
     ErrorCode.INTERNAL_ERROR: 500,
 }
@@ -289,6 +294,9 @@ class SpeakRequest(BaseModel):
     format: ResponseFormat = "wav"
     seed: int | None = None
     speed: float = 1.0
+    take: int | None = Field(default=None, ge=1)
+    """Alternate delivery of the same line. Derives a repeatable seed when `seed`
+    is not given, so take=2 is reproducible and cache-stable."""
 
 
 class SpeechRequest(BaseModel):
@@ -324,6 +332,12 @@ class SynthesisResult(BaseModel):
     elapsed_ms: int = 0
     """Wall-clock cost of this call. On a cache hit this is the (tiny) lookup
     time, which makes latency regressions obvious to a caller."""
+    take: int | None = None
+    """Which alternate delivery was rendered. A new take yields different audio
+    without disturbing the cache entry for take 1."""
+    real_time_factor: float | None = None
+    """duration_sec / elapsed_sec. Above 1.0 means faster than real time, so a
+    3x RTF renders 30 s of speech in 10 s. None for streamed output."""
 
 
 class BeatSpec(BaseModel):
@@ -341,6 +355,9 @@ class BeatSpec(BaseModel):
     Video pipelines (Manim, slideshows) need this to leave room for a visual to
     land. Included in the reported timings, so subtitles stay frame-accurate.
     """
+    take: int | None = Field(default=None, ge=1)
+    """Alternate delivery of this beat's line, for re-recording one beat without
+    touching the others."""
 
 
 class ScriptRequest(BaseModel):
@@ -366,6 +383,11 @@ class BeatTiming(BaseModel):
     voice_id: str | None = None
     """Which voice actually spoke this beat, so a multi-speaker script is
     auditable from the result alone."""
+    cached: bool = False
+    """True when re-rendering an edited script reused this beat from disk.
+    Editing one beat of twelve should show eleven instant hits."""
+    artifact_id: str = ""
+    """The per-beat artifact id, so a caller can fetch or replace one beat."""
 
 
 class ScriptResult(BaseModel):

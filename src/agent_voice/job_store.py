@@ -20,6 +20,14 @@ from .schemas import ErrorCode, ErrorResponse, Job, JobStatus
 
 JobKind = Literal["script", "download_model", "install_engine"]
 
+_INTERRUPTIBLE_STATUSES: frozenset[str] = frozenset({"pending", "running"})
+"""A job in one of these states cannot survive a daemon restart: its work lived in
+this process, so nothing can resume it. Reconciled to ``failed`` at startup rather
+than lying as ``running`` forever."""
+
+_RESTART_MESSAGE = "job was interrupted by a daemon restart"
+_RESTART_SUGGESTION = "Daemon restarted; resubmit this job"
+
 
 class JobStore:
     def __init__(self, jobs_dir: Path, clock: Clock | None = None) -> None:
@@ -82,7 +90,9 @@ class JobStore:
             raise AgentVoiceError(
                 ErrorCode.BAD_REQUEST,
                 f"unknown job: {job_id}",
-                "Jobs are ephemeral; check the job_id returned when you started it.",
+                "No job with that id in data/jobs/. Ids are 16 hex chars; list them "
+                "with `agent-voice jobs list` or check the job_id returned when you "
+                "started it.",
             )
         return job
 
@@ -146,6 +156,11 @@ class JobStore:
         return jobs[:limit]
 
     def prune(self, *, older_than_seconds: float = 24 * 3600) -> int:
+        """Delete job files older than ``older_than_seconds``.
+
+        Safe to call at startup: an unreadable or already-deleted file is skipped,
+        so a stale job artifact can never stop the daemon from booting.
+        """
         cutoff = time.time() - older_than_seconds
         removed = 0
         for path in self.jobs_dir.glob("*.json"):
@@ -157,3 +172,32 @@ class JobStore:
             except OSError:
                 continue
         return removed
+
+    # -- startup reconciliation ------------------------------------------
+    def reconcile_on_startup(self) -> int:
+        """Fail every job that a previous process left ``pending`` or ``running``.
+
+        The work lived in the dead process — a cancelled task, an in-memory thread —
+        so nothing can resume it. Marking it ``failed`` with ``DAEMON_RESTARTED``
+        is the only honest answer; leaving it ``running`` would have callers poll a
+        job that can never move again. Terminal statuses are left untouched, so this
+        is idempotent and safe to call on every boot.
+
+        Returns how many jobs were reconciled.
+        """
+        reconciled = 0
+        for path in sorted(self.jobs_dir.glob("*.json")):
+            job = self._load(path.stem)
+            if job is None or job.status not in _INTERRUPTIBLE_STATUSES:
+                continue
+            job.status = "failed"
+            job.message = _RESTART_MESSAGE
+            job.error = ErrorResponse(
+                error_code=ErrorCode.DAEMON_RESTARTED,
+                message=_RESTART_MESSAGE,
+                suggestion=_RESTART_SUGGESTION,
+            )
+            job.updated_at = self._clock.now()
+            self._persist(job)
+            reconciled += 1
+        return reconciled

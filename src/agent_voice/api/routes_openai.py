@@ -72,6 +72,7 @@ async def run_synthesis(
     response_format: str,
     seed: int | None,
     speed: float,
+    take: int | None = None,
     openai_voice_compat: bool = False,
 ):
     ctx = request.app.state.ctx
@@ -103,6 +104,7 @@ async def run_synthesis(
         seed=seed,
         speed=speed,
         response_format=response_format,
+        take=take,
     )
 
 
@@ -157,6 +159,9 @@ async def agent_speak(payload: SpeakRequest, request: Request):
         response_format=payload.format,
         seed=payload.seed,
         speed=payload.speed,
+        # A new take is an alternate delivery of the same line: same text, other
+        # audio. It feeds the cache key, so take 1 stays cached.
+        take=payload.take,
     )
     return result.model_dump(mode="json")
 

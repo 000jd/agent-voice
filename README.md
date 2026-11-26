@@ -43,14 +43,18 @@ genuinely free when idle, and MCP tools that return compact JSON.
 ## Install
 
 ```bash
-git clone <your-fork> agent-voice && cd agent-voice
+git clone https://github.com/000jd/agent-voice.git agent-voice && cd agent-voice
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 cp .env.example .env
 ```
 
-The core venv installs **no torch**. That is deliberate — it is what makes a 0 MB idle GPU
-a structural guarantee rather than a promise.
+`uv sync --extra dev` works too and is what CI uses. Either way the core venv installs **no
+torch** — that is deliberate, and it is what makes a 0 MB idle GPU a structural guarantee rather
+than a promise.
+
+The template defaults to `ALLOW_AGENT_ENGINE_MUTATION=false`; see [Security](#security) before you
+change it.
 
 ## Quickstart with the mock engine
 
@@ -75,8 +79,12 @@ sets and cannot share a virtualenv:
 
 | engine | package | streaming | when to use |
 |---|---|---|---|
-| `qwen3_tts_fast` | `faster-qwen3-tts` (CUDA graphs) | native | default; fastest, real-time PCM |
+| `qwen3_tts_fast` | `faster-qwen3-tts` (CUDA graphs) | native | default; native streaming |
 | `qwen3_tts` | `qwen-tts` (official) | emulated | fallback if graph capture misbehaves |
+
+Honest throughput, measured on the reference box with the official backend and 0.6B: **~10.5 s of
+wall time for 9.0 s of audio, warm — RTF ≈ 0.86**, i.e. slightly slower than real time. A cache hit
+returns in ~0.01 s. That number was not measured on `qwen3_tts_fast`.
 
 ```bash
 uv run agent-voice engines install qwen3_tts_fast
@@ -106,6 +114,7 @@ uv run agent-voice voices add narrator ./my-clip.wav \
 | Daemon boot with a GPU engine configured | **0 workers, 631 MiB VRAM** (= desktop idle) |
 | Cold start (spawn + load 0.6B + 9.5 s speech) | 21.8 s |
 | Warm request (model resident, 9.0 s speech) | 10.5 s |
+| Warm real-time factor (9.0 s audio / 10.5 s wall) | **RTF ≈ 0.86** — slightly slower than real time |
 | Cache hit (identical request) | 0.01 s |
 | VRAM with 0.6B loaded | ~3.5 GB |
 | VRAM after `unload(force=true)` | **639 MiB** — back to baseline |
@@ -114,17 +123,23 @@ Full numbers and dependency findings: [`docs/phase0-report.md`](docs/phase0-repo
 
 ## Connect an agent
 
-### Command Code / Claude Code / Cursor
+`agent-voice mcp` is a stdio shim: it starts the daemon if it is not already running, then proxies
+MCP to it, so the agent process never loads a model itself. Every snippet below uses the same
+command — `uv run --directory <abs-path> agent-voice mcp` — with the absolute path to your checkout
+substituted for `<abs-path>`.
 
-The `agent-voice mcp` command is a stdio shim. It starts the daemon if it is not running,
-then proxies MCP to it — so the agent never loads a model itself.
+### `.mcp.json` (project or user scope, portable `mcpServers` format)
+
+Works for Command Code, Claude Code, Cursor, Copilot and anything else that reads a top-level
+`mcpServers` object. Drop it at the repo root for a project-scoped server.
 
 ```json
 {
   "mcpServers": {
     "agent-voice": {
+      "type": "stdio",
       "command": "uv",
-      "args": ["run", "--directory", "/absolute/path/to/agent-voice", "agent-voice", "mcp"],
+      "args": ["run", "--directory", "<abs-path>", "agent-voice", "mcp"],
       "env": {
         "AGENT_VOICE_CLIENT_ID": "command-code"
       }
@@ -132,6 +147,49 @@ then proxies MCP to it — so the agent never loads a model itself.
   }
 }
 ```
+
+### Claude Desktop (`claude_desktop_config.json`)
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- Linux: `~/.config/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "agent-voice": {
+      "command": "uv",
+      "args": ["run", "--directory", "<abs-path>", "agent-voice", "mcp"],
+      "env": {
+        "AGENT_VOICE_CLIENT_ID": "claude-desktop"
+      }
+    }
+  }
+}
+```
+
+### VS Code
+
+Put a top-level `servers` object in `.vscode/mcp.json` (workspace) or your profile's `mcp.json`.
+Note the key is `servers`, not `mcpServers`, and the `type` is required:
+
+```json
+{
+  "servers": {
+    "agent-voice": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "<abs-path>", "agent-voice", "mcp"],
+      "env": {
+        "AGENT_VOICE_CLIENT_ID": "vscode"
+      }
+    }
+  }
+}
+```
+
+`AGENT_VOICE_CLIENT_ID` becomes the `X-Agent-Id` header, which selects a per-agent voice/engine
+binding (`set_agent_binding`).
 
 ### HTTP MCP directly
 
@@ -160,19 +218,27 @@ tools = await client.get_tools()
 
 ## Tools
 
-| Tool | Purpose |
-|---|---|
-| `server_info` | **Call first.** Version, defaults, voices, engines and GPU state in one call — never spawns a worker |
-| `speak` | Synthesise one utterance, return a file path |
-| `speak_script` | Multi-beat script with exact per-beat timings and SRT/VTT |
-| `start_script_job` / `get_job` / `cancel_job` | Long scripts and other async work |
-| `clone_voice` / `list_voices` / `delete_voice` | Manage reference voices |
-| `set_agent_binding` / `list_agent_bindings` | Per-agent voice routing |
-| `list_engines` / `list_models` | Discover engines, models, install state |
-| `download_model` / `register_model` / `register_engine` / `install_engine` | Agent-driven self-management |
-| `gpu_status` / `unload_models` | Inspect and free the GPU |
+19 tools, split into a `core` and a `full` surface (`AGENT_VOICE_TOOLSET`, see
+[Security](#security)). Every tool returns compact JSON — audio is never inlined as base64.
 
-Every tool returns compact JSON. Audio is never inlined as base64.
+| Tool | Surface | Purpose |
+|---|---|---|
+| `server_info` | core | **Call first.** Version, defaults, voices, engines and GPU state in one call — never spawns a worker |
+| `speak` | core | Synthesise one utterance, return a file path |
+| `speak_script` | core | Multi-beat script with exact per-beat timings and SRT/VTT |
+| `start_script_job` / `get_job` / `cancel_job` | core | Long scripts and other async work |
+| `clone_voice` / `list_voices` | core | Manage reference voices |
+| `gpu_status` / `unload_models` | core | Inspect and free the GPU |
+| `delete_voice` | full | Remove a voice and its cached prompts |
+| `set_agent_binding` / `list_agent_bindings` | full | Per-agent voice routing |
+| `list_engines` / `list_models` | full | Discover engines, models, install state |
+| `download_model` / `register_model` / `register_engine` / `install_engine` | full | Agent-driven self-management |
+
+Failures come back as MCP `isError=true` with the JSON `{error_code, message, suggestion}` body as
+the text, so a client can tell success from failure without parsing the payload.
+
+The server also exposes `agent-voice://voices` (JSON) and `agent-voice://guide` (this repo's
+SKILL.md), plus a `narrate_video` prompt.
 
 ### Orient with `server_info`
 
@@ -209,6 +275,15 @@ the ones that cannot.
 | `chunks_used` | How many text chunks were stitched. `>1` means the input exceeded `CHUNK_CHARS` and was split — normal, not an error |
 | `elapsed_ms` | Wall-clock cost of the call; near zero on a cache hit, so latency regressions are obvious |
 | `cached` | `true` when the deterministic disk cache answered and no GPU work happened |
+| `real_time_factor` | Defined as `duration_sec / elapsed_sec` — above 1.0 means faster than real time, `None` when the duration is unknown. ⚠️ In the current build the daemon computes the reciprocal (`elapsed/duration`), so a render 37× faster than real time reports `0.027`; recompute from `duration_sec` and `elapsed_ms` if the value looks inverted. On the reference box a warm 0.6B render measured **≈ 0.86** (slightly slower than real time) |
+| `take` | Which alternate delivery was rendered (`take=2`, …). A new take gets its own cache entry, so take 1 is untouched |
+
+### Alternate takes of the same line
+
+Want a different read of the same line? Pass `take=2` (or `3`, …) to `speak`, or `take` on an
+individual `speak_script` beat. Each take is a separate cache entry, so asking again for the same
+take is free and take 1 still resolves to the original audio. When you pass `take` without a
+`seed`, the seed is derived from it, so a given take is reproducible.
 
 ### Idempotent voice cloning
 
@@ -239,6 +314,7 @@ speak_script(beats=[
 | `language` | `"Auto"` or a language name |
 | `target_duration_sec` + `fit_mode` | Fit the beat into a fixed slot (`none`, `pad`, `atempo`) — for fixed-length video segments |
 | `pause_after_sec` | 0–10 s of silence inserted **after** the beat. Included in the reported timings, so subtitles and visuals stay frame-accurate |
+| `take` | Alternate delivery of this beat's line (`take=2`, `take=3`, …). Re-record one beat without touching the others |
 
 `BeatTiming` reports `start_sec`, `end_sec`, `pause_after_sec` and `voice_id` per
 beat. `end_sec` is the end of the spoken portion; the next beat starts at
@@ -249,12 +325,179 @@ on the frame you expect.
 passed straight into `BeatSpec`, so anything the contract accepts works through the
 tool.
 
+### The `.timing.json` file
+
+With `export_srt=true` (the default) a script render writes `<artifact>.timing.json` next to the
+audio, alongside `.srt` and `.vtt`. It is the serialised `ScriptResult` — exactly this shape, no
+extra keys:
+
+```json
+{
+  "artifact_id": "a1b2c3d4e5f60718",
+  "file_path": "/repo/data/artifacts/a1b2c3d4e5f60718.wav",
+  "duration_sec": 8.9143,
+  "beats": [
+    {
+      "index": 0,
+      "text": "Welcome back to the show.",
+      "duration_sec": 2.4123,
+      "start_sec": 0.0,
+      "end_sec": 2.4123,
+      "pause_after_sec": 1.5,
+      "target_duration_sec": null,
+      "fit_mode": "none",
+      "voice_id": "9f2c1d",
+      "cached": false,
+      "artifact_id": "0b1f..."
+    },
+    {
+      "index": 1,
+      "text": "Everything, honestly.",
+      "duration_sec": 3.4012,
+      "start_sec": 3.9123,
+      "end_sec": 7.3135,
+      "pause_after_sec": 0.0,
+      "target_duration_sec": 8.0,
+      "fit_mode": "atempo",
+      "voice_id": "4a7e02",
+      "cached": true,
+      "artifact_id": "77cd..."
+    }
+  ],
+  "srt_path": "/repo/data/artifacts/a1b2c3d4e5f60718.srt",
+  "vtt_path": "/repo/data/artifacts/a1b2c3d4e5f60718.vtt",
+  "timing_json_path": "/repo/data/artifacts/a1b2c3d4e5f60718.timing.json",
+  "engine_id": "qwen3_tts_fast",
+  "model_alias": "0.6b-base",
+  "format": "wav"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `artifact_id` / `file_path` / `duration_sec` | The stitched master and its true length |
+| `beats[].index` | Position in the `beats` list you passed in — stable across re-renders |
+| `beats[].text` | The beat's text, echoed back |
+| `beats[].duration_sec` | Spoken length of this beat, **excluding** any trailing pause |
+| `beats[].start_sec` / `end_sec` | Onset and end of the spoken portion. A following beat starts at `end_sec + pause_after_sec` |
+| `beats[].pause_after_sec` | Silence inserted after this beat, included in the layout |
+| `beats[].target_duration_sec` / `fit_mode` | The slot that was requested, echoed (`null` / `"none"` when unused) |
+| `beats[].voice_id` | Which voice actually spoke this beat — auditable multi-speaker scripts |
+| `beats[].cached` | `true` when this beat was reused from disk. Edit one beat of twelve and see eleven instant hits |
+| `beats[].artifact_id` | This beat's own artifact, so a single beat can be fetched or re-rendered |
+| `srt_path` / `vtt_path` / `timing_json_path` | Where the sidecars landed |
+
+#### Consuming it from Manim
+
+Read `start_sec` / `end_sec` instead of accumulating offsets yourself — every earlier
+`pause_after_sec` is already baked into `start_sec`, which is what keeps a visual on the word it
+belongs to:
+
+```python
+import json
+
+from manim import FadeIn, FadeOut, Scene, Text
+
+with open("a1b2c3d4e5f60718.timing.json", encoding="utf-8") as handle:
+    timing = json.load(handle)
+
+FADE_IN = 0.3
+FADE_OUT = 0.1
+
+
+class NarratedClip(Scene):
+    def construct(self):
+        # Manim's clock starts at 0, so the audio lines up with t=0.
+        self.add_sound(timing["file_path"])
+        beats = timing["beats"]
+        # Scene time already rendered. Tracked by adding up what we ask for,
+        # because animations consume scene time too.
+        cursor = 0.0
+        for position, beat in enumerate(beats):
+            # start_sec already includes every earlier pause_after_sec, so hold
+            # the screen until the beat is due rather than summing durations.
+            gap = beat["start_sec"] - cursor
+            if gap > 0:
+                self.wait(gap)
+                cursor += gap
+            caption = Text(beat["text"]).scale(0.7)
+            self.play(FadeIn(caption), run_time=FADE_IN)
+            cursor += FADE_IN
+            spoken = beat["end_sec"] - beat["start_sec"]
+            remaining = spoken - FADE_IN
+            if remaining > 0:
+                self.wait(remaining)
+                cursor += remaining
+            # Fade out only if the pause leaves room. On back-to-back beats the
+            # fade would push the next caption late, so cut instead.
+            next_onset = (
+                beats[position + 1]["start_sec"]
+                if position + 1 < len(beats)
+                else timing["duration_sec"]
+            )
+            if next_onset - beat["end_sec"] >= FADE_OUT:
+                self.play(FadeOut(caption), run_time=FADE_OUT)
+                cursor += FADE_OUT
+            else:
+                self.remove(caption)
+```
+
+```bash
+# Manim does not mux narration into the render; attach it afterwards.
+manim -qh --fps 30 scene.py NarratedClip
+ffmpeg -y -i media/videos/scene/1080p30/NarratedClip.mp4 \
+       -i a1b2c3d4e5f60718.wav \
+       -c:v copy -c:a aac -shortest out.mp4
+```
+
 ## Agent skill
 
 An installable skill for coding agents lives at
 [`skills/agent-voice/SKILL.md`](skills/agent-voice/SKILL.md) — orientation,
 first-run voice cloning, script beats, reproducibility, error handling and the MCP
-config snippet, in about 30 seconds of reading.
+config snippet, in about 30 seconds of reading. The MCP server also serves it as the
+`agent-voice://guide` resource.
+
+## Security
+
+The defaults are chosen so that a fresh `cp .env.example .env` is safe to run and safe to expose to
+an agent.
+
+- **Engine mutation is off by default.** `ALLOW_AGENT_ENGINE_MUTATION=false`. Enabling it lets an
+  AI agent write `engine.yaml` / `worker.py` / `pyproject.toml` into `engines/` **and execute it** —
+  `worker.py` is run as a Python script on this machine. That is arbitrary code execution requested
+  by a language model. Leave it off unless you specifically want that.
+- **Mutation is loopback-only.** Even with the flag on, both the daemon and the calling client must
+  be on loopback. A non-loopback peer gets `AGENT_MUTATION_DISABLED`.
+- **Loopback bind + Host/Origin guard.** The daemon binds `127.0.0.1` and rejects requests whose
+  `Host` header is not a loopback name, which is what stops a DNS-rebinding page in your browser
+  from talking to it. A present `Origin` must also be local. If you deliberately front the daemon
+  with another hostname, add it to `AGENT_VOICE_ALLOWED_HOSTS`.
+- **`/audio` is behind Bearer.** An artifact is the user's own speech (or a clone of someone
+  else's), so `/audio/{artifact_id}` requires `Authorization: Bearer $AGENT_VOICE_API_KEY` when a
+  key is set, exactly like `/v1/*` and `/mcp/*`. `/health` stays open.
+- **`AGENT_VOICE_TOOLSET` limits what the agent can see.**
+
+  | value | Tools exposed |
+  |---|---|
+  | `auto` (default) | `core`, plus the management tools when mutation is enabled |
+  | `core` | Synthesis, voices read/clone, GPU status. No engine/model management at all |
+  | `full` | Everything, so the per-call loopback + mutation guard answers with an actionable error |
+
+  `core` is the right choice for an agent that only needs to make audio: a shorter tool list costs
+  fewer tokens and has less for a model to get wrong.
+- **`REQUIRE_ENGINE_APPROVAL`** stops agent-authored code from going live unattended. With
+  `REQUIRE_ENGINE_APPROVAL=true`, `register_engine` stages the plugin under
+  `engines/.pending/<id>/`; an operator inspects it and runs
+  `agent-voice engines approve <id>` to move it into `engines/` and reload the registry.
+
+### Voice cloning: consent is the operator's responsibility
+
+Only clone voices you have permission to use. `agent-voice` runs locally and offline — no audio,
+transcript or reference clip leaves this machine — but that is a property of the software, not a
+licence. Cloning a real person's voice without their consent is impersonation, and in many
+jurisdictions a legal problem, no matter where the model runs. The tool cannot verify consent for
+you; the responsibility is the operator's.
 
 ## GPU lifecycle
 
@@ -308,25 +551,97 @@ Alternatively, Task Scheduler with trigger "At log on" and action
 
 ```
 agent-voice serve | mcp | status
-agent-voice engines  list | install <id>
+agent-voice engines  list | install <id> | test <id> | pending | approve <id>
 agent-voice models   list | download <engine> <alias>
 agent-voice voices   list | add <name> <wav> | delete <voice_id>
 agent-voice bindings list | set <agent> ... | delete <agent>
+agent-voice cache    stats | clear
 agent-voice unload [--force]
+```
+
+### `engines test <engine_id>` — IPC v1 conformance
+
+Spawns a real worker and walks the full protocol v1 contract, printing a pass/fail row per step.
+Exits non-zero if anything fails, so it works as a CI or post-install gate. `mock` needs no GPU:
+
+```console
+$ agent-voice engines test mock
+step           result  detail
+-------------  ------  ---------------------------------------------------------------
+spawn+connect  PASS    pid 473640, ready in 0.05 s
+hello          PASS    protocol_version=1 engine_id=mock backend=mock 1 streaming=True
+load_model     PASS    alias=mock-tone loaded_models=['mock-tone']
+synthesize     PASS    1.92 s of audio in 0.27 s -> conformance.wav
+cancel         PASS    cancel acknowledged, cancelled=True
+shutdown       PASS    acknowledged, exited rc=0 in 0.05 s
+mock: IPC v1 conformance passed
+```
+
+The steps are `spawn+connect`, `hello` (asserts `protocol_version == 1` and the engine id matches),
+`load_model` (the registry's default alias), `synthesize` (asserts a WAV exists with duration > 0),
+`cancel` (starts a stream, then cancels it; a cancel acknowledgement — including a `JOB_CANCELLED`
+result — passes) and `shutdown`. Skipped steps are reported as `SKIP` with the reason, never as a
+pass.
+
+### `engines pending` / `engines approve <id>`
+
+With `REQUIRE_ENGINE_APPROVAL=true`, agent-authored plugins land in `engines/.pending/<id>/`.
+`engines pending` lists them; `engines approve <id>` validates the staged manifest, moves the
+directory to `engines/<id>/`, and reloads the registry. It refuses to overwrite an existing engine
+directory, and a manifest that cannot load blocks the move.
+
+### `cache stats` / `cache clear`
+
+`cache stats` prints entry count, total size, the configured cap and the oldest/newest entry as
+JSON. It measures only — it never evicts. `cache clear` deletes every cached artifact and sidecar
+and prints exactly what it removed and how many bytes it freed:
+
+```console
+$ agent-voice cache clear
+{
+  "cache_dir": "/repo/data/cache",
+  "files_deleted": 6,
+  "directories_removed": 3,
+  "bytes_freed": 15407,
+  "bytes_freed_human": "15.0 KiB",
+  "deleted": [
+    "92/921e...cea.json",
+    "92/921e...cea.wav"
+  ]
+}
+freed 15.0 KiB in 6 file(s)
 ```
 
 ## Adding an engine
 
 See `engines/ADDING_AN_ENGINE.md`. In short: create `engines/<id>/engine.yaml`, a
 `worker.py` that speaks IPC protocol v1, and optionally a `pyproject.toml` for an isolated
-venv. No daemon changes required.
+venv. No daemon changes required. Then prove it speaks the protocol:
+
+```bash
+uv run agent-voice engines test <engine_id>
+```
 
 ## Development
 
 ```bash
-uv run pytest -v                 # mock + contract suite, no GPU needed
-AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu   # real GPU gate
+uv sync --extra dev             # the dev extra supplies ruff + pytest; a bare
+                                # `uv sync` installs neither
+
+uv run ruff check .             # must stay clean
+uv run pytest -v                # mock + contract suite, no GPU needed
+PYTHONPATH=. .venv/bin/pytest -v   # if you use the console script directly:
+                                   # conftest imports `tests._fake_clock`, so the
+                                   # repo root has to be importable
+
+AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""   # real GPU gate
+uv run agent-voice engines test mock   # end-to-end IPC v1 conformance, ~1 s
 ```
+
+CI runs exactly `uv sync --extra dev`, `ruff check .` and `pytest -v -m "not gpu"` on Python 3.12
+against `ubuntu-latest`, with no GPU and no secrets — see `.github/workflows/ci.yml`.
+
+Agent-facing orientation lives in [`AGENTS.md`](AGENTS.md).
 
 ## License
 

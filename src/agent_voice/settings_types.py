@@ -31,6 +31,9 @@ class SettingsLike(Protocol):
     stream_queue_maxsize: int
     stream_queue_timeout_seconds: float
     allow_agent_engine_mutation: bool
+    require_engine_approval: bool
+    toolset: str
+    allowed_hosts: list[str]
     mcp_base_path: str
     data_dir: Path
     engines_dir: Path

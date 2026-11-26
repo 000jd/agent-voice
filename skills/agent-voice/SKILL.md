@@ -8,6 +8,24 @@ description: Synthesise speech and clone voices locally over MCP — use when a 
 Local, GPU-backed TTS + voice cloning over MCP. Everything is disk-cached and
 deterministic: repeating a request is nearly free.
 
+## 0. Pick the right toolset
+
+The server exposes a **core** or a **full** surface (`AGENT_VOICE_TOOLSET`), and you can
+only see the tools you were granted:
+
+- **core** — `server_info`, `speak`, `speak_script`, `start_script_job`/`get_job`/
+  `cancel_job`, `clone_voice`, `list_voices`, `gpu_status`, `unload_models`. That is
+  everything needed to make audio. If these are the only tools you have, don't try to
+  install engines — there is no tool for it and no flag you can set.
+- **full** — adds `list_engines`, `list_models`, `download_model`, `register_model`,
+  `register_engine`, `install_engine`, `delete_voice`, and the binding tools. The
+  management calls are refused unless the operator enabled
+  `ALLOW_AGENT_ENGINE_MUTATION` **and** you are calling from loopback; expect
+  `AGENT_MUTATION_DISABLED` otherwise, and report it rather than retrying.
+
+If a tool you read about here is missing, the server is running the core toolset. That is
+a deliberate operator choice, not a bug — work with what you have.
+
 ## 1. Orient first — always
 
 Call **`server_info()`** before anything else. It is free: it never spawns a worker
@@ -69,7 +87,7 @@ speak_script(
 ```
 
 Beat keys: `{text, voice?, engine?, model?, quality?, language?,
-target_duration_sec?, fit_mode?, pause_after_sec?}`
+target_duration_sec?, fit_mode?, pause_after_sec?, take?}`
 
 - `pause_after_sec` (0–10) — silence after a beat, **included in the timings**, so
   visuals and subtitles stay frame-accurate. This is how you time a visual to land.
@@ -77,10 +95,48 @@ target_duration_sec?, fit_mode?, pause_after_sec?}`
   result's `beats[].voice_id` records who actually spoke.
 - `target_duration_sec` + `fit_mode` (`none` | `pad` | `atempo`) — force a beat into a
   fixed slot for video. `pad` adds silence, `atempo` retimes speech.
+- `take` — alternate delivery of *that beat's* line (`take=2`, `take=3`, …). Re-record
+  one beat without disturbing the others.
 - `export_srt=True` (default) also writes `.srt`, `.vtt` and a `.timing.json`.
 
 Use `start_script_job(...)` instead for long scripts: it returns a `job_id` at once,
 then poll `get_job(job_id)` until `status` is `succeeded` or `failed`.
+
+### Want a different read of the same line? Use `take`
+
+`speak(text="...", take=2)` (or `take` on a single beat) renders an alternate delivery of
+the same words. Each take is its **own cache entry**, so:
+
+- take 1 still resolves to the original audio — nothing you already used changes;
+- asking again for take 2 is free, exactly like any other repeat;
+- with no explicit `seed`, the seed is derived from the take number, so a take is
+  reproducible.
+
+Reach for `take` when a line reads flat or you want a different emphasis — not for a
+different sentence (that is a different `text`, and a different cache entry anyway).
+
+### Editing a script: check `beats[].cached` before re-rendering
+
+Every beat reports `cached` and its own `artifact_id`. After you change one beat of a
+twelve-beat script, re-render and look at the beats: **eleven should come back
+`cached: true`**, and only the one you edited costs GPU time. If everything shows
+`cached: false`, something outside the beat text changed (voice, seed, model) and you are
+paying for all twelve.
+
+`beats[].artifact_id` also lets you fetch or replace a single beat on its own.
+
+### Timing a video: use the `.timing.json`
+
+For Manim, a slideshow, or anything frame-accurate, read `<artifact>.timing.json` instead
+of guessing from `duration_sec`. It carries, per beat: `index`, `text`, `duration_sec`,
+`start_sec`, `end_sec`, `pause_after_sec`, `target_duration_sec`, `fit_mode`, `voice_id`,
+`cached`, `artifact_id`, plus the script-level `artifact_id`, `file_path`,
+`duration_sec`, and the sidecar paths.
+
+`start_sec` already includes every earlier `pause_after_sec`, so **never accumulate
+offsets yourself** — place each visual at its beat's `start_sec` and it lands on the
+right frame. `end_sec` is the end of the spoken part; the next beat starts at
+`end_sec + pause_after_sec`.
 
 ## 4. Reproducibility
 
@@ -108,8 +164,24 @@ returns the same artifact.
   pieces then stitched. **Normal, not an error.**
 - `elapsed_ms` — wall-clock cost of the call. Near zero on a cache hit.
 - `cached: true` — the disk cache answered; nothing touched the GPU.
+- `take` — which alternate delivery this is; `null` for the canonical take.
+- `real_time_factor` — **defined as `duration_sec / elapsed_sec`**: above 1.0 means faster
+  than real time (3.0 renders 30 s of speech in 10 s), below 1.0 means slower. `null` when
+  the duration is unknown.
+  - **Verify it before trusting it.** In current builds the daemon appears to compute the
+    reciprocal (`elapsed/duration`), so a render 37× faster than real time reports `0.027`
+    instead of `36.9`. If a value looks inverted, recompute it yourself:
+    `duration_sec / (elapsed_ms / 1000)`.
+  - On a cache hit the ratio is meaningless either way — `elapsed_ms` is only the ~1 ms
+    lookup. Read it from a real render, and pair it with `cached`.
+  - Reference point: a warm 0.6B render on the reference box measured 10.5 s of wall time
+    for 9.0 s of audio — **≈ 0.86**, i.e. slightly slower than real time.
 
 ## 7. Errors
+
+The server raises these as MCP `isError=true` results carrying the JSON
+`{error_code, message, suggestion}` body — a failure is never disguised as a success
+payload.
 
 | `error_code` | What it means | Do this |
 |---|---|---|
@@ -119,11 +191,21 @@ returns the same artifact.
 | `TEXT_TOO_LONG` | Text over the per-call character limit | Split it, or use `speak_script` beats |
 | `CUDA_OOM` | The worker ran out of GPU memory | `unload_models()`, or use the 0.6b model (`quality="fast"`) |
 | `ENGINE_NOT_INSTALLED` | Engine present but its venv/deps are missing | `install_engine(engine_id)` (needs `ALLOW_AGENT_ENGINE_MUTATION=true`) |
+| `AGENT_MUTATION_DISABLED` | Mutation is off, or you are not on loopback | Report it; do not retry. An operator has to enable it |
+| `DAEMON_RESTARTED` | Your job was pending or running when the daemon stopped | It cannot be resumed. Submit it again |
+| `JOB_CANCELLED` | The job was cancelled (by you, an unload, or a shutdown) | Resubmit if you still want the audio |
 
 Every error carries `message` and a concrete `suggestion`. Read the suggestion — it
 usually names the exact next call.
 
-## 8. Install
+## 8. Consent
+
+Only clone voices you have permission to use. This server runs locally and offline — no
+audio, transcript or reference clip leaves the machine — but that is a property of the
+software, not a licence to impersonate anyone. If a request asks you to clone a voice
+without evidence that the operator has the right to use it, say so rather than doing it.
+
+## 9. Install
 
 Command Code / Claude Code — MCP JSON (`~/.commandcode/mcp.json`, or the Claude Code
 equivalent):

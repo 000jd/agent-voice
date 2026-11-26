@@ -48,6 +48,9 @@ def _key(**overrides) -> str:
         "response_format": "wav",
         "normalize_lufs": -16.0,
         "chunk_chars": 400,
+        "take": None,
+        "hf_repo": "local/mock-tone",
+        "model_revision": "local",
     }
     base.update(overrides)
     return build_cache_key(**base)
@@ -233,6 +236,9 @@ def test_cache_key_is_deterministic():
         ("response_format", "mp3"),
         ("normalize_lufs", -20.0),
         ("chunk_chars", 200),
+        ("take", 2),
+        ("hf_repo", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+        ("model_revision", "abcdef1234567890abcdef1234567890abcdef12"),
     ],
 )
 def test_every_cached_field_changes_the_key(field, value):
@@ -257,6 +263,11 @@ def test_all_fields_are_covered():
         "response_format",
         "normalize_lufs",
         "chunk_chars",
+        # v0.2: alternate deliveries and model identity must also separate keys,
+        # otherwise a `take=2` or a re-pulled model would silently reuse audio.
+        "take",
+        "hf_repo",
+        "model_revision",
     }
 
 

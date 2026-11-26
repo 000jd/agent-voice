@@ -1,4 +1,9 @@
-"""Engine and model discovery plus agent-driven self-management."""
+"""Engine and model discovery plus agent-driven self-management.
+
+Every mutating route here writes an audit line via :func:`record_mutation` before
+returning: these endpoints write Python to disk and later execute it, which is the
+highest-privilege thing the daemon can be asked to do.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ import subprocess
 
 from fastapi import APIRouter, Request
 
+from ..engine_registry import WORKER_NAME
 from ..schemas import (
     AgentVoiceError,
     EngineEntry,
@@ -17,7 +23,7 @@ from ..schemas import (
     RegisterEngineRequest,
     RegisterModelRequest,
 )
-from .app import require_agent_mutation
+from .app import record_mutation, require_agent_mutation
 
 router = APIRouter(tags=["engines"])
 
@@ -41,6 +47,16 @@ async def register_engine(payload: RegisterEngineRequest, request: Request):
         worker_py_content=payload.worker_py_content,
     )
 
+    # Audited before the (optional) install job starts: if `uv sync` later runs
+    # arbitrary build backends, the record of who staged the code already exists.
+    record_mutation(
+        ctx,
+        agent_id=request.headers.get("x-agent-id"),
+        action="register_engine",
+        engine_id=record.engine_id,
+        worker_path=record.directory / WORKER_NAME,
+    )
+
     job_id = None
     if payload.install_venv and (record.directory / "pyproject.toml").is_file():
         job = ctx.jobs.create("install_engine")
@@ -60,7 +76,14 @@ async def register_engine(payload: RegisterEngineRequest, request: Request):
 async def install_engine(engine_id: str, request: Request):
     ctx = request.app.state.ctx
     require_agent_mutation(ctx, request)
-    ctx.registry.get(engine_id)
+    record = ctx.registry.get(engine_id)
+    record_mutation(
+        ctx,
+        agent_id=request.headers.get("x-agent-id"),
+        action="install_engine",
+        engine_id=engine_id,
+        worker_path=record.directory / WORKER_NAME,
+    )
     job = ctx.jobs.create("install_engine")
     ctx.jobs.register_task(
         job.job_id, asyncio.create_task(_run_install(ctx, engine_id, job.job_id))
@@ -94,6 +117,14 @@ async def register_model(payload: RegisterModelRequest, request: Request):
         est_vram_gb=payload.est_vram_gb,
     )
 
+    record_mutation(
+        ctx,
+        agent_id=request.headers.get("x-agent-id"),
+        action="register_model",
+        engine_id=payload.engine_id,
+        model_alias=payload.model_alias,
+    )
+
     job_id = None
     if payload.download:
         job = ctx.jobs.create("download_model")
@@ -113,6 +144,13 @@ async def download_model(engine_id: str, model_alias: str, request: Request):
     ctx = request.app.state.ctx
     require_agent_mutation(ctx, request)
     ctx.registry.model_spec(engine_id, model_alias)
+    record_mutation(
+        ctx,
+        agent_id=request.headers.get("x-agent-id"),
+        action="download_model",
+        engine_id=engine_id,
+        model_alias=model_alias,
+    )
     job = ctx.jobs.create("download_model")
     ctx.jobs.register_task(
         job.job_id, asyncio.create_task(_run_download(ctx, engine_id, model_alias, job.job_id))

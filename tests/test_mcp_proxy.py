@@ -27,6 +27,65 @@ from agent_voice.mcp_stdio_proxy import _is_healthy
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+
+def payload(result):
+    """Unwrap a CallToolResult into plain JSON, recursively.
+
+    Tools that return a Pydantic model arrive as a ``Root`` wrapper (fastmcp
+    builds a RootModel output schema), and a list of models arrives as a list of
+    ``Root`` objects. Both carry exactly the same data as a dict, so tests should
+    not care which shape the server chose.
+    """
+    return _unwrap(result.data)
+
+
+def _unwrap(data):
+    if data is None or isinstance(data, (bool, int, float, bytes)):
+        return data
+    if isinstance(data, list):
+        return [_unwrap(item) for item in data]
+    if isinstance(data, tuple):
+        return [_unwrap(item) for item in data]
+    if isinstance(data, dict):
+        return {key: _unwrap(value) for key, value in data.items()}
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return data
+
+    # fastmcp wraps a tool's typed return in its own ``Root`` container. It is not
+    # a pydantic RootModel (no ``.root``), it simply exposes the model's fields as
+    # attributes and mirrors them in ``__dict__``. Pydantic models additionally
+    # offer ``model_dump``. Handle all three shapes so the tests assert on data,
+    # not on the transport's wrapper class.
+    dump = getattr(data, "model_dump", None)
+    if callable(dump):
+        return _unwrap(dump())
+    if hasattr(data, "__dict__") and data.__dict__:
+        return {key: _unwrap(value) for key, value in vars(data).items()}
+    return data
+
+
+async def call_expecting_error(client, name: str, arguments: dict) -> dict:
+    """Call a tool that must fail, returning its structured error payload.
+
+    v0.2 raises ``ToolError`` (so MCP clients see ``isError=true``) instead of
+    returning a dict with ``isError=false``, which clients could not distinguish
+    from success. The JSON body is unchanged, so this returns it parsed.
+    """
+    from fastmcp.exceptions import ToolError
+
+    try:
+        result = await client.call_tool(name, arguments)
+    except ToolError as exc:
+        return json.loads(str(exc))
+    raise AssertionError(
+        f"{name} should have raised ToolError, got a successful result: "
+        f"{payload(result)!r}"
+    )
+
+
 EXPECTED_TOOLS = {
     "server_info",
     "speak",
@@ -85,33 +144,52 @@ async def lifespan_driver(app: FastAPI) -> AsyncIterator[None]:
 
     ``combine_lifespans`` yields a mapping, and Starlette refuses to accept one
     unless ``scope['state']`` exists. This is the documented workaround.
+
+    Shutdown matters for wall-clock: the receive queue hands out exactly the two
+    lifespan messages and then signals end-of-stream. Anything else makes the
+    app task wait forever and every teardown pays the full timeout — which is
+    what made this suite take four minutes.
     """
-    receive_queue: list[dict[str, Any]] = [{"type": "lifespan.startup"}]
+    asyncio_mod = __import__("asyncio")
+    receive_queue: asyncio_mod.Queue[dict[str, Any]] = asyncio_mod.Queue()
     send_events: list[dict[str, Any]] = []
+    started: asyncio_mod.Event = asyncio_mod.Event()
+    stopped: asyncio_mod.Event = asyncio_mod.Event()
+
+    await receive_queue.put({"type": "lifespan.startup"})
 
     async def receive() -> dict[str, Any]:
-        if receive_queue:
-            return receive_queue.pop(0)
-        await __import__("asyncio").sleep(3600)
-        return {"type": "lifespan.startup"}  # pragma: no cover
+        return await receive_queue.get()
 
     async def send(message: dict[str, Any]) -> None:
         send_events.append(message)
+        if message["type"] == "lifespan.startup.complete":
+            started.set()
+        elif message["type"] in {
+            "lifespan.shutdown.complete",
+            "lifespan.shutdown.failed",
+        }:
+            stopped.set()
 
     scope = {"type": "lifespan", "asgi": {"version": "3.0"}, "state": {}}
-    task = __import__("asyncio").create_task(app(scope, receive, send))
+    task = asyncio_mod.create_task(app(scope, receive, send))
     try:
-        for _ in range(300):
-            if any(m["type"].startswith("lifespan.startup") for m in send_events):
-                break
-            await __import__("asyncio").sleep(0.01)
-        if not any(m["type"] == "lifespan.startup.complete" for m in send_events):
-            raise RuntimeError(f"lifespan failed to start: {send_events}")
+        # Poll the event, not a sleep loop, so startup is as fast as the app.
+        try:
+            await asyncio_mod.wait_for(started.wait(), timeout=30)
+        except (TimeoutError, asyncio_mod.TimeoutError) as exc:
+            raise RuntimeError(f"lifespan failed to start: {send_events}") from exc
         yield
     finally:
-        receive_queue.append({"type": "lifespan.shutdown"})
+        await receive_queue.put({"type": "lifespan.shutdown"})
         with contextlib.suppress(Exception):
-            await __import__("asyncio").wait_for(task, timeout=10)
+            await asyncio_mod.wait_for(stopped.wait(), timeout=10)
+        with contextlib.suppress(Exception):
+            await asyncio_mod.wait_for(task, timeout=5)
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await task
 
 
 @contextlib.asynccontextmanager
@@ -163,7 +241,7 @@ async def test_tools_have_descriptions(tmp_path):
 async def test_list_engines_reports_install_state(tmp_path):
     async with mcp_client(tmp_path) as (client, _app):
         result = await client.call_tool("list_engines", {})
-        engines = {e["engine_id"]: e for e in result.data["engines"]}
+        engines = {e["engine_id"]: e for e in payload(result)["engines"]}
         assert "mock" in engines
         assert engines["mock"]["installed"] is True
         # Every engine must explain itself when it cannot be used.
@@ -175,7 +253,7 @@ async def test_list_engines_reports_install_state(tmp_path):
 async def test_list_models_includes_hf_repo_and_download_state(tmp_path):
     async with mcp_client(tmp_path) as (client, _app):
         result = await client.call_tool("list_models", {})
-        models = result.data["models"]
+        models = payload(result)["models"]
         assert any(m["hf_repo"] == "Qwen/Qwen3-TTS-12Hz-1.7B-Base" for m in models)
         for model in models:
             assert "downloaded_locally" in model
@@ -186,7 +264,7 @@ async def test_list_models_includes_hf_repo_and_download_state(tmp_path):
 async def test_list_models_filters_by_engine(tmp_path):
     async with mcp_client(tmp_path) as (client, _app):
         result = await client.call_tool("list_models", {"engine_id": "mock"})
-        assert all(m["engine_id"] == "mock" for m in result.data["models"])
+        assert all(m["engine_id"] == "mock" for m in payload(result)["models"])
 
 
 @pytest.mark.asyncio
@@ -194,7 +272,7 @@ async def test_gpu_status_shape(tmp_path):
     async with mcp_client(tmp_path) as (client, _app):
         result = await client.call_tool("gpu_status", {})
         for key in ("active_engine", "workers", "queue_depth", "in_flight"):
-            assert key in result.data
+            assert key in payload(result)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +284,7 @@ async def test_gpu_status_shape(tmp_path):
 async def test_speak_returns_a_file_path_not_audio(tmp_path):
     async with mcp_client(tmp_path) as (client, _app):
         result = await client.call_tool("speak", {"text": "Hello from MCP."})
-        body = result.data
+        body = payload(result)
         assert Path(body["file_path"]).is_file()
         assert "audio" not in body
         assert "base64" not in json.dumps(body).lower()
@@ -217,16 +295,16 @@ async def test_speak_payload_is_compact(tmp_path):
     """Tool results are read by a model; they must stay small."""
     async with mcp_client(tmp_path) as (client, _app):
         result = await client.call_tool("speak", {"text": "Compact please."})
-        serialised = json.dumps(result.data)
+        serialised = json.dumps(payload(result))
         assert len(serialised) < 2000, f"result too large: {len(serialised)} bytes"
 
 
 @pytest.mark.asyncio
 async def test_speak_reports_structured_error_for_unknown_engine(tmp_path):
     async with mcp_client(tmp_path) as (client, _app):
-        result = await client.call_tool("speak", {"text": "Hi.", "engine": "nope"})
-        assert result.data["error_code"] == "ENGINE_NOT_FOUND"
-        assert result.data["suggestion"]
+        body = await call_expecting_error(client, "speak", {"text": "Hi.", "engine": "nope"})
+        assert body["error_code"] == "ENGINE_NOT_FOUND"
+        assert body["suggestion"]
 
 
 @pytest.mark.asyncio
@@ -236,8 +314,8 @@ async def test_speak_script_returns_timings(tmp_path):
             "speak_script",
             {"beats": [{"text": "One."}, {"text": "Two."}], "export_srt": True},
         )
-        assert len(result.data["beats"]) == 2
-        assert Path(result.data["srt_path"]).is_file()
+        assert len(payload(result)["beats"]) == 2
+        assert Path(payload(result)["srt_path"]).is_file()
 
 
 @pytest.mark.asyncio
@@ -248,12 +326,12 @@ async def test_start_script_job_then_get_job(tmp_path):
         started = await client.call_tool(
             "start_script_job", {"beats": [{"text": "Async beat."}]}
         )
-        job_id = started.data["job_id"]
+        job_id = payload(started)["job_id"]
         assert job_id
 
         job = None
         for _ in range(200):
-            job = (await client.call_tool("get_job", {"job_id": job_id})).data
+            job = payload(await client.call_tool("get_job", {"job_id": job_id}))
             if job["status"] in {"succeeded", "failed"}:
                 break
             await asyncio.sleep(0.05)
@@ -263,8 +341,8 @@ async def test_start_script_job_then_get_job(tmp_path):
 @pytest.mark.asyncio
 async def test_get_unknown_job_returns_structured_error(tmp_path):
     async with mcp_client(tmp_path) as (client, _app):
-        result = await client.call_tool("get_job", {"job_id": "nope"})
-        assert result.data["error_code"] == "BAD_REQUEST"
+        body = await call_expecting_error(client, "get_job", {"job_id": "nope"})
+        assert body["error_code"] == "BAD_REQUEST"
 
 
 # ---------------------------------------------------------------------------
@@ -287,12 +365,12 @@ async def test_clone_list_delete_voice(tmp_path):
         created = await client.call_tool(
             "clone_voice", {"name": "mcp-voice", "ref_audio_path": str(audio)}
         )
-        voice_id = created.data["voice_id"]
+        voice_id = payload(created)["voice_id"]
 
-        listed = (await client.call_tool("list_voices", {})).data["voices"]
+        listed = payload(await client.call_tool("list_voices", {}))["voices"]
         assert any(v["voice_id"] == voice_id for v in listed)
 
-        deleted = (await client.call_tool("delete_voice", {"voice_id": voice_id})).data
+        deleted = payload(await client.call_tool("delete_voice", {"voice_id": voice_id}))
         assert deleted["deleted"] == voice_id
 
 
@@ -305,10 +383,10 @@ async def test_clone_voice_rejects_short_clip(tmp_path):
     sf.write(audio, np.zeros(int(24_000 * 0.3), dtype=np.float32), 24_000)
 
     async with mcp_client(tmp_path) as (client, _app):
-        result = await client.call_tool(
-            "clone_voice", {"name": "short", "ref_audio_path": str(audio)}
+        body = await call_expecting_error(
+            client, "clone_voice", {"name": "short", "ref_audio_path": str(audio)}
         )
-        assert result.data["error_code"] == "INVALID_REF_AUDIO"
+        assert body["error_code"] == "INVALID_REF_AUDIO"
 
 
 # ---------------------------------------------------------------------------
@@ -324,10 +402,10 @@ async def test_x_agent_id_selects_binding(tmp_path):
             "set_agent_binding",
             {"agent_id": "agent-xyz", "engine_id": "mock", "model_alias": "mock-tone"},
         )
-        bindings = (await client.call_tool("list_agent_bindings", {})).data["bindings"]
+        bindings = payload(await client.call_tool("list_agent_bindings", {}))["bindings"]
         assert any(b["agent_id"] == "agent-xyz" for b in bindings)
 
-        spoken = (await client.call_tool("speak", {"text": "Routed by header."})).data
+        spoken = payload(await client.call_tool("speak", {"text": "Routed by header."}))
         assert spoken["engine_id"] == "mock"
 
 
@@ -335,7 +413,7 @@ async def test_x_agent_id_selects_binding(tmp_path):
 async def test_missing_agent_header_still_works(tmp_path):
     """No X-Agent-Id must not break anything: it falls back to server defaults."""
     async with mcp_client(tmp_path) as (client, _app):
-        spoken = (await client.call_tool("speak", {"text": "No header."})).data
+        spoken = payload(await client.call_tool("speak", {"text": "No header."}))
         assert spoken["engine_id"] == "mock"
 
 
@@ -346,23 +424,38 @@ async def test_missing_agent_header_still_works(tmp_path):
 
 @pytest.mark.asyncio
 async def test_mutation_disabled_blocks_register_engine(tmp_path):
+    """With the core toolset the mutation tool is absent, not merely refusing.
+
+    v0.2 hides mutation tools unless the operator opts in, so the observable
+    contract is "the tool does not exist" rather than an AGENT_MUTATION_DISABLED
+    payload.
+    """
     async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
-        result = await client.call_tool(
-            "register_engine",
-            {"engine_id": "neweng", "engine_yaml_content": "backend_name: x\n"},
-        )
-        assert result.data["error_code"] == "AGENT_MUTATION_DISABLED"
-        assert "ALLOW_AGENT_ENGINE_MUTATION" in result.data["suggestion"]
+        names = {tool.name for tool in await client.list_tools()}
+        assert "register_engine" not in names
+        assert len(names) == 10
 
 
 @pytest.mark.asyncio
 async def test_mutation_disabled_blocks_register_model(tmp_path):
     async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
-        result = await client.call_tool(
-            "register_model",
-            {"engine_id": "mock", "model_alias": "x-model", "hf_repo": "a/b"},
+        names = {tool.name for tool in await client.list_tools()}
+        assert "register_model" not in names
+
+
+@pytest.mark.asyncio
+async def test_mutation_refused_when_toolset_full_but_flag_off(tmp_path):
+    """`toolset=full` exposes the tools; the flag still refuses them at call time."""
+    async with mcp_client(
+        tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false", AGENT_VOICE_TOOLSET="full"
+    ) as (client, _app):
+        body = await call_expecting_error(
+            client,
+            "register_engine",
+            {"engine_id": "neweng", "engine_yaml_content": "backend_name: x\n"},
         )
-        assert result.data["error_code"] == "AGENT_MUTATION_DISABLED"
+        assert body["error_code"] == "AGENT_MUTATION_DISABLED"
+        assert "ALLOW_AGENT_ENGINE_MUTATION" in body["suggestion"]
 
 
 @pytest.mark.asyncio
@@ -384,20 +477,25 @@ async def test_register_engine_succeeds_when_enabled(tmp_path):
                 "install_venv": False,
             },
         )
-        assert result.data["engine_id"] == "agenteng"
+        assert payload(result)["engine_id"] == "agenteng"
 
-        engines = (await client.call_tool("list_engines", {})).data["engines"]
+        engines = payload(await client.call_tool("list_engines", {}))["engines"]
         assert any(e["engine_id"] == "agenteng" for e in engines), "must hot-reload"
 
 
 @pytest.mark.asyncio
 async def test_register_engine_rejects_traversal(tmp_path):
-    async with mcp_client(tmp_path) as (client, _app):
-        result = await client.call_tool(
+    """Path traversal must be refused, and nothing may be written outside engines/."""
+    async with mcp_client(
+        tmp_path, ALLOW_AGENT_ENGINE_MUTATION="true", AGENT_VOICE_TOOLSET="full"
+    ) as (client, _app):
+        body = await call_expecting_error(
+            client,
             "register_engine",
             {"engine_id": "../../evil", "engine_yaml_content": "backend_name: x\n"},
         )
-        assert "error_code" in result.data
+        assert body["error_code"] in {"INVALID_SLUG", "MANIFEST_INVALID", "BAD_REQUEST"}
+        assert not (tmp_path / "evil").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +510,7 @@ async def test_artifacts_land_inside_mcp_base(tmp_path):
     sandbox.mkdir()
 
     async with mcp_client(tmp_path, MCP_BASE_PATH=str(sandbox)) as (client, _app):
-        body = (await client.call_tool("speak", {"text": "Sandboxed."})).data
+        body = payload(await client.call_tool("speak", {"text": "Sandboxed."}))
         path = Path(body["file_path"])
         assert path.is_file()
         assert sandbox.resolve() in path.parents
@@ -430,10 +528,10 @@ async def test_clone_voice_confined_to_mcp_base(tmp_path):
     sf.write(outside, np.zeros(24_000 * 5, dtype=np.float32), 24_000)
 
     async with mcp_client(tmp_path, MCP_BASE_PATH=str(sandbox)) as (client, _app):
-        result = await client.call_tool(
-            "clone_voice", {"name": "escape", "ref_audio_path": str(outside)}
+        body = await call_expecting_error(
+            client, "clone_voice", {"name": "escape", "ref_audio_path": str(outside)}
         )
-        assert result.data["error_code"] == "PATH_OUTSIDE_BASE"
+        assert body["error_code"] == "PATH_OUTSIDE_BASE"
 
 
 # ---------------------------------------------------------------------------

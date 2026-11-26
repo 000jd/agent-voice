@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -57,7 +58,23 @@ class Settings(BaseSettings):
     allow_agent_engine_mutation: bool = Field(
         default=False, alias="ALLOW_AGENT_ENGINE_MUTATION"
     )
+    require_engine_approval: bool = Field(
+        default=False, alias="REQUIRE_ENGINE_APPROVAL"
+    )
+    """When true, register_engine stages a plugin under engines/.pending/<id>/
+    instead of activating it. An operator promotes it with `engines approve`."""
+    toolset: Literal["auto", "core", "full"] = Field(default="auto", alias="AGENT_VOICE_TOOLSET")
+    """Which MCP tools to expose.
+
+    ``auto`` exposes the read/synthesis surface when agent mutation is disabled,
+    and the full surface when it is enabled. ``core`` and ``full`` force it.
+    """
     mcp_base_path: str = Field(default="", alias="MCP_BASE_PATH")
+
+    # --- HTTP security --------------------------------------------------
+    allowed_hosts: list[str] = Field(default_factory=list, alias="AGENT_VOICE_ALLOWED_HOSTS")
+    """Extra Host header values accepted by the DNS-rebinding guard, beyond the
+    loopback defaults. Accepts a comma-separated string from the environment."""
 
     # --- Paths ----------------------------------------------------------
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
@@ -68,6 +85,14 @@ class Settings(BaseSettings):
     def _validate_lufs(cls, value: float) -> float:
         if not -40.0 <= value <= -5.0:
             raise ValueError("NORMALIZE_LUFS must be between -40 and -5")
+        return value
+
+    @field_validator("allowed_hosts", mode="before")
+    @classmethod
+    def _split_hosts(cls, value: object) -> object:
+        """Accept `a,b,c` from the environment as well as a real list."""
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
         return value
 
     @field_validator("data_dir", "engines_dir")

@@ -34,9 +34,20 @@ CACHE_KEY_FIELDS: tuple[str, ...] = (
     "response_format",
     "normalize_lufs",
     "chunk_chars",
+    "take",
+    "hf_repo",
+    "model_revision",
 )
-"""Every field that can change the audio. Adding one invalidates nothing by
-itself — old entries simply never match a new key — but it must be deliberate."""
+"""Every field that can change the audio.
+
+``hf_repo`` and ``model_revision`` are included so that pointing an alias at a
+different repository, or pulling updated weights for the same repo, can never
+serve audio rendered by the old model. That is worth a cold cache: silently
+returning the wrong voice is far worse than re-rendering.
+
+Adding a field here invalidates every existing entry by design — old keys simply
+never match again.
+"""
 
 
 INTERNAL_META_KEYS: frozenset[str] = frozenset(

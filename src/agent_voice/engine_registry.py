@@ -82,10 +82,41 @@ class EngineRecord:
             return candidate
         return (self.directory / candidate).absolute()
 
+    def worker_command(self) -> list[str]:
+        """Argv that starts this engine's worker.
+
+        Transport-agnostic on purpose: the caller owns the environment (notably
+        the IPC endpoint in ``AGENT_VOICE_IPC_*``) and decides whether to spawn.
+        The registry itself never starts a process.
+        """
+        return [str(self.venv_python), str(self.directory / WORKER_NAME)]
+
 
 def _hf_cache_path(hf_repo: str) -> Path:
     org, _, name = hf_repo.partition("/")
     return Path.home() / ".cache" / "huggingface" / "hub" / f"models--{org}--{name}"
+
+
+def model_revision(hf_repo: str) -> str:
+    """Best-effort local revision of ``hf_repo`` for the synthesis cache key.
+
+    Re-pulling weights must change the key, otherwise a cached render from the old
+    snapshot is served as if it were the new model's. Returning the commit hash
+    from the HF cache's ``refs/main`` is the only pointer we have before (or
+    without) a worker, and it is a plain file read — no network, no hub client.
+
+    ``"local"`` marks a repo that is not an HF repo at all (``local/mock-tone``),
+    and ``"unknown"`` means the repo may be remote but was never resolved on this
+    machine. Both are honest: neither invents a version.
+    """
+    if "/" not in hf_repo or hf_repo.startswith("local/"):
+        return "local"
+    ref = _hf_cache_path(hf_repo) / "refs" / "main"
+    try:
+        revision = ref.read_text("utf-8").strip()
+    except OSError:
+        return "unknown"
+    return revision or "unknown"
 
 
 def hf_model_downloaded(hf_repo: str) -> bool:

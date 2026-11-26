@@ -36,7 +36,7 @@ from .audio_utils import chunk_text, crossfade_stitch
 from .cache import CacheEntry, SynthesisCache, build_cache_key
 from .clock import Clock, get_clock
 from .config import Settings
-from .engine_registry import EngineRecord, EngineRegistry
+from .engine_registry import EngineRecord, EngineRegistry, model_revision
 from .ipc.transport import (
     IS_WINDOWS,
     AsyncConnection,
@@ -681,6 +681,39 @@ class WorkerManager:
         handle.model_last_used[model_alias] = self.clock.now()
 
     # -- public synthesis ----------------------------------------------
+    @staticmethod
+    def _effective_seed(seed: int | None, take: int | None) -> int | None:
+        """Resolve ``seed`` vs ``take`` into the seed actually sent to the worker.
+
+        Precedence: an explicit ``seed`` always wins and ``take`` then only affects
+        the cache key (so a caller can still ask for a distinct take of a pinned
+        seed). Without ``seed``, ``take`` derives ``10007 * take`` — deterministic
+        and well separated between takes, which is what makes take=2 both
+        reproducible and cache-stable.
+        """
+        if seed is not None:
+            return seed
+        if take is not None:
+            return 10007 * take
+        return None
+
+    @staticmethod
+    def _real_time_factor(elapsed_ms: int, duration_sec: float) -> float | None:
+        """Speech duration divided by wall clock: >1.0 means faster than real time.
+
+        This is the definition the public contract states, so a render that takes
+        10.5 s to produce 9.0 s of audio is 0.86 (slower than real time), and one
+        that produces 1.92 s in 0.27 s is 7.1 (about 7x faster).
+
+        ``None`` when the duration is unknown (a non-WAV cache entry written before
+        the sidecar existed). On a cache hit ``elapsed_ms`` is only the lookup cost,
+        so the factor is enormous — that is the truthful number for "this call",
+        and it is why a caller comparing RTFs must also look at ``cached``.
+        """
+        if duration_sec <= 0 or elapsed_ms <= 0:
+            return None
+        return duration_sec / (elapsed_ms / 1000.0)
+
     async def synthesize(
         self,
         *,
@@ -694,8 +727,14 @@ class WorkerManager:
         seed: int | None = None,
         speed: float = 1.0,
         response_format: str = "wav",
+        take: int | None = None,
     ) -> SynthesisResult:
-        """Synthesise to a file. Cache is consulted before any worker exists."""
+        """Synthesise to a file. Cache is consulted before any worker exists.
+
+        ``take`` requests an alternate delivery of the same line. It is part of the
+        cache key, so take=2 gets its own cache entry and never shadows take=1.
+        """
+        effective_seed = self._effective_seed(seed, take)
         started = self.clock.monotonic()
         cache_key = await self._cache_key(
             engine_id=engine_id,
@@ -705,9 +744,10 @@ class WorkerManager:
             ref_text=ref_text,
             x_vector_only=x_vector_only,
             language=language,
-            seed=seed,
+            seed=effective_seed,
             speed=speed,
             response_format=response_format,
+            take=take,
         )
         cached = self.cache.get(cache_key)
         if cached is not None:
@@ -719,6 +759,7 @@ class WorkerManager:
                 voice_id=voice_id,
                 response_format=response_format,
                 started=started,
+                take=take,
             )
 
         from .security import resolve_artifact_path
@@ -778,7 +819,7 @@ class WorkerManager:
                             "prompt_cache_path": prompt_cache_path,
                             "wav_path": str(chunk_out),
                             "language": language,
-                            "seed": seed,
+                            "seed": effective_seed,
                             "speed": speed,
                         },
                         timeout=1800.0,
@@ -865,6 +906,7 @@ class WorkerManager:
                 with contextlib.suppress(OSError):
                     path.unlink(missing_ok=True)
 
+        elapsed_ms = self._elapsed_ms(started)
         return SynthesisResult(
             artifact_id=artifact_id,
             file_path=str(final),
@@ -879,7 +921,9 @@ class WorkerManager:
             cached=False,
             download_url=f"/audio/{artifact_id}",
             chunks_used=chunks_used,
-            elapsed_ms=self._elapsed_ms(started),
+            elapsed_ms=elapsed_ms,
+            take=take,
+            real_time_factor=self._real_time_factor(elapsed_ms, duration_sec),
         )
 
     def _cached_result(
@@ -892,6 +936,7 @@ class WorkerManager:
         voice_id: str | None,
         response_format: str,
         started: float,
+        take: int | None = None,
     ) -> SynthesisResult:
         """Materialise a cache hit. Never touches the GPU.
 
@@ -922,6 +967,7 @@ class WorkerManager:
         else:
             duration_sec = 0.0
 
+        elapsed_ms = self._elapsed_ms(started)
         return SynthesisResult(
             artifact_id=artifact_id,
             file_path=str(target),
@@ -936,7 +982,10 @@ class WorkerManager:
             cached=True,
             download_url=f"/audio/{artifact_id}",
             chunks_used=int(meta.get("chunks_used") or 1),
-            elapsed_ms=self._elapsed_ms(started),
+            elapsed_ms=elapsed_ms,
+            take=take,
+            # A hit only paid the lookup, so this factor is huge by construction.
+            real_time_factor=self._real_time_factor(elapsed_ms, duration_sec),
         )
 
     def _elapsed_ms(self, started: float) -> int:
@@ -954,13 +1003,20 @@ class WorkerManager:
         language: str = "Auto",
         seed: int | None = None,
         speed: float = 1.0,
+        take: int | None = None,
     ) -> tuple[uuid.UUID, asyncio.Queue[bytes], str]:
         """Start a PCM stream. Returns (stream_id, queue, streaming_mode).
 
         The queue is bounded. A consumer that stops draining it eventually hits
         ``BACKPRESSURE`` and the worker is cancelled rather than buffering audio
         without limit.
+
+        ``take`` is accepted for call-site symmetry with :meth:`synthesize`, but a
+        stream has no cache entry and no ``SynthesisResult`` to report it on, so it
+        cannot select a stored alternate delivery. It still derives the seed (see
+        :meth:`_effective_seed`), so take=2 does stream different audio.
         """
+        effective_seed = self._effective_seed(seed, take)
         # Hold the engine lock until the streaming RPC has been sent and its
         # request id registered, then hand the lock to the background task, which
         # releases it when generation ends. That keeps "one GPU RPC per engine"
@@ -1001,7 +1057,7 @@ class WorkerManager:
                             "x_vector_only_mode": x_vector_only,
                             "prompt_cache_path": None,
                             "language": language,
-                            "seed": seed,
+                            "seed": effective_seed,
                             "speed": speed,
                         },
                         timeout=1800.0,
@@ -1233,8 +1289,21 @@ class WorkerManager:
         seed: int | None,
         speed: float,
         response_format: str,
+        take: int | None = None,
     ) -> str:
         record = self.registry.get(engine_id)
+        # Which weights this alias resolves to belongs in the key: re-pointing an
+        # alias, or pulling a new snapshot of the same repo, must never serve the
+        # old model's audio. An unknown alias is not an error here — the worker
+        # reports MODEL_NOT_FOUND with a proper suggestion once it is asked to load
+        # it, and the key still has to be computable to get that far.
+        try:
+            spec = self.registry.model_spec(engine_id, model_alias)
+            hf_repo = spec.hf_repo
+            revision = model_revision(hf_repo)
+        except AgentVoiceError:
+            hf_repo = ""
+            revision = "unknown"
         ref_sha = ""
         if voice_id:
             from .voice_store import sha256_file
@@ -1258,6 +1327,9 @@ class WorkerManager:
             response_format=response_format,
             normalize_lufs=self.settings.normalize_lufs,
             chunk_chars=self.settings.chunk_chars,
+            take=take,
+            hf_repo=hf_repo,
+            model_revision=revision,
         )
 
     @staticmethod
