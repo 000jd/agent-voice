@@ -633,3 +633,51 @@ async def test_design_to_clone_bridge_releases_vram(tmp_path):
         )
     finally:
         await ctx.workers.stop()
+
+
+@pytest.mark.asyncio
+async def test_design_candidates_render_and_save_reuses_cache(tmp_path):
+    """candidates=2 renders two takes; saving one reuses the cached artifact."""
+    _require_model("qwen3_tts_fast", "1.7b-design")
+
+    settings = _settings(tmp_path)
+    settings.ensure_dirs()
+    ctx = AppContext(settings)
+    await ctx.workers.start()
+    try:
+        result = await render_design(
+            ctx,
+            DesignVoiceRequest(
+                name="gpu-candidates",
+                instruct=DESIGN_INSTRUCT,
+                engine="qwen3_tts_fast",
+                quality="high",
+                candidates=2,
+            ),
+        )
+        assert result.voice_id is None, "multi-candidate renders never save a voice"
+        assert [candidate.take for candidate in result.candidates] == [1, 2]
+        paths = {candidate.file_path for candidate in result.candidates}
+        assert len(paths) == 2, "each take must produce its own artifact"
+        for candidate in result.candidates:
+            _assert_valid_wav(candidate.file_path, min_seconds=0.2)
+
+        chosen = result.candidates[1]
+        saved = await render_design(
+            ctx,
+            DesignVoiceRequest(
+                name="gpu-candidates",
+                instruct=DESIGN_INSTRUCT,
+                engine="qwen3_tts_fast",
+                quality="high",
+                take=chosen.take,
+                save_as_clone=True,
+            ),
+        )
+        assert saved.voice_id is not None
+        assert saved.preview_file_path == chosen.file_path, (
+            "saving the chosen take must reuse the cached candidate artifact"
+        )
+        _assert_valid_wav(saved.preview_file_path, min_seconds=0.2)
+    finally:
+        await ctx.workers.stop()

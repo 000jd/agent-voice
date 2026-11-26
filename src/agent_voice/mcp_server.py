@@ -31,6 +31,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers, get_http_request
 from mcp_types import ToolAnnotations
 
+from .pronunciations import prepare_text
 from .schemas import (
     DEFAULT_DESIGN_SAMPLE_TEXT,
     AgentVoiceError,
@@ -333,6 +334,7 @@ def build_mcp_server(ctx) -> FastMCP:
         seed: int | None = None,
         speed: float = 1.0,
         take: int | None = None,
+        pronunciations: dict[str, str] | None = None,
     ) -> SynthesisResult:
         """Synthesise ONE utterance to a file. For several beats use speak_script().
 
@@ -354,6 +356,8 @@ def build_mcp_server(ctx) -> FastMCP:
             take: Alternate delivery of the same line. take=2 derives a repeatable
                 new seed, so you can audition a different read of one line without
                 losing the canonical one. Omit for the canonical delivery.
+            pronunciations: Per-call word -> spoken-form overrides for this line,
+                e.g. {"kubectl": "kube control"}. Merged over the server lexicon.
 
         Read:
             file_path: absolute local path; read this. Audio is never returned inline.
@@ -390,6 +394,7 @@ def build_mcp_server(ctx) -> FastMCP:
                 seed=seed,
                 speed=speed,
                 take=take,
+                pronunciations=pronunciations,
             )
             if len(request.text) > settings.max_text_chars:
                 raise AgentVoiceError(
@@ -398,6 +403,11 @@ def build_mcp_server(ctx) -> FastMCP:
                     f"{settings.max_text_chars}",
                     "Split it up or use speak_script.",
                 )
+            # Rewritten after the limit check: the caller is told off for what it
+            # sent, not for a spoken form an expansion made longer.
+            spoken_text, pronunciations_hash = prepare_text(
+                ctx.pronunciations, request.text, request.pronunciations
+            )
             target = resolve_target(
                 settings=settings,
                 registry=ctx.registry,
@@ -414,7 +424,7 @@ def build_mcp_server(ctx) -> FastMCP:
             return await ctx.workers.synthesize(
                 engine_id=target.engine_id,
                 model_alias=target.model_alias,
-                text=request.text,
+                text=spoken_text,
                 voice_id=target.voice_id,
                 ref_text=target.ref_text,
                 x_vector_only=target.x_vector_only,
@@ -429,6 +439,7 @@ def build_mcp_server(ctx) -> FastMCP:
                 speed=request.speed,
                 response_format=request.format,
                 take=request.take,
+                pronunciations_hash=pronunciations_hash,
             )
         except AgentVoiceError as exc:
             _raise_tool_error(exc)
@@ -442,6 +453,7 @@ def build_mcp_server(ctx) -> FastMCP:
         format: ResponseFormat = "wav",
         export_srt: bool = True,
         pause_after_sec: float = 0.0,
+        pronunciations: dict[str, str] | None = None,
     ) -> ScriptResult:
         """Synthesise a multi-beat script into one stitched file with exact timings.
 
@@ -455,6 +467,7 @@ def build_mcp_server(ctx) -> FastMCP:
         Returns `file_path`, `duration_sec`, `beats[]` (start_sec, end_sec,
         voice_id, cached, artifact_id) and, when export_srt, `srt_path` and
         `timing_json_path`. Full field guide: resource agent-voice://guide.
+        `pronunciations` maps words to spoken forms for every beat.
         """
         try:
             payload = ScriptRequest(
@@ -464,6 +477,7 @@ def build_mcp_server(ctx) -> FastMCP:
                 quality=quality,
                 format=format,
                 export_srt=export_srt,
+                pronunciations=pronunciations,
             )
             return await render_script(ctx, payload, agent_id=_agent_id())
         except AgentVoiceError as exc:
@@ -478,15 +492,16 @@ def build_mcp_server(ctx) -> FastMCP:
         format: ResponseFormat = "wav",
         export_srt: bool = True,
         pause_after_sec: float = 0.0,
+        pronunciations: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Start a script render in the background and return a job id immediately.
 
         Use it when a script is long enough that blocking the tool call would time
         out or stall your loop; each call creates a new job, so this is not
         idempotent — reuse the job_id instead of re-submitting. Takes exactly the
-        same `beats` and the same call-level `pause_after_sec` default as
-        speak_script (see BeatSpec for per-beat `pause_after_sec`, `voice`,
-        `speaker`, `instruct`, `fit_mode` and `take`).
+        same `beats`, the same call-level `pause_after_sec` default and the same
+        `pronunciations` overrides as speak_script (see BeatSpec for per-beat
+        `pause_after_sec`, `voice`, `speaker`, `instruct`, `fit_mode` and `take`).
 
         Read:
             job_id: pass it to get_job(). Progress advances beat by beat, and the
@@ -502,6 +517,7 @@ def build_mcp_server(ctx) -> FastMCP:
                 quality=quality,
                 format=format,
                 export_srt=export_srt,
+                pronunciations=pronunciations,
             )
             job = ctx.jobs.create("script")
             # Captured before the task starts: get_http_headers() is only valid
@@ -628,6 +644,7 @@ def build_mcp_server(ctx) -> FastMCP:
         engine: str | None = None,
         model: str | None = None,
         quality: QualityTier = "high",
+        candidates: int = 1,
     ) -> DesignVoiceResult:
         """Design a new voice from a written description; no reference clip needed.
 
@@ -643,25 +660,45 @@ def build_mcp_server(ctx) -> FastMCP:
             overwrite: Replace an existing voice with this name.
             take, seed: Alternate/repeatable deliveries, as in speak().
             engine, model, quality: Which checkpoint does the designing.
+            candidates: 1-5 takes to audition; all are returned in `candidates`.
+
+        Read:
+            voice_id: pass as `voice`; null when save_as_clone is false.
+            preview_file_path: the first take, playable immediately.
+            candidates[]: take, seed, file_path, duration_sec — one per take.
         """
         try:
-            return await render_design(
-                ctx,
-                DesignVoiceRequest(
+            if not 1 <= candidates <= 5:
+                raise AgentVoiceError(
+                    ErrorCode.BAD_REQUEST,
+                    f"candidates must be between 1 and 5, got {candidates}",
+                    "Ask for candidates=1 when a single voice is enough.",
+                )
+            try:
+                payload = DesignVoiceRequest(
                     name=name,
                     instruct=instruct,
                     sample_text=sample_text,
                     language=language,
                     save_as_clone=save_as_clone,
+                    candidates=candidates,
                     take=take,
                     seed=seed,
                     overwrite=overwrite,
                     engine=engine,
                     model=model,
                     quality=quality,
-                ),
-                agent_id=_agent_id(),
-            )
+                )
+            except ValueError as exc:
+                # A pydantic ValidationError is a ValueError: an unusable name or
+                # take must still surface as the canonical JSON error body rather
+                # than an unstructured tool exception.
+                raise AgentVoiceError(
+                    ErrorCode.BAD_REQUEST,
+                    f"invalid voice design request: {exc}",
+                    "Use a name of 1-64 letters, digits, spaces, '.', '-' or '_'.",
+                ) from exc
+            return await render_design(ctx, payload, agent_id=_agent_id())
         except AgentVoiceError as exc:
             _raise_tool_error(exc)
 

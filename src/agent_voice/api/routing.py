@@ -289,6 +289,17 @@ def resolve_target(
             "Drop voice/speaker: the forced mode chooses its own timbre source.",
         )
 
+    if len(instruct) > settings.max_instruct_chars:
+        # Central for every path: speak, each script beat, and design_voice.
+        # Reject before any binding/registry work so a huge prompt never wakes a
+        # worker or reaches a tokenizer.
+        raise AgentVoiceError(
+            ErrorCode.TEXT_TOO_LONG,
+            f"instruct is {len(instruct)} characters, limit is "
+            f"{settings.max_instruct_chars}",
+            "Shorten the delivery/voice description; a sentence or two is enough.",
+        )
+
     engine_from_model, alias_from_model = parse_model_selector(model)
 
     # An OpenAI model name expresses a tier. Apply it, but never let it override

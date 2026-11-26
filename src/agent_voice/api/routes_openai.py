@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 
+from ..pronunciations import prepare_text
 from ..schemas import AgentVoiceError, ErrorCode, SpeakRequest, SpeechRequest
 from .routing import resolve_target
 
@@ -118,9 +119,15 @@ async def run_synthesis(
     speaker: str | None = None,
     instruct: str = "",
     openai_voice_compat: bool = False,
+    pronunciations: dict[str, str] | None = None,
 ):
     ctx = request.app.state.ctx
     _validate_text(request, text)
+
+    # Validated before the rewrite on purpose: the limit is about what the caller
+    # sent. The spoken form and the hash of the map that produced it travel
+    # together, so a lexicon edit invalidates exactly the audio it changes.
+    text, pronunciations_hash = prepare_text(ctx.pronunciations, text, pronunciations)
 
     if openai_voice_compat:
         # Either a local voice or a preset speaker comes back; routing turns that
@@ -159,6 +166,7 @@ async def run_synthesis(
         speed=speed,
         response_format=response_format,
         take=take,
+        pronunciations_hash=pronunciations_hash,
     )
 
 
@@ -222,6 +230,8 @@ async def agent_speak(payload: SpeakRequest, request: Request):
         take=payload.take,
         speaker=payload.speaker,
         instruct=payload.instruct,
+        # Per-call overrides; the persistent lexicon applies underneath them.
+        pronunciations=payload.pronunciations,
     )
     return result.model_dump(mode="json")
 

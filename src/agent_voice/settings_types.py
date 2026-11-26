@@ -24,9 +24,14 @@ class SettingsLike(Protocol):
     min_engine_residency_seconds: float
     min_free_vram_gb: float
     enable_vram_pressure_yield: bool
+    max_queue_depth: int
     max_cache_gb: float
     chunk_chars: int
     max_text_chars: int
+    max_script_beats: int
+    max_instruct_chars: int
+    max_design_sample_chars: int
+    max_ref_text_chars: int
     normalize_lufs: float
     stream_queue_maxsize: int
     stream_queue_timeout_seconds: float
@@ -52,6 +57,9 @@ class SettingsLike(Protocol):
 
     @property
     def bindings_path(self) -> Path: ...
+
+    @property
+    def pronunciations_path(self) -> Path: ...
 
     @property
     def daemon_lock_path(self) -> Path: ...

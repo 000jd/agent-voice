@@ -47,6 +47,7 @@ from ..cache import SynthesisCache
 from ..config import Settings, get_settings
 from ..engine_registry import EngineRegistry
 from ..job_store import JobStore
+from ..pronunciations import PronunciationStore
 from ..schemas import (
     PROTOCOL_VERSION,
     AgentVoiceError,
@@ -105,8 +106,11 @@ class AppContext:
         self.settings.ensure_dirs()
         self.registry = EngineRegistry(settings.engines_dir)
         self.cache = SynthesisCache(settings.cache_dir, max_gb=settings.max_cache_gb)
-        self.voices = VoiceStore(settings.voices_dir)
+        self.voices = VoiceStore(
+            settings.voices_dir, max_ref_text_chars=settings.max_ref_text_chars
+        )
         self.bindings = BindingStore(settings.bindings_path)
+        self.pronunciations = PronunciationStore(settings.pronunciations_path)
         self.jobs = JobStore(settings.jobs_dir)
         self.workers = WorkerManager(
             settings=settings,

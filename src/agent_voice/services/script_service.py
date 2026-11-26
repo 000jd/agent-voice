@@ -26,6 +26,7 @@ from ..audio_utils import (
     write_srt,
     write_vtt,
 )
+from ..pronunciations import apply_pronunciations, pronunciation_hash
 from ..schemas import (
     AgentVoiceError,
     BeatSpec,
@@ -71,6 +72,9 @@ async def render_script(
 ) -> ScriptResult:
     """Render a multi-beat script into one stitched artifact.
 
+    Each beat's spoken text passes through the pronunciation lexicon, but the
+    returned timings and subtitles keep the words as the caller wrote them.
+
     Args:
         ctx: Application context (settings, registry, workers, voices, jobs).
         payload: Beats plus their defaults.
@@ -81,6 +85,23 @@ async def render_script(
         raise AgentVoiceError(
             ErrorCode.BAD_REQUEST, "script has no beats", "Provide at least one beat."
         )
+
+    beat_limit = ctx.settings.max_script_beats
+    if len(payload.beats) > beat_limit:
+        # Before routing and before the work directory: a script over the limit is
+        # rejected at admission, so a runaway job never reserves GPU time or leaves
+        # a scratch directory behind.
+        raise AgentVoiceError(
+            ErrorCode.BAD_REQUEST,
+            f"script has {len(payload.beats)} beats, limit is {beat_limit}",
+            "Split it into smaller scripts or raise MAX_SCRIPT_BEATS.",
+        )
+
+    # One map and one hash for the whole script: the persistent lexicon plus this
+    # call's overrides. The hash goes into every per-beat cache key, so editing the
+    # lexicon can never serve audio rendered from the old one.
+    pron_map = ctx.pronunciations.effective(payload.pronunciations)
+    pron_hash = pronunciation_hash(pron_map)
 
     # Every beat may name its own voice/engine/model — that is what makes a
     # multi-speaker podcast possible — but most scripts repeat the same tuple, so
@@ -143,7 +164,9 @@ async def render_script(
             result = await ctx.workers.synthesize(
                 engine_id=target.engine_id,
                 model_alias=target.model_alias,
-                text=beat.text,
+                # Only the spoken text is rewritten; beat.text stays the caller's
+                # words for the timings and the subtitles.
+                text=apply_pronunciations(beat.text, pron_map),
                 voice_id=target.voice_id,
                 ref_text=target.ref_text,
                 x_vector_only=target.x_vector_only,
@@ -157,6 +180,7 @@ async def render_script(
                 speed=1.0,
                 response_format="wav",
                 take=beat.take,
+                pronunciations_hash=pron_hash,
             )
             segment = work_dir / f"beat-{index:03d}.wav"
             segment.write_bytes(Path(result.file_path).read_bytes())
@@ -242,6 +266,9 @@ async def render_script(
             timings.append(
                 BeatTiming(
                     index=beat_index,
+                    # Deliberately the original words: a pronunciation rewrite is
+                    # how the line is spoken, not what was scripted, so subtitles
+                    # must keep showing "kubectl" rather than "kube control".
                     text=beat.text,
                     duration_sec=round(span, 4),
                     start_sec=round(start, 4),

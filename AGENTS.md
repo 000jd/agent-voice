@@ -54,6 +54,11 @@ AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""
 # the same path on the mock engine, which ships custom_voice and voice_design aliases
 .venv/bin/agent-voice voices design probe --engine mock --model mock-design \
   --instruct "quiet and precise"
+
+# pronunciation lexicon — persistent data/pronunciations.json, applies to every render
+.venv/bin/agent-voice pronunciations list
+.venv/bin/agent-voice pronunciations set kubectl "cube control"
+.venv/bin/agent-voice pronunciations delete kubectl
 ```
 
 `engines test <id>` is the fastest way to prove an engine still speaks protocol v1: it spawns a
@@ -64,7 +69,8 @@ anything in the worker, the transport or the manager.
 `voices design` is the same in-process pattern the conformance test and the Manim demo use: build
 an `AppContext`, `await ctx.workers.start()`, call the service, `await ctx.workers.stop()` inside
 `asyncio.run`. No running daemon is involved, which is why every heavy import stays inside the
-command body.
+command body. `--candidates 2..5` renders several takes to audition and saves none; re-run with
+`--take <n> --save-as-clone` (no `--seed`) to register the winner from the cache.
 
 ## Security defaults
 
@@ -77,8 +83,14 @@ command body.
 - **Loopback by default end to end.** The server binds `127.0.0.1`, a Host/Origin guard rejects
   DNS-rebinding attempts, and `/audio` sits behind the bearer token because an artifact is the
   user's own speech. Set `AGENT_VOICE_API_KEY` before exposing anything.
-- `REQUIRE_ENGINE_APPROVAL=true` stages agent-authored plugins under `engines/.pending/<id>/`
-  for `agent-voice engines approve <id>` instead of activating them.
+- **Input caps are admission control.** `MAX_SCRIPT_BEATS=200`, `MAX_INSTRUCT_CHARS=1000`,
+  `MAX_DESIGN_SAMPLE_CHARS=500` and `MAX_REF_TEXT_CHARS=2000` are checked before routing and
+  before a worker is spawned, so an oversized request costs a round-trip and no GPU time.
+  Oversized text is `413 TEXT_TOO_LONG`; an over-long beat list is `BAD_REQUEST`. A new cap
+  belongs at admission too, never after the expensive part.
+- `REQUIRE_ENGINE_APPROVAL` defaults to `true` in code as well as in `.env.example`: an
+  agent-authored plugin is staged under `engines/.pending/<id>/` until an operator promotes
+  it with `agent-voice engines approve <id>`.
 
 ## Error taxonomy
 
@@ -99,5 +111,12 @@ fastmcp) are legitimately present.
 
 - Every subprocess uses an argv list with `shell=False`. There is no path in this project that
   builds a shell string, and none should be added.
+- Cache hits and read-only calls (`server_info`, `gpu_status`, `list_voices`) never wait behind
+  the GPU lock. Uncached jobs queue FIFO per engine, and `MAX_QUEUE_DEPTH=64` turns a full wait
+  queue into `429 BACKPRESSURE` instead of unbounded latency.
+- `qwen3_tts_fast` stays strictly serialized: its CUDA graphs are captured at batch 1, so there
+  is no micro-batching to add there. Throughput comes from the cache and the queue.
+- The effective pronunciation map is part of the synthesis cache key, so a lexicon edit
+  invalidates old renders; subtitles keep the original written text, never the spoken form.
 - Typer sub-commands must not import torch. Defer heavy imports into command bodies.
 - `pyproject.toml`'s core `dependencies` must never gain torch.

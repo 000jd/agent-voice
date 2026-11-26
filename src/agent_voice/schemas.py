@@ -52,6 +52,24 @@ def validate_alias(value: str) -> str:
         raise ValueError("must not contain '..'")
     return value
 
+
+VOICE_NAME_PATTERN = re.compile(r"^[\w .\-]{1,64}$")
+"""Human-facing voice names: 1-64 word chars, spaces, dots and hyphens.
+
+Voice ids are random hex and never derived from the name; the pattern exists so a
+name cannot smuggle a path separator, a newline or a control character into
+metadata, logs or subtitles.
+"""
+
+
+def validate_voice_name(value: str) -> str:
+    if not isinstance(value, str) or VOICE_NAME_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            "voice name must be 1-64 characters of letters, digits, spaces, '.', '-' or '_'"
+        )
+    return value
+
+
 SAMPLE_RATE = 24_000
 """Engine output sample rate. PCM_CHUNK payloads are always 24 kHz mono int16 LE."""
 
@@ -264,12 +282,22 @@ class VoiceMetadata(BaseModel):
     design_instruct: str = ""
     """The natural-language description used when source == "designed"."""
 
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return validate_voice_name(value)
+
 
 class CloneVoiceRequest(BaseModel):
     name: str
     ref_audio_path: str
     ref_text: str = ""
     x_vector_only: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return validate_voice_name(value)
 
 
 class VoiceListResponse(BaseModel):
@@ -289,12 +317,26 @@ class DesignVoiceRequest(BaseModel):
     sample_text: str = DEFAULT_DESIGN_SAMPLE_TEXT
     language: str = "English"
     save_as_clone: bool = True
+    candidates: int = Field(default=1, ge=1, le=5)
     take: int | None = Field(default=None, ge=1)
     seed: int | None = None
     overwrite: bool = False
     engine: str | None = None
     model: str | None = None
     quality: QualityTier = "high"
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return validate_voice_name(value)
+
+
+class DesignCandidate(BaseModel):
+    take: int
+    seed: int | None = None
+    file_path: str
+    download_url: str = ""
+    duration_sec: float
 
 
 class DesignVoiceResult(BaseModel):
@@ -306,6 +348,8 @@ class DesignVoiceResult(BaseModel):
     design_instruct: str
     engine_id: str
     model_alias: str
+    candidates: list[DesignCandidate] = Field(default_factory=list)
+    """When candidates > 1, every take to audition; the first is also the preview."""
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +394,8 @@ class SpeakRequest(BaseModel):
     take: int | None = Field(default=None, ge=1)
     """Alternate delivery of the same line. Derives a repeatable seed when `seed`
     is not given, so take=2 is reproducible and cache-stable."""
+    pronunciations: dict[str, str] | None = None
+    """Per-call word -> spoken-form overrides merged over data/pronunciations.json."""
 
 
 class SpeechRequest(BaseModel):
@@ -402,7 +448,8 @@ class BeatSpec(BaseModel):
     instruct: str = ""
     engine: str | None = None
     model: str | None = None
-    quality: QualityTier = "high"
+    quality: QualityTier | None = None
+    """Omit to inherit ScriptRequest.quality; an explicit value wins."""
     language: str = "Auto"
     target_duration_sec: float | None = None
     fit_mode: Literal["none", "pad", "atempo"] = "none"
@@ -424,6 +471,8 @@ class ScriptRequest(BaseModel):
     quality: QualityTier = "high"
     format: ResponseFormat = "wav"
     export_srt: bool = True
+    pronunciations: dict[str, str] | None = None
+    """Per-call overrides applied to every beat's spoken text."""
 
 
 class BeatTiming(BaseModel):

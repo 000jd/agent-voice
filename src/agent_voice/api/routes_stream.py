@@ -13,6 +13,7 @@ import contextlib
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
+from ..pronunciations import prepare_text
 from ..schemas import AgentVoiceError, ErrorCode
 from .routing import resolve_target
 
@@ -31,6 +32,7 @@ async def _open_stream(
     speed,
     speaker=None,
     instruct: str = "",
+    pronunciations: dict[str, str] | None = None,
 ):
     ctx = request.app.state.ctx
     if len(text) > ctx.settings.max_text_chars:
@@ -39,6 +41,9 @@ async def _open_stream(
             f"text is {len(text)} characters, limit is {ctx.settings.max_text_chars}",
             "Split the input or use speak_script.",
         )
+    # Rewritten after the length check, so the limit applies to what the caller
+    # sent; the hash of the effective map rides along with the spoken form.
+    text, pronunciations_hash = prepare_text(ctx.pronunciations, text, pronunciations)
     target = resolve_target(
         settings=ctx.settings,
         registry=ctx.registry,
@@ -66,6 +71,7 @@ async def _open_stream(
         instruct=target.instruct,
         language=language,
         speed=speed,
+        pronunciations_hash=pronunciations_hash,
     )
     return ctx, target, stream_id, queue, mode
 
@@ -89,6 +95,7 @@ async def pcm_stream(request: Request):
         speed=float(body.get("speed", 1.0)),
         speaker=body.get("speaker"),
         instruct=body.get("instruct") or "",
+        pronunciations=body.get("pronunciations"),
     )
 
     async def generate():
@@ -141,6 +148,13 @@ async def audio_ws(websocket: WebSocket):
         # travels the same path as on the HTTP stream: routing decides the model.
         speaker = payload.get("speaker")
         instruct = payload.get("instruct") or ""
+        # Rewritten exactly the way the chunked route does it, so a socket client
+        # and an HTTP client hear the same spoken form for the same line.
+        text, pronunciations_hash = prepare_text(
+            ctx.pronunciations,
+            payload.get("text") or payload.get("input") or "",
+            payload.get("pronunciations"),
+        )
         target = resolve_target(
             settings=ctx.settings,
             registry=ctx.registry,
@@ -157,7 +171,7 @@ async def audio_ws(websocket: WebSocket):
         stream_id, queue, mode = await ctx.workers.stream(
             engine_id=target.engine_id,
             model_alias=target.model_alias,
-            text=payload.get("text") or payload.get("input") or "",
+            text=text,
             voice_id=target.voice_id,
             ref_text=target.ref_text,
             x_vector_only=target.x_vector_only,
@@ -166,6 +180,7 @@ async def audio_ws(websocket: WebSocket):
             instruct=target.instruct,
             language=payload.get("language", "Auto"),
             speed=float(payload.get("speed", 1.0)),
+            pronunciations_hash=pronunciations_hash,
         )
         current = {"engine": target.engine_id, "stream_id": stream_id}
         await websocket.send_json(

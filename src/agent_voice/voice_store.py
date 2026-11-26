@@ -22,7 +22,7 @@ from typing import Any, Literal
 from filelock import FileLock
 
 from .audio_utils import canonicalise_ref_audio
-from .schemas import AgentVoiceError, ErrorCode, VoiceMetadata
+from .schemas import AgentVoiceError, ErrorCode, VoiceMetadata, validate_voice_name
 from .security import (
     MAX_REF_AUDIO_SECONDS,
     MIN_REF_AUDIO_SECONDS,
@@ -59,9 +59,15 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 class VoiceStore:
-    def __init__(self, voices_dir: Path) -> None:
+    def __init__(self, voices_dir: Path, max_ref_text_chars: int = 2000) -> None:
         self.voices_dir = Path(voices_dir)
         self.voices_dir.mkdir(parents=True, exist_ok=True)
+        self.max_ref_text_chars = max_ref_text_chars
+        """Longest accepted transcript, from MAX_REF_TEXT_CHARS.
+
+        A transcript far longer than the clip cannot describe it: the caller has
+        pasted a whole document, and the fix is a shorter reference, not more text.
+        """
 
     # -- lookup ---------------------------------------------------------
     def voice_dir(self, voice_id: str) -> Path:
@@ -134,7 +140,31 @@ class VoiceStore:
         only the canonical bytes tell us whether this is a retry of an existing
         voice or a genuine name clash. A rejected clone therefore never leaves a
         half-built voice directory behind.
+
+        The name and the transcript are checked before any of that: they are pure
+        input validation, so a typo costs no decode, no staging directory and no
+        temporary file.
         """
+        try:
+            name = validate_voice_name(name)
+        except ValueError as exc:
+            # Raised here rather than surfacing as a pydantic error from
+            # VoiceMetadata below: a bad name is a 400 the agent can act on, not a
+            # 500 after the audio has already been canonicalised.
+            raise AgentVoiceError(
+                ErrorCode.BAD_REQUEST,
+                str(exc),
+                "Use 1-64 letters, digits, spaces, dots, hyphens or underscores.",
+            ) from exc
+
+        if len(ref_text) > self.max_ref_text_chars:
+            raise AgentVoiceError(
+                ErrorCode.TEXT_TOO_LONG,
+                f"ref_text is {len(ref_text)} characters, limit is "
+                f"{self.max_ref_text_chars}",
+                "Shorten the transcript; 3-10 s of speech is the clone sweet spot.",
+            )
+
         clip = Path(source_path)
         if not clip.is_file():
             raise AgentVoiceError(

@@ -30,6 +30,10 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     monkeypatch.setenv("AGENT_VOICE_DEFAULT_ENGINE", "mock")
     monkeypatch.setenv("MCP_BASE_PATH", "")
     monkeypatch.setenv("ALLOW_AGENT_ENGINE_MUTATION", "true")
+    # The production default is now True (an agent-authored plugin is executable
+    # code). Tests that exercise live registration opt out explicitly; staging
+    # tests set it back to true.
+    monkeypatch.setenv("REQUIRE_ENGINE_APPROVAL", "false")
     monkeypatch.setenv("MODEL_IDLE_TTL_SECONDS", "900")
     monkeypatch.setenv("MIN_ENGINE_RESIDENCY_SECONDS", "60")
     # Starlette's TestClient sends `Host: testserver`. That name is deliberately

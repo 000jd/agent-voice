@@ -780,3 +780,112 @@ def test_server_info_presets_are_scoped_to_the_default_engine():
     )
     assert speakers == ["Ryan"]
     assert design_available is False
+
+
+# ---------------------------------------------------------------------------
+# v0.3.1: approval default, pronunciations, design candidates
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_engine_stages_when_approval_required(tmp_path):
+    async with mcp_client(
+        tmp_path,
+        ALLOW_AGENT_ENGINE_MUTATION="true",
+        AGENT_VOICE_TOOLSET="full",
+        REQUIRE_ENGINE_APPROVAL="true",
+    ) as (client, _app):
+        result = payload(
+            await client.call_tool(
+                "register_engine",
+                {
+                    "engine_id": "stagedeng",
+                    "engine_yaml_content": (
+                        "backend_name: stagedeng\n"
+                        "backend_version: '1'\n"
+                        "venv_python: null\n"
+                        "models: []\n"
+                    ),
+                    "worker_py_content": "print('x')\n",
+                    "install_venv": False,
+                },
+            )
+        )
+        assert result["staged"] is True
+        assert result["installed"] is False
+        assert result["job_id"] is None
+
+        engines = payload(await client.call_tool("list_engines", {}))["engines"]
+        assert "stagedeng" not in {entry["engine_id"] for entry in engines}
+
+
+@pytest.mark.asyncio
+async def test_speak_pronunciations_change_the_spoken_text(tmp_path):
+    async with mcp_client(tmp_path) as (client, _app):
+        plain = payload(await client.call_tool("speak", {"text": "kubectl pods"}))
+        rewritten = payload(
+            await client.call_tool(
+                "speak",
+                {"text": "kubectl pods", "pronunciations": {"kubectl": "cube control"}},
+            )
+        )
+        repeat = payload(
+            await client.call_tool(
+                "speak",
+                {"text": "kubectl pods", "pronunciations": {"kubectl": "cube control"}},
+            )
+        )
+
+        # "cube control pods" is three spoken words, not two.
+        assert plain["duration_sec"] != rewritten["duration_sec"]
+        assert rewritten["cached"] is False
+        assert repeat["cached"] is True
+        assert repeat["file_path"] == rewritten["file_path"]
+
+
+@pytest.mark.asyncio
+async def test_design_voice_candidates_and_save_reuses_the_take(tmp_path):
+    async with mcp_client(tmp_path) as (client, _app):
+        result = payload(
+            await client.call_tool(
+                "design_voice",
+                {
+                    "name": "audition",
+                    "instruct": "warm, low narrator",
+                    "candidates": 3,
+                },
+            )
+        )
+        assert result["voice_id"] is None, "multi-candidate renders never save"
+        candidates = result["candidates"]
+        assert [candidate["take"] for candidate in candidates] == [1, 2, 3]
+        assert len({candidate["file_path"] for candidate in candidates}) == 3
+
+        chosen = candidates[1]
+        saved = payload(
+            await client.call_tool(
+                "design_voice",
+                {
+                    "name": "audition",
+                    "instruct": "warm, low narrator",
+                    "take": chosen["take"],
+                    "save_as_clone": True,
+                },
+            )
+        )
+        assert saved["voice_id"]
+        assert saved["preview_file_path"] == chosen["file_path"], "cache must be reused"
+
+        voices = payload(await client.call_tool("list_voices", {}))["voices"]
+        assert any(voice["voice_id"] == saved["voice_id"] for voice in voices)
+
+
+@pytest.mark.asyncio
+async def test_design_voice_rejects_invalid_candidate_count(tmp_path):
+    async with mcp_client(tmp_path) as (client, _app):
+        body = await call_expecting_error(
+            client,
+            "design_voice",
+            {"name": "audition", "instruct": "warm", "candidates": 0},
+        )
+        assert body["error_code"] == "BAD_REQUEST"

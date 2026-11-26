@@ -34,12 +34,16 @@ models_app = typer.Typer(help="Inspect and download models.", no_args_is_help=Tr
 voices_app = typer.Typer(help="Manage reference voices.", no_args_is_help=True)
 bindings_app = typer.Typer(help="Manage per-agent bindings.", no_args_is_help=True)
 cache_app = typer.Typer(help="Inspect and clear the synthesis cache.", no_args_is_help=True)
+pronunciations_app = typer.Typer(
+    help="Manage the persistent pronunciation lexicon.", no_args_is_help=True
+)
 
 app.add_typer(engines_app, name="engines")
 app.add_typer(models_app, name="models")
 app.add_typer(voices_app, name="voices")
 app.add_typer(bindings_app, name="bindings")
 app.add_typer(cache_app, name="cache")
+app.add_typer(pronunciations_app, name="pronunciations")
 
 
 def _print(payload) -> None:
@@ -495,7 +499,7 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
     engine_id = record.engine_id
     steps: list[_Step] = []
     workdir = Path(tempfile.mkdtemp(prefix="agent-voice-conformance-"))
-    voices = VoiceStore(settings.voices_dir)
+    voices = VoiceStore(settings.voices_dir, max_ref_text_chars=settings.max_ref_text_chars)
     manager = WorkerManager(
         settings=settings,
         registry=registry,
@@ -950,7 +954,7 @@ def voices_list() -> None:
     from .voice_store import VoiceStore
 
     settings = get_settings()
-    store = VoiceStore(settings.voices_dir)
+    store = VoiceStore(settings.voices_dir, max_ref_text_chars=settings.max_ref_text_chars)
     _print([v.model_dump(mode="json") for v in store.list()])
 
 
@@ -966,7 +970,7 @@ def voices_add(
     from .voice_store import VoiceStore
 
     settings = get_settings()
-    store = VoiceStore(settings.voices_dir)
+    store = VoiceStore(settings.voices_dir, max_ref_text_chars=settings.max_ref_text_chars)
     try:
         metadata = store.add(
             name=name, source_path=audio, ref_text=ref_text, x_vector_only=x_vector_only
@@ -1010,6 +1014,13 @@ def voices_design(
         min=1,
         help="Alternate design of the same prompt; each take caches separately.",
     ),
+    candidates: int = typer.Option(
+        1,
+        "--candidates",
+        min=1,
+        max=5,
+        help="How many takes to render for auditioning (1-5); the first is the preview.",
+    ),
     seed: int | None = typer.Option(
         None, "--seed", help="Fixed seed, so the same prompt renders identical audio."
     ),
@@ -1031,7 +1042,9 @@ def voices_design(
     Runs in-process against the engines directory, so no daemon needs to be
     running. A voice_design checkpoint renders the preview; with --save-as-clone
     (the default) that preview is registered as an ordinary reference voice, which
-    any cloning checkpoint can then speak with — design once, clone forever.
+    any cloning checkpoint can then speak with — design once, clone forever. With
+    --candidates 2..5 every take is printed for auditioning; the first is the one
+    that gets saved.
     """
     import asyncio
 
@@ -1045,6 +1058,7 @@ def voices_design(
         sample_text=sample_text,
         language=language,
         save_as_clone=save_as_clone,
+        candidates=candidates,
         take=take,
         seed=seed,
         overwrite=overwrite,
@@ -1086,6 +1100,13 @@ def voices_design(
             "preview only (nothing saved): " + result.preview_file_path,
             fg=typer.colors.YELLOW,
         )
+    if len(result.candidates) > 1:
+        typer.echo("candidates:")
+        for candidate in result.candidates:
+            typer.echo(
+                f"  take {candidate.take}: {candidate.file_path} "
+                f"({candidate.duration_sec:.2f} s)"
+            )
 
 
 @voices_app.command("delete")
@@ -1094,11 +1115,60 @@ def voices_delete(voice_id: str) -> None:
     from .voice_store import VoiceStore
 
     settings = get_settings()
-    store = VoiceStore(settings.voices_dir)
+    store = VoiceStore(settings.voices_dir, max_ref_text_chars=settings.max_ref_text_chars)
     if not store.delete(voice_id):
         typer.secho(f"no such voice: {voice_id}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     typer.secho(f"deleted {voice_id}", fg=typer.colors.GREEN)
+
+
+# ---------------------------------------------------------------------------
+# pronunciations
+# ---------------------------------------------------------------------------
+
+
+@pronunciations_app.command("list")
+def pronunciations_list() -> None:
+    """Print the persistent word -> spoken-form map as JSON."""
+    from .pronunciations import PronunciationStore
+
+    store = PronunciationStore(get_settings().pronunciations_path)
+    _print(store.list())
+
+
+@pronunciations_app.command("set")
+def pronunciations_set(word: str, replacement: str) -> None:
+    """Set one entry. Matching is case-insensitive and whole-word.
+
+    The map is read on every synthesis request, so an edit here reaches a running
+    daemon immediately; the change also invalidates the cached audio it affects.
+    """
+    from .pronunciations import PronunciationStore
+
+    store = PronunciationStore(get_settings().pronunciations_path)
+    try:
+        entries = store.set(word, replacement)
+    except ValueError as exc:
+        typer.secho(f"invalid pronunciation: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    _print(entries)
+
+
+@pronunciations_app.command("delete")
+def pronunciations_delete(word: str) -> None:
+    """Remove one entry. Exits non-zero when the word is not in the lexicon."""
+    from .pronunciations import PronunciationStore
+
+    store = PronunciationStore(get_settings().pronunciations_path)
+    try:
+        deleted = store.delete(word)
+    except ValueError as exc:
+        typer.secho(f"invalid pronunciation: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    if not deleted:
+        typer.secho(f"no such pronunciation: {word}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    _print({"deleted": word})
 
 
 # ---------------------------------------------------------------------------

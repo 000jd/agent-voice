@@ -53,6 +53,8 @@ def _key(**overrides) -> str:
         "mode": "clone",
         "speaker": None,
         "instruct": "",
+        # v0.3.1: canonical hash of the effective pronunciation map.
+        "pronunciations": "",
         "hf_repo": "local/mock-tone",
         "model_revision": "local",
     }
@@ -245,6 +247,7 @@ def test_cache_key_is_deterministic():
         ("mode", "custom_voice"),
         ("speaker", "Ryan"),
         ("instruct", "speak slowly and warmly"),
+        ("pronunciations", "hash-of-a-different-map"),
         ("hf_repo", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
         ("model_revision", "abcdef1234567890abcdef1234567890abcdef12"),
     ],
@@ -289,6 +292,9 @@ def test_all_fields_are_covered():
         "mode",
         "speaker",
         "instruct",
+        # v0.3.1: a lexicon update must not reuse audio rendered with old
+        # pronunciation rules.
+        "pronunciations",
         "hf_repo",
         "model_revision",
     }
@@ -519,3 +525,27 @@ def test_ffmpeg_error_tail_is_used_by_the_audio_pipeline():
     raw_dumps = source.count("stderr.decode(")
     # Exactly one: inside _ffmpeg_error_tail itself.
     assert raw_dumps == 1, f"{raw_dumps} raw stderr dumps remain; use _ffmpeg_error_tail"
+
+
+# ---------------------------------------------------------------------------
+# v0.3.1: name and transcript caps
+# ---------------------------------------------------------------------------
+
+
+def test_store_rejects_unsafe_names_and_long_transcripts(tmp_path):
+    source = _tone(tmp_path / "in.wav")
+    store = VoiceStore(tmp_path / "voices")
+
+    with pytest.raises(AgentVoiceError) as name_error:
+        store.add(name="../escape", source_path=source)
+    assert name_error.value.error_code == ErrorCode.BAD_REQUEST
+
+    with pytest.raises(AgentVoiceError) as text_error:
+        store.add(name="too-long", source_path=source, ref_text="x" * 2001)
+    assert text_error.value.error_code == ErrorCode.TEXT_TOO_LONG
+    assert store.list() == [], "rejected names/transcripts must not leave a voice"
+
+    small = VoiceStore(tmp_path / "voices-small", max_ref_text_chars=10)
+    with pytest.raises(AgentVoiceError) as configured:
+        small.add(name="configured", source_path=source, ref_text="x" * 11)
+    assert configured.value.error_code == ErrorCode.TEXT_TOO_LONG

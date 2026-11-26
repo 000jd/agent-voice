@@ -475,6 +475,23 @@ class WorkerManager:
         return lock
 
     def _enqueue(self, *, engine_id: str, kind: str, payload: dict[str, Any]) -> QueuedJob:
+        """Admit a job to the engine queue, or refuse it with BACKPRESSURE.
+
+        The depth check is admission control, not a wait: an unbounded queue turns
+        one stuck GPU into an ever-growing pile of callers that all time out
+        together. A cache hit never reaches here — :meth:`synthesize` answers hits
+        before it asks for an engine slot — so only real GPU work is ever refused.
+        """
+        depth = self.queue_depth()
+        limit = self.settings.max_queue_depth
+        if depth >= limit:
+            # Raised before the QueuedJob is built, so a refused request can never
+            # leave a partial entry in ``_queues`` for the reaper to trip over.
+            raise AgentVoiceError(
+                ErrorCode.BACKPRESSURE,
+                f"queue is full ({depth}/{limit} jobs waiting)",
+                "Server queue is full; retry shortly or use start_script_job.",
+            )
         job = QueuedJob(
             job_id=uuid.uuid4().hex,
             engine_id=engine_id,
@@ -689,8 +706,11 @@ class WorkerManager:
 
     # -- public synthesis ----------------------------------------------
     @staticmethod
-    def _effective_seed(seed: int | None, take: int | None) -> int | None:
+    def effective_seed(seed: int | None, take: int | None) -> int | None:
         """Resolve ``seed`` vs ``take`` into the seed actually sent to the worker.
+
+        Public because ``voice_design_service`` reports the seed behind each
+        candidate take: a caller must be able to re-render the take it picked.
 
         Precedence: an explicit ``seed`` always wins and ``take`` then only affects
         the cache key (so a caller can still ask for a distinct take of a pinned
@@ -738,6 +758,7 @@ class WorkerManager:
         speed: float = 1.0,
         response_format: str = "wav",
         take: int | None = None,
+        pronunciations_hash: str = "",
     ) -> SynthesisResult:
         """Synthesise to a file. Cache is consulted before any worker exists.
 
@@ -749,11 +770,17 @@ class WorkerManager:
         description. They reach the cache key too, because the same text in the
         same voice is different audio once the delivery changes.
 
+        ``pronunciations_hash`` is the canonical hash of the lexicon map that
+        rewrote ``text`` before this call (see ``pronunciations.prepare_text``). It
+        is opaque here — the rewritten text is what gets spoken — but it belongs in
+        the cache key, so editing the lexicon can never serve audio rendered from
+        the old map.
+
         A non-clone request carries no reference: the worker is told there is no
         ref audio, no transcript and no prompt cache, whatever the caller passed,
         so a stale ``voice_id`` cannot leak into a preset or design render.
         """
-        effective_seed = self._effective_seed(seed, take)
+        resolved_seed = self.effective_seed(seed, take)
         started = self.clock.monotonic()
         cache_key = await self._cache_key(
             engine_id=engine_id,
@@ -766,10 +793,11 @@ class WorkerManager:
             speaker=speaker,
             instruct=instruct,
             language=language,
-            seed=effective_seed,
+            seed=resolved_seed,
             speed=speed,
             response_format=response_format,
             take=take,
+            pronunciations_hash=pronunciations_hash,
         )
         cached = self.cache.get(cache_key)
         if cached is not None:
@@ -853,7 +881,7 @@ class WorkerManager:
                             "instruct": instruct,
                             "wav_path": str(chunk_out),
                             "language": language,
-                            "seed": effective_seed,
+                            "seed": resolved_seed,
                             "speed": speed,
                         },
                         timeout=1800.0,
@@ -1049,6 +1077,7 @@ class WorkerManager:
         seed: int | None = None,
         speed: float = 1.0,
         take: int | None = None,
+        pronunciations_hash: str = "",
     ) -> tuple[uuid.UUID, asyncio.Queue[bytes], str]:
         """Start a PCM stream. Returns (stream_id, queue, streaming_mode).
 
@@ -1062,9 +1091,13 @@ class WorkerManager:
         ``take`` is accepted for call-site symmetry with :meth:`synthesize`, but a
         stream has no cache entry and no ``SynthesisResult`` to report it on, so it
         cannot select a stored alternate delivery. It still derives the seed (see
-        :meth:`_effective_seed`), so take=2 does stream different audio.
+        :meth:`effective_seed`), so take=2 does stream different audio.
+
+        ``pronunciations_hash`` is accepted for the same symmetry and is likewise
+        unused: a stream is never cached, and the rewrite has already been applied
+        to ``text`` by the caller.
         """
-        effective_seed = self._effective_seed(seed, take)
+        resolved_seed = self.effective_seed(seed, take)
         # Hold the engine lock until the streaming RPC has been sent and its
         # request id registered, then hand the lock to the background task, which
         # releases it when generation ends. That keeps "one GPU RPC per engine"
@@ -1114,7 +1147,7 @@ class WorkerManager:
                             "speaker": speaker,
                             "instruct": instruct,
                             "language": language,
-                            "seed": effective_seed,
+                            "seed": resolved_seed,
                             "speed": speed,
                         },
                         timeout=1800.0,
@@ -1358,6 +1391,7 @@ class WorkerManager:
         mode: ModelMode = "clone",
         speaker: str | None = None,
         instruct: str = "",
+        pronunciations_hash: str = "",
     ) -> str:
         record = self.registry.get(engine_id)
         # Which weights this alias resolves to belongs in the key: re-pointing an
@@ -1407,6 +1441,10 @@ class WorkerManager:
             mode=mode,
             speaker=speaker or "",
             instruct=instruct or "",
+            # The lexicon's identity is keyed next to the text it produced, so a
+            # changed map is visible in the key itself rather than only through
+            # whatever its rewrite happened to alter.
+            pronunciations=pronunciations_hash,
             hf_repo=hf_repo,
             model_revision=revision,
         )

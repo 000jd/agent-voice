@@ -38,7 +38,9 @@ genuinely free when idle, and MCP tools that return compact JSON.
 
 - Linux or Windows (macOS works for the mock engine; CUDA engines are Linux/Windows only)
 - Python 3.12 for the core daemon
-- `ffmpeg` and `ffprobe` on `PATH`
+- `ffmpeg` and `ffprobe` on `PATH` — both are needed: reference clips are canonicalised to
+  24 kHz mono WAV through them, and every non-WAV output format is converted the same way.
+  See [Troubleshooting](#troubleshooting) if either is missing.
 - `uv` for engine environment management
 - For GPU engines: an NVIDIA GPU with a recent driver. Developed and verified on an
   RTX 4060 Ti 16 GB with driver 580.178.04.
@@ -56,8 +58,8 @@ cp .env.example .env
 torch** — that is deliberate, and it is what makes a 0 MB idle GPU a structural guarantee rather
 than a promise.
 
-The template defaults to `ALLOW_AGENT_ENGINE_MUTATION=false`; see [Security](#security) before you
-change it.
+The template defaults to `ALLOW_AGENT_ENGINE_MUTATION=false` and `REQUIRE_ENGINE_APPROVAL=true`
+(the same as the code defaults); see [Security](#security) before you change either.
 
 ## Quickstart with the mock engine
 
@@ -93,6 +95,10 @@ sets and cannot share a virtualenv:
 |---|---|---|---|
 | `qwen3_tts_fast` | `faster-qwen3-tts` (CUDA graphs) | native | default; native streaming |
 | `qwen3_tts` | `qwen-tts` (official) | emulated | fallback if graph capture misbehaves |
+
+`qwen3_tts_fast` captures CUDA graphs, which is fast but hardware-sensitive. If capture fails
+on your box, install the official `qwen3_tts` engine instead — that fallback is exactly what it
+is for. See [Troubleshooting](#troubleshooting).
 
 Honest throughput, measured on the reference box with the official backend and 0.6B: **~10.5 s of
 wall time for 9.0 s of audio, warm — RTF ≈ 0.86**, i.e. slightly slower than real time. A cache hit
@@ -177,8 +183,42 @@ Pass `save_as_clone=false` to audition a design without registering it: you get 
 and `voice_id: null`. `take=2`, `take=3`, … re-rolls the same description without touching
 take 1, and `seed=` makes a design reproducible.
 
+#### Audition several takes at once
+
+One take at a time makes a design hard to choose. `candidates=2..5` renders that many takes in
+a single call and registers none of them — it forces `save_as_clone=false`:
+
+```python
+design_voice(
+    name="narrator",
+    instruct="warm baritone, measured pace, a little gravel, late-night radio",
+    candidates=3,
+)
+```
+
+The result has `voice_id: null` and a `candidates` list with `take`, the `seed` behind that
+take, `file_path`, `download_url` and `duration_sec` for each render. Take 1 is also the
+`preview_file_path`, so a caller that ignores the list still has audio to play. Each take uses
+a take-derived seed, so every candidate is a genuinely different delivery that stays
+reproducible.
+
+Pick one and register exactly that render:
+
+```python
+design_voice(
+    name="narrator",
+    instruct="warm baritone, measured pace, a little gravel, late-night radio",
+    take=2,
+    save_as_clone=True,
+)
+```
+
+Omit `seed`: the take-derived seed is recomputed, the request matches the winning candidate's
+cache key, and the voice is registered from the cached audio instead of being synthesised
+again.
+
 Over HTTP the same body goes to `POST /v1/voices/design` (`DesignVoiceRequest`), which returns
-the `DesignVoiceResult` above:
+a `DesignVoiceResult` — the same `candidates` and `take` fields apply:
 
 ```bash
 curl -s -X POST localhost:8000/v1/voices/design \
@@ -342,7 +382,7 @@ never inlined as base64.
 | Tool | Surface | Purpose |
 |---|---|---|
 | `server_info` | core | **Call first.** Version, defaults, voices, engines and GPU state in one call — never spawns a worker |
-| `speak` | core | Synthesise one utterance, return a file path. Takes `voice`, `speaker` or `instruct` |
+| `speak` | core | Synthesise one utterance, return a file path. Takes `voice`, `speaker` or `instruct`, plus per-call `pronunciations` |
 | `speak_script` | core | Multi-beat script with exact per-beat timings and SRT/VTT |
 | `start_script_job` / `get_job` / `cancel_job` | core | Long scripts and other async work |
 | `clone_voice` / `design_voice` / `list_voices` / `delete_voice` | core | Create voices by cloning a clip or describing one, then list/delete them |
@@ -365,7 +405,7 @@ a failed synthesis round-trip:
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "0.3.1",
   "default_engine": "qwen3_tts_fast",
   "default_voice": "a1b2c3d4e5f6",
   "voices_count": 1,
@@ -401,7 +441,7 @@ reports its `mode`, whether it `supports_instruct`, and its own `preset_speakers
 | `cached` | `true` when the deterministic disk cache answered and no GPU work happened |
 | `mode` | Which mode produced the audio: `clone`, `custom_voice` or `voice_design` |
 | `speaker` | The preset timbre that spoke, when a `custom_voice` checkpoint answered |
-| `real_time_factor` | Defined as `duration_sec / elapsed_sec` — above 1.0 means faster than real time, `None` when the duration is unknown. ⚠️ In the current build the daemon computes the reciprocal (`elapsed/duration`), so a render 37× faster than real time reports `0.027`; recompute from `duration_sec` and `elapsed_ms` if the value looks inverted. On the reference box a warm 0.6B render measured **≈ 0.86** (slightly slower than real time) |
+| `real_time_factor` | `duration_sec / elapsed_sec` — above 1.0 means faster than real time, below 1.0 slower, `None` when the duration is unknown. On a cache hit `elapsed_ms` is only the lookup, so the ratio is meaningless there; read it from a real render and pair it with `cached`. Reference point: a warm 0.6B render measured **≈ 0.86** (slightly slower than real time) |
 | `take` | Which alternate delivery was rendered (`take=2`, …). A new take gets its own cache entry, so take 1 is untouched |
 
 ### Alternate takes of the same line
@@ -421,6 +461,35 @@ returns the existing voice instead of creating a duplicate. If a voice with that
 already exists but the audio (or `ref_text`) differs, the call fails — silently
 swapping a voice an agent is already using would be worse than erroring. Pass
 `overwrite=true` (or `POST /v1/voices?overwrite=true`) to replace it deliberately.
+
+### Voice names
+
+A voice name must match `^[\w .\-]{1,64}$` — letters, digits, underscores, spaces, dots and
+hyphens, 1–64 characters. Path separators, newlines and control characters are rejected, so a
+name cannot smuggle any of those into metadata, logs or JSON payloads. The rule is enforced for
+`clone_voice`, `design_voice` and `voices add`, and applies to a designed voice exactly as it
+does to a cloned one.
+
+Pick a stable label: `speak(voice="narrator")` and script beats address the voice by that exact
+name (or its id) from then on, so renaming one means changing the callers too.
+
+## Input caps
+
+Four caps bound what a single request can ask the daemon to do. They are enforced at admission —
+before routing, before a worker is spawned and before any GPU time is spent — so an oversized
+request costs one round-trip and nothing else. All four are in `.env.example`.
+
+| Setting | Default | Applies to | Violation |
+|---|---|---|---|
+| `MAX_SCRIPT_BEATS` | 200 | beats in one script (`speak_script` / `start_script_job`) | `400 BAD_REQUEST` |
+| `MAX_INSTRUCT_CHARS` | 1000 | `instruct` on `speak`, a beat, or `design_voice` | `413 TEXT_TOO_LONG` |
+| `MAX_DESIGN_SAMPLE_CHARS` | 500 | `design_voice(sample_text=...)` | `413 TEXT_TOO_LONG` |
+| `MAX_REF_TEXT_CHARS` | 2000 | `clone_voice(ref_text=...)` | `413 TEXT_TOO_LONG` |
+
+They sit alongside the existing `MAX_TEXT_CHARS` (one utterance) and `CHUNK_CHARS` (how a long
+text is split, not rejected). A rejected request creates no cache entry and leaves no scratch
+directory behind, so retrying it unchanged fails identically — shorten the input, split a long
+script across several calls, or raise the cap deliberately.
 
 ## Scripts: beats, timings and multi-speaker
 
@@ -456,11 +525,15 @@ speak_script(beats=[
 | `voice` | Voice id or name for **this beat** — enables multi-speaker scripts (podcasts, interviews); the result's `beats[].voice_id` records who actually spoke |
 | `speaker` | Preset timbre for this beat (`Vivian` … `Sohee`), answered by a `custom_voice` checkpoint. Needs no reference clip, so it works on a fresh install |
 | `instruct` | Delivery direction for this beat (`"slower, wearier"`). With a `speaker` it steers that preset and needs `supports_instruct`; with no `voice`/`speaker` it routes the beat to `voice_design` and becomes the description of a new timbre; a cloned beat ignores it |
-| `engine` / `model` / `quality` | Per-beat overrides of the same-named `speak` options |
+| `engine` / `model` / `quality` | Per-beat overrides of the same-named `speak` options. `quality` is optional: omit it and the beat inherits the script's `quality`, so set it only on a beat that should differ |
 | `language` | `"Auto"` or a language name |
 | `target_duration_sec` + `fit_mode` | Fit the beat into a fixed slot (`none`, `pad`, `atempo`) — for fixed-length video segments |
 | `pause_after_sec` | 0–10 s of silence inserted **after** the beat. Included in the reported timings, so subtitles and visuals stay frame-accurate |
 | `take` | Alternate delivery of this beat's line (`take=2`, `take=3`, …). Re-record one beat without touching the others |
+
+`quality` is the one key whose default is worth knowing: a beat leaves it unset to inherit
+`speak_script`'s `quality`, and sets it only to make one beat cheaper or better. (Before 0.3.1
+every beat defaulted to `high`, which quietly overrode a `quality="fast"` script.)
 
 `speak` takes the same arguments for a single line, and routing follows the same rules:
 `speak("Good evening.", speaker="Serena")` speaks a preset timbre;
@@ -624,6 +697,37 @@ first.
 It prints the per-beat timings, the audio and video durations, and the drift
 between them, and exits non-zero if they disagree by more than 750 ms.
 
+## Pronunciation lexicon
+
+Some words are written one way and spoken another: `kubectl`, a surname, an acronym. The
+lexicon rewrites them before synthesis without changing the text you asked to speak.
+
+- **Persistent map.** `data/pronunciations.json` is a plain `{word: replacement}` object.
+  Matching is case-insensitive and whole-word, so `async` never rewrites `asynchronously`, and
+  a multi-word key is matched before any shorter key it contains. The file is read on every
+  request, so an edit reaches a running daemon immediately.
+- **Per-call overrides.** `speak(..., pronunciations={"kubectl": "cube control"})` and
+  `speak_script(..., pronunciations={...})` merge on top of the persistent map for that call
+  only; nothing is written to disk. On a script the map applies to every beat.
+- **The cache follows the map.** The effective map's hash is part of the synthesis cache key, so
+  adding, changing or deleting an entry invalidates the old renders instead of serving audio
+  that was spoken the previous way.
+- **Subtitles keep the written text.** `.srt`, `.vtt` and `.timing.json` carry the beat text you
+  passed in, not the rewritten spoken form — captions show `kubectl`, the audio says
+  "cube control".
+
+Manage the persistent map from a shell, no daemon required:
+
+```bash
+agent-voice pronunciations list
+agent-voice pronunciations set kubectl "cube control"
+agent-voice pronunciations delete kubectl
+```
+
+`set` replaces an existing entry case-insensitively (`Kubectl` and `kubectl` are the same key)
+and prints the resulting map as JSON; `delete` removes every casing of the word, prints
+`{"deleted": "<word>"}` and exits non-zero when the word is not in the lexicon.
+
 ## Agent skill
 
 An installable skill for coding agents lives at
@@ -660,10 +764,12 @@ an agent.
 
   `core` is the right choice for an agent that only needs to make audio: a shorter tool list costs
   fewer tokens and has less for a model to get wrong.
-- **`REQUIRE_ENGINE_APPROVAL`** stops agent-authored code from going live unattended. With
-  `REQUIRE_ENGINE_APPROVAL=true`, `register_engine` stages the plugin under
-  `engines/.pending/<id>/`; an operator inspects it and runs
-  `agent-voice engines approve <id>` to move it into `engines/` and reload the registry.
+- **`REQUIRE_ENGINE_APPROVAL` is on by default**, in code as well as in `.env.example`, and
+  stops agent-authored code from going live unattended. With the flag true, `register_engine`
+  stages the plugin under `engines/.pending/<id>/`; an operator inspects it and runs
+  `agent-voice engines approve <id>` to move it into `engines/` and reload the registry. An
+  operator who wants an agent's plugins live immediately can set it to `false` — that is the
+  opt-out, and it means an agent's Python runs unread.
 
 ### Voice cloning: consent is the operator's responsibility
 
@@ -684,6 +790,29 @@ you; the responsibility is the operator's.
   `force=true` cancels them and frees VRAM immediately.
 - With `ENABLE_VRAM_PRESSURE_YIELD=true`, an idle worker is killed when another application
   needs the GPU.
+- Uncached jobs queue FIFO per engine, and a full wait queue (`MAX_QUEUE_DEPTH`) answers
+  `429 BACKPRESSURE` instead of growing. See
+  [Concurrency](#concurrency-parallel-agents-and-the-gpu-queue).
+
+## Concurrency: parallel agents and the GPU queue
+
+Several agents — or one agent fanning out — can hit the daemon at once. The design keeps that
+safe without letting a queue grow without bound.
+
+- **Cache hits never wait.** A request the deterministic disk cache can answer is served
+  immediately, even while another render holds the GPU.
+- **Read-only calls never wait either.** `server_info`, `gpu_status` and `list_voices` never
+  acquire the engine/GPU lock, so they stay responsive during a long synthesis.
+- **Uncached jobs queue FIFO per engine.** They wait in arrival order instead of failing
+  straight away with `WORKER_BUSY`, so a burst degrades into latency rather than errors.
+- **`MAX_QUEUE_DEPTH` (default 64) bounds that queue.** When it is full the request is refused
+  with `429 BACKPRESSURE`, whose suggestion is to retry or to submit the work with
+  `start_script_job`. A refusal costs a round-trip; an unbounded queue costs the machine.
+  `gpu_status()` reports `queue_depth` and `in_flight`, so both sides of the line are visible.
+- **`qwen3_tts_fast` is strictly serialized.** Its CUDA graphs are captured at batch 1, so two
+  decodes cannot share the model and there is no micro-batching. Throughput comes from the
+  cache and the queue, not from batching. For long work, `start_script_job` keeps a single call
+  from occupying the engine slot while you poll.
 
 ## Autostart
 
@@ -728,6 +857,7 @@ agent-voice serve | mcp | status
 agent-voice engines  list | install <id> | test <id> | pending | approve <id>
 agent-voice models   list | download <engine> <alias>
 agent-voice voices   list | add <name> <wav> | design <name> --instruct "..." | delete <voice_id>
+agent-voice pronunciations list | set <word> <replacement> | delete <word>
 agent-voice bindings list | set <agent> ... | delete <agent>
 agent-voice cache    stats | clear
 agent-voice unload [--force]
@@ -750,7 +880,8 @@ $ agent-voice voices design narrator \
   "source": "designed",
   "design_instruct": "warm baritone, measured pace, a little gravel, late-night radio",
   "engine_id": "qwen3_tts_fast",
-  "model_alias": "1.7b-design"
+  "model_alias": "1.7b-design",
+  "candidates": []
 }
 designed 'narrator' -> voice 7c1a90d2be44 (6.42 s preview: /repo/data/artifacts/0f3c8a11d2b4.wav)
 ```
@@ -762,6 +893,7 @@ designed 'narrator' -> voice 7c1a90d2be44 (6.42 s preview: /repo/data/artifacts/
 | `--language` | Language of that sentence (default `English`) |
 | `--save-as-clone/--no-save-as-clone` | Register the render as a voice (default) or keep only the preview |
 | `--take` / `--seed` | Re-roll the same description, or pin it for a reproducible render |
+| `--candidates` | Render 1–5 takes to audition. With 2–5 nothing is saved and every take is printed; re-run with `--take <n> --save-as-clone` to keep the winner |
 | `--overwrite` | Replace an existing voice with the same name |
 | `--engine` / `--model` / `--quality` | Target selection; `--model` must be a `voice_design` checkpoint |
 
@@ -792,7 +924,8 @@ requests) and `shutdown`. Skipped steps are reported as `SKIP` with the reason, 
 
 ### `engines pending` / `engines approve <id>`
 
-With `REQUIRE_ENGINE_APPROVAL=true`, agent-authored plugins land in `engines/.pending/<id>/`.
+With `REQUIRE_ENGINE_APPROVAL=true` (the default, in code as well as in `.env.example`),
+agent-authored plugins land in `engines/.pending/<id>/`.
 `engines pending` lists them. `engines approve <id>` prints the engine's model list and the
 `worker.py` SHA-256, asks for confirmation (`--yes` skips the prompt for scripts), validates the
 staged manifest, moves the directory to `engines/<id>/`, and reloads the registry. It refuses to
@@ -828,6 +961,58 @@ venv. No daemon changes required. Then prove it speaks the protocol:
 
 ```bash
 uv run agent-voice engines test <engine_id>
+```
+
+## Troubleshooting
+
+### CUDA graph capture fails (`qwen3_tts_fast`)
+
+Symptom: the worker dies during `load_model`, `engines test qwen3_tts_fast` fails at graph
+capture, or the first request errors with a CUDA/torch traceback instead of a clean
+`{error_code, message, suggestion}` body.
+
+Graph capture needs a clean device. Another process holding VRAM, a driver that disallows the
+capture, or a card that cannot replay the captured graphs will fail it. Two ways out:
+
+- **Fall back to the official engine.** Set `AGENT_VOICE_DEFAULT_ENGINE=qwen3_tts` (or pass
+  `engine="qwen3_tts"` per call), install it with `agent-voice engines install qwen3_tts` and
+  download the same aliases. It is slower per request and streams in an emulated way, but it is
+  reliable.
+- **Retry with VRAM free.** Stop whatever else is using the GPU, then restart the daemon so
+  capture happens with the device to itself — `nvidia-smi` to confirm,
+  `unload_models(force=true)` to evict a previous worker first.
+
+### `qwen3_tts_fast` cannot load the tokenizer
+
+`faster-qwen3-tts` needs `transformers==5.15.1`, pinned exactly in
+`engines/qwen3_tts_fast/pyproject.toml`. With 5.24.x the tokenizer crashes on load with
+`AttributeError: property 'upsample' of 'Qwen3TTSTokenizerV2Encoder' has no setter`: the newer
+transformers defines a read-only property that the model's `__init__` tries to assign. Re-apply
+the pin rather than upgrading inside that venv:
+
+```bash
+agent-voice engines install qwen3_tts_fast    # uv sync restores the pinned dependency set
+```
+
+Do not bump it by hand. `qwen3_tts_fast` and the official `qwen3_tts` require mutually
+exclusive transformers versions, which is why they are separate venvs in the first place.
+
+### `ffmpeg` / `ffprobe` missing
+
+Both binaries are required, and the daemon needs them on **its own** `PATH` — a shell that has
+ffmpeg while a systemd unit or MCP shim does not is the usual failure. Symptoms:
+
+- `clone_voice` / `design_voice` fails with `ffmpeg not found on PATH` (or `ffprobe`), because
+  every reference is canonicalised — decoded, resampled to 24 kHz mono WAV and silence-trimmed —
+  before it is registered.
+- A non-WAV `format=` (`mp3`, `opus`, `flac`, `pcm`) fails during conversion, because every
+  output format goes through ffmpeg.
+
+Install the system package (`apt install ffmpeg`, `brew install ffmpeg`, or a Windows build) and
+confirm both resolve from the environment the daemon starts in:
+
+```bash
+ffmpeg -version && ffprobe -version
 ```
 
 ## Development

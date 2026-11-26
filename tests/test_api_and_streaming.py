@@ -741,3 +741,132 @@ def test_unknown_engine_returns_actionable_suggestion(client):
     response = client.post("/v1/agent/speak", json={"text": "Hi.", "engine": "nope"})
     assert response.status_code == 404
     assert "list_engines" in response.json()["suggestion"]
+
+
+# ---------------------------------------------------------------------------
+# v0.3.1: quality inheritance, pronunciation, design candidates, name safety
+# ---------------------------------------------------------------------------
+
+
+def test_script_quality_inherits_from_the_call_level(client, monkeypatch):
+    import agent_voice.services.script_service as script_service
+
+    real = script_service.resolve_target
+    seen: list[str] = []
+
+    def recording(**kwargs):
+        seen.append(kwargs["quality"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(script_service, "resolve_target", recording)
+
+    inherited = client.post(
+        "/v1/agent/script", json={"beats": [{"text": "one"}], "quality": "fast"}
+    )
+    assert inherited.status_code == 200
+    assert seen == ["fast"]
+
+    seen.clear()
+    overridden = client.post(
+        "/v1/agent/script",
+        json={"beats": [{"text": "one", "quality": "high"}], "quality": "fast"},
+    )
+    assert overridden.status_code == 200
+    assert seen == ["high"]
+
+
+def test_script_pronunciations_rewrite_audio_but_keep_subtitles(client):
+    rewritten = client.post(
+        "/v1/agent/script",
+        json={
+            "beats": [{"text": "kubectl pods"}],
+            "pronunciations": {"kubectl": "cube control"},
+        },
+    )
+    assert rewritten.status_code == 200
+    body = rewritten.json()
+
+    srt = Path(body["srt_path"]).read_text("utf-8")
+    assert "kubectl pods" in srt, "subtitles keep the written words, not the spoken form"
+
+    plain = client.post(
+        "/v1/agent/script",
+        json={"beats": [{"text": "kubectl pods"}], "export_srt": False},
+    )
+    assert plain.status_code == 200
+    assert body["duration_sec"] > plain.json()["duration_sec"], (
+        "'cube control pods' is one word longer than 'kubectl pods'"
+    )
+
+
+def test_agent_speak_pronunciations_are_applied_and_cached(client):
+    plain = client.post("/v1/agent/speak", json={"text": "kubectl pods"})
+    rewritten = client.post(
+        "/v1/agent/speak",
+        json={"text": "kubectl pods", "pronunciations": {"kubectl": "cube control"}},
+    )
+    repeat = client.post(
+        "/v1/agent/speak",
+        json={"text": "kubectl pods", "pronunciations": {"kubectl": "cube control"}},
+    )
+
+    assert plain.status_code == rewritten.status_code == repeat.status_code == 200
+    assert plain.json()["duration_sec"] != rewritten.json()["duration_sec"]
+    assert repeat.json()["cached"] is True
+    assert repeat.json()["file_path"] == rewritten.json()["file_path"]
+
+
+def test_design_candidates_force_preview_and_save_the_chosen_take(client):
+    response = client.post(
+        "/v1/voices/design",
+        json={
+            "name": "audition",
+            "instruct": "warm, low narrator",
+            "candidates": 3,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["voice_id"] is None, "multi-candidate renders never save"
+    assert [candidate["take"] for candidate in body["candidates"]] == [1, 2, 3]
+    paths = {candidate["file_path"] for candidate in body["candidates"]}
+    assert len(paths) == 3
+
+    chosen = body["candidates"][1]
+    saved = client.post(
+        "/v1/voices/design",
+        json={
+            "name": "audition",
+            "instruct": "warm, low narrator",
+            "take": chosen["take"],
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["voice_id"]
+    assert saved.json()["preview_file_path"] == chosen["file_path"], (
+        "saving the chosen take must reuse the cached candidate"
+    )
+
+
+@pytest.mark.parametrize("count", [0, 6])
+def test_design_candidates_out_of_range_is_422(client, count):
+    response = client.post(
+        "/v1/voices/design",
+        json={"name": "audition", "instruct": "warm", "candidates": count},
+    )
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "BAD_REQUEST"
+
+
+def test_clone_voice_rejects_unsafe_name(client, ref_wav):
+    response = client.post(
+        "/v1/voices", json={"name": "../escape", "ref_audio_path": str(ref_wav)}
+    )
+    assert response.status_code == 422
+
+
+def test_design_voice_rejects_unsafe_name(client):
+    response = client.post(
+        "/v1/voices/design", json={"name": "bad\nname", "instruct": "warm"}
+    )
+    assert response.status_code == 422

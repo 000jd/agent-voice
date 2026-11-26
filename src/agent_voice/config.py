@@ -42,11 +42,23 @@ class Settings(BaseSettings):
     )
     min_free_vram_gb: float = Field(default=2.0, alias="MIN_FREE_VRAM_GB")
     enable_vram_pressure_yield: bool = Field(default=True, alias="ENABLE_VRAM_PRESSURE_YIELD")
+    max_queue_depth: int = Field(default=64, ge=1, alias="MAX_QUEUE_DEPTH")
+    """Uncached GPU jobs waiting behind an engine lock before admission returns 429.
+
+    Cache hits and read-only calls never enter this queue: they are answered before
+    the engine slot is requested.
+    """
 
     # --- Cache / audio --------------------------------------------------
     max_cache_gb: float = Field(default=5.0, alias="MAX_CACHE_GB")
     chunk_chars: int = Field(default=400, ge=1, alias="CHUNK_CHARS")
     max_text_chars: int = Field(default=20000, ge=1, alias="MAX_TEXT_CHARS")
+    max_script_beats: int = Field(default=200, ge=1, alias="MAX_SCRIPT_BEATS")
+    max_instruct_chars: int = Field(default=1000, ge=1, alias="MAX_INSTRUCT_CHARS")
+    max_design_sample_chars: int = Field(
+        default=500, ge=1, alias="MAX_DESIGN_SAMPLE_CHARS"
+    )
+    max_ref_text_chars: int = Field(default=2000, ge=1, alias="MAX_REF_TEXT_CHARS")
     normalize_lufs: float = Field(default=-16.0, alias="NORMALIZE_LUFS")
 
     # --- Streaming ------------------------------------------------------
@@ -60,10 +72,14 @@ class Settings(BaseSettings):
         default=False, alias="ALLOW_AGENT_ENGINE_MUTATION"
     )
     require_engine_approval: bool = Field(
-        default=False, alias="REQUIRE_ENGINE_APPROVAL"
+        default=True, alias="REQUIRE_ENGINE_APPROVAL"
     )
     """When true, register_engine stages a plugin under engines/.pending/<id>/
-    instead of activating it. An operator promotes it with `engines approve`."""
+    instead of activating it. An operator promotes it with `engines approve`.
+
+    On by default: an agent-authored plugin is Python the daemon will execute, so a
+    human approval gate is the safe default even when mutation is enabled.
+    """
     toolset: Literal["auto", "core", "full"] = Field(default="auto", alias="AGENT_VOICE_TOOLSET")
     """Which MCP tools to expose.
 
@@ -148,6 +164,10 @@ class Settings(BaseSettings):
     @property
     def bindings_path(self) -> Path:
         return self.data_dir / "bindings.json"
+
+    @property
+    def pronunciations_path(self) -> Path:
+        return self.data_dir / "pronunciations.json"
 
     @property
     def daemon_lock_path(self) -> Path:
