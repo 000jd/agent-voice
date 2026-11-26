@@ -11,7 +11,7 @@ given for every release so a tag can be verified against the history.
 
 No unreleased changes.
 
-## [0.4.0] — 2026-11-26 — unreleased
+## [0.4.0] — 2026-11-26 — `9d6ede1`
 
 "Expressive markup, a zero-GPU Kokoro engine, scoped lexicons and code mode."
 
