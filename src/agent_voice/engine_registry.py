@@ -312,13 +312,17 @@ class EngineRegistry:
             )
         return record
 
-    def require_installed(self, engine_id: str) -> EngineRecord:
+    def require_installed(
+        self, engine_id: str, *, allow_agent_mutation: bool = False
+    ) -> EngineRecord:
         record = self.get(engine_id)
         if not record.installed:
+            suggestion = f"Run `agent-voice engines install {engine_id}`"
+            suggestion += " or call install_engine()." if allow_agent_mutation else "."
             raise AgentVoiceError(
                 ErrorCode.ENGINE_NOT_INSTALLED,
                 f"engine '{engine_id}' is not installed: {record.why_unavailable}",
-                f"Run `agent-voice engines install {engine_id}` or call install_engine().",
+                suggestion,
             )
         return record
 

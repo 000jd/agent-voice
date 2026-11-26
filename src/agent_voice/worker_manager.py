@@ -406,7 +406,9 @@ class WorkerManager:
         return handle
 
     async def ensure_worker(self, engine_id: str) -> WorkerHandle:
-        record = self.registry.require_installed(engine_id)
+        record = self.registry.require_installed(
+            engine_id, allow_agent_mutation=self.settings.allow_agent_engine_mutation
+        )
         handle = self._workers.get(engine_id)
         if handle is not None and handle.alive:
             return handle
@@ -728,9 +730,11 @@ class WorkerManager:
     def _real_time_factor(elapsed_ms: int, duration_sec: float) -> float | None:
         """Speech duration divided by wall clock: >1.0 means faster than real time.
 
-        This is the definition the public contract states, so a render that takes
-        10.5 s to produce 9.0 s of audio is 0.86 (slower than real time), and one
-        that produces 1.92 s in 0.27 s is 7.1 (about 7x faster).
+        Reported as ``realtime_multiple`` plus its deprecated alias
+        ``real_time_factor``. This is the definition the public contract states,
+        so a render that takes 10.5 s to produce 9.0 s of audio is 0.86 (slower
+        than real time), and one that produces 1.92 s in 0.27 s is 7.1 (about 7x
+        faster).
 
         ``None`` when the duration is unknown (a non-WAV cache entry written before
         the sidecar existed). On a cache hit ``elapsed_ms`` is only the lookup cost,
@@ -961,6 +965,7 @@ class WorkerManager:
                     path.unlink(missing_ok=True)
 
         elapsed_ms = self._elapsed_ms(started)
+        realtime_multiple = self._real_time_factor(elapsed_ms, duration_sec)
         return SynthesisResult(
             artifact_id=artifact_id,
             file_path=str(final),
@@ -981,7 +986,8 @@ class WorkerManager:
             chunks_used=chunks_used,
             elapsed_ms=elapsed_ms,
             take=take,
-            real_time_factor=self._real_time_factor(elapsed_ms, duration_sec),
+            realtime_multiple=realtime_multiple,
+            real_time_factor=realtime_multiple,
         )
 
     def _cached_result(
@@ -1028,6 +1034,8 @@ class WorkerManager:
             duration_sec = 0.0
 
         elapsed_ms = self._elapsed_ms(started)
+        # A hit only paid the lookup, so this factor is huge by construction.
+        realtime_multiple = self._real_time_factor(elapsed_ms, duration_sec)
         return SynthesisResult(
             artifact_id=artifact_id,
             file_path=str(target),
@@ -1046,8 +1054,8 @@ class WorkerManager:
             chunks_used=int(meta.get("chunks_used") or 1),
             elapsed_ms=elapsed_ms,
             take=take,
-            # A hit only paid the lookup, so this factor is huge by construction.
-            real_time_factor=self._real_time_factor(elapsed_ms, duration_sec),
+            realtime_multiple=realtime_multiple,
+            real_time_factor=realtime_multiple,
         )
 
     def _elapsed_ms(self, started: float) -> int:

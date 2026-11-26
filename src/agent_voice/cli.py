@@ -172,6 +172,449 @@ def unload(
 
 
 # ---------------------------------------------------------------------------
+# doctor / mcp-config
+# ---------------------------------------------------------------------------
+
+# A check is PASS (usable), WARN (works, but degraded or unconfigured) or FAIL
+# (this checkout cannot serve requests as configured). Only FAIL exits non-zero:
+# no `.env` and a CPU-only box are both supported setups.
+_CHECK_COLOUR = {
+    "PASS": typer.colors.GREEN,
+    "WARN": typer.colors.YELLOW,
+    "FAIL": typer.colors.RED,
+}
+
+# Clients that get an MCP snippet. `Literal` makes Typer reject anything else
+# with a usage error that lists the choices.
+McpClient = Literal["claude-code", "claude-desktop", "vscode", "cursor", "command-code"]
+
+
+@dataclass
+class _Check:
+    """One doctor row. ``fix`` is the single line to act on for a WARN/FAIL."""
+
+    name: str
+    status: Literal["PASS", "WARN", "FAIL"]
+    detail: str = ""
+    fix: str = ""
+
+
+def _one_line(text: object) -> str:
+    """Collapse a tool's multi-line message, so one check stays one row."""
+    return " ".join(str(text or "").split())
+
+
+def _print_checks(checks: list[_Check]) -> None:
+    """Print `check | result | detail`, plus a `fix:` line under every warning.
+
+    Plain `typer.echo` on purpose: the doctor runs before anything is installed,
+    so it must not depend on a rich renderer being available.
+    """
+    header = ("check", "result", "detail")
+    result_width = len(header[1])
+    name_width = max([len(header[0])] + [len(check.name) for check in checks])
+    detail_width = max(
+        24, min(96, max([len(header[2])] + [len(check.detail) for check in checks]))
+    )
+
+    typer.echo(f"{header[0]:<{name_width}}  {header[1]:<{result_width}}  {header[2]}")
+    typer.echo(f"{'-' * name_width}  {'-' * result_width}  {'-' * detail_width}")
+    blank = f"{'':<{name_width}}  {'':<{result_width}}  "
+    for check in checks:
+        detail = check.detail
+        if len(detail) > detail_width:
+            detail = f"{detail[: detail_width - 3]}..."
+        result = typer.style(
+            f"{check.status:<{result_width}}", fg=_CHECK_COLOUR[check.status], bold=True
+        )
+        typer.echo(f"{check.name:<{name_width}}  {result}  {detail}")
+        if check.fix and check.status != "PASS":
+            typer.echo(f"{blank}fix: {check.fix}")
+
+
+def _python_check() -> _Check:
+    """The interpreter doctor runs under. pyproject pins 3.12, not just >=3.12."""
+    import platform
+
+    version = platform.python_version()
+    if sys.version_info[:2] != (3, 12):
+        return _Check(
+            "python",
+            "WARN",
+            f"{version} (pyproject requires >=3.12,<3.13)",
+            "run it as `uv run agent-voice doctor` so the project venv is used",
+        )
+    return _Check("python", "PASS", version)
+
+
+def _probe_gpu() -> _Check:
+    """nvidia-smi presence and answer. A CPU/mock-only box is never a FAIL."""
+    import shutil
+    import subprocess
+
+    binary = shutil.which("nvidia-smi")
+    if binary is None:
+        return _Check(
+            "gpu",
+            "WARN",
+            "no nvidia-smi: mock/CPU only",
+            "install the NVIDIA driver for GPU engines; `--engine mock` needs no GPU",
+        )
+
+    # argv list, shell=False: no string ever reaches a shell.
+    argv = [binary, "--query-gpu=name,memory.total", "--format=csv,noheader"]
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=20, shell=False, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _Check(
+            "gpu",
+            "WARN",
+            f"nvidia-smi did not run: {_one_line(exc)}",
+            "reinstall the NVIDIA driver, or use `--engine mock`",
+        )
+
+    stdout = _one_line(getattr(result, "stdout", ""))
+    if getattr(result, "returncode", 1) != 0 or not stdout:
+        reason = _one_line(getattr(result, "stderr", "")) or (
+            f"exit code {getattr(result, 'returncode', '?')}"
+        )
+        return _Check(
+            "gpu",
+            "WARN",
+            f"nvidia-smi failed: {reason}",
+            "reinstall the NVIDIA driver, or use `--engine mock`",
+        )
+    return _Check("gpu", "PASS", stdout)
+
+
+def _check_port(host: str, port: int, base_url: str) -> _Check:
+    """Is `host:port` free, or already occupied by a healthy daemon?
+
+    A bind is the only honest availability test. When it fails the port is taken,
+    which is fine if the thing holding it answers `/health` (a running daemon);
+    anything else would make `serve` fail with EADDRINUSE.
+    """
+    import socket
+
+    import httpx
+
+    label = f"{host}:{port}"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            # SO_REUSEADDR forgives TIME_WAIT, never a live listener.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+    except OSError as exc:
+        bind_error = _one_line(exc)
+    else:
+        return _Check("port", "PASS", f"{label} is free")
+
+    try:
+        response = httpx.get(f"{base_url}/health", timeout=2.0)
+        healthy = response.status_code == 200 and bool(response.json())
+    except (httpx.HTTPError, ValueError):
+        healthy = False
+    if healthy:
+        return _Check("port", "PASS", f"{label} already serves a healthy daemon")
+    return _Check(
+        "port",
+        "FAIL",
+        f"{label} in use ({bind_error})",
+        f"stop the process holding {label}, or set AGENT_VOICE_PORT to a free port in .env",
+    )
+
+
+def _engine_checks(entries, engines_dir: Path, default_engine: str) -> list[_Check]:
+    """One row per discovered engine; nothing installed is a FAIL, not a warning."""
+    if not any(entry.installed for entry in entries):
+        discovered = [entry.engine_id for entry in entries]
+        # Suggest something that exists: the configured default when it was
+        # discovered, else the first engine there is, else the bundled mock.
+        if default_engine in discovered:
+            suggested = default_engine
+        else:
+            suggested = discovered[0] if discovered else "mock"
+        return [
+            _Check(
+                "engines",
+                "FAIL",
+                f"no engine installed in {engines_dir}; "
+                f"discovered: {', '.join(discovered) or '(none)'}",
+                f"agent-voice engines install {suggested}",
+            )
+        ]
+
+    checks: list[_Check] = []
+    for entry in entries:
+        if entry.installed:
+            checks.append(
+                _Check(
+                    f"engines: {entry.engine_id}",
+                    "PASS",
+                    f"{entry.backend_name} {entry.backend_version}",
+                )
+            )
+            continue
+        checks.append(
+            _Check(
+                f"engines: {entry.engine_id}",
+                "WARN",
+                entry.why_unavailable or "not installed",
+                f"agent-voice engines install {entry.engine_id}",
+            )
+        )
+    return checks
+
+
+def _model_checks(entries) -> list[_Check]:
+    """Which declared weights are actually on disk.
+
+    `local/` repos ship with the engine and count as present, exactly like the
+    router (`api/routing.py`) treats them — otherwise the dependency-free mock
+    engine would report every model as missing.
+    """
+    present = 0
+    missing: list[tuple[str, str, str]] = []
+    for entry in entries:
+        for model in entry.models:
+            if model.downloaded_locally or model.hf_repo.startswith("local/"):
+                present += 1
+            else:
+                missing.append((entry.engine_id, model.alias, model.hf_repo))
+
+    total = present + len(missing)
+    if total == 0:
+        return [
+            _Check(
+                "models",
+                "WARN",
+                "no engine declares a model",
+                "check that each engines/<id>/engine.yaml lists its models",
+            )
+        ]
+    if not missing:
+        return [_Check("models", "PASS", f"{present}/{total} weights present")]
+    return [
+        _Check(
+            f"models: {engine_id}/{alias}",
+            "WARN",
+            f"{hf_repo} not downloaded",
+            f"agent-voice models download {engine_id} {alias}",
+        )
+        for engine_id, alias, hf_repo in missing
+    ]
+
+
+def _inbox_check(settings) -> _Check:
+    """Create the data dirs the daemon needs, and report the confinement root."""
+    try:
+        settings.ensure_dirs()
+    except OSError as exc:
+        return _Check(
+            "inbox",
+            "FAIL",
+            f"not usable: {settings.inbox_dir} ({_one_line(exc)})",
+            f"create {settings.data_dir}, or point DATA_DIR at a writable path",
+        )
+    return _Check("inbox", "PASS", str(settings.inbox_dir))
+
+
+def _env_check(
+    *,
+    default_engine: str,
+    known: list[str],
+    installed: list[str],
+    engines_usable: bool = True,
+) -> _Check:
+    """`.env` presence, plus whether the configured default engine can serve.
+
+    `settings.default_engine` is the *effective* value (a shell variable beats the
+    file, as it does for the daemon), so this checks what would really be used.
+    Only engine ids are ever printed: a `.env` also holds API keys, and this
+    command's output is the kind of thing a user pastes into an issue.
+    """
+    fallback = installed[0] if installed else "mock"
+    if not (Path.cwd() / ".env").is_file():
+        return _Check(".env", "WARN", "absent, built-in defaults apply", "cp .env.example .env")
+    if not engines_usable:
+        # One root cause, one row: the engines row already carries the FAIL.
+        return _Check(
+            ".env",
+            "WARN",
+            "present; default engine not checked (engines are unusable)",
+            "fix the engines row first, then re-run doctor",
+        )
+    if not default_engine:
+        return _Check(
+            ".env",
+            "FAIL",
+            "AGENT_VOICE_DEFAULT_ENGINE is empty",
+            f"set AGENT_VOICE_DEFAULT_ENGINE={fallback} in .env",
+        )
+    if not known:
+        return _Check(
+            ".env",
+            "FAIL",
+            f"AGENT_VOICE_DEFAULT_ENGINE={default_engine} resolves to no engine",
+            "agent-voice engines install mock (the bundled, dependency-free engine)",
+        )
+    if default_engine not in known:
+        return _Check(
+            ".env",
+            "FAIL",
+            f"AGENT_VOICE_DEFAULT_ENGINE={default_engine} is not a discovered engine",
+            f"set AGENT_VOICE_DEFAULT_ENGINE to one of {', '.join(known)} in .env",
+        )
+    if default_engine not in installed:
+        return _Check(
+            ".env",
+            "WARN",
+            f"AGENT_VOICE_DEFAULT_ENGINE={default_engine} is not installed",
+            f"agent-voice engines install {default_engine}, or set "
+            f"AGENT_VOICE_DEFAULT_ENGINE={fallback} in .env",
+        )
+    return _Check(".env", "PASS", f"AGENT_VOICE_DEFAULT_ENGINE={default_engine} (installed)")
+
+
+@app.command()
+def doctor() -> None:
+    """Check this machine and checkout: tools, GPU, port, engines, weights, config.
+
+    One row per check and one `fix:` line under every WARN/FAIL. Exits non-zero
+    only on a FAIL, so a CPU-only box or a missing `.env` (both supported) still
+    return 0. Engine and model code stays imported inside this body: the doctor
+    must run on a machine that cannot import torch at all.
+    """
+    import shutil
+
+    from .engine_registry import EngineRegistry
+
+    settings = get_settings()
+    default_engine = settings.default_engine
+
+    # A broken ENGINES_DIR must show up as a FAIL row, not a traceback: the
+    # doctor is the command you run *because* the layout is wrong.
+    registry_error: _Check | None = None
+    known: list[str] = []
+    entries: list = []
+    try:
+        registry = EngineRegistry(settings.engines_dir)
+        entries = registry.list_entries()
+        known = registry.ids()
+    except OSError as exc:
+        registry_error = _Check(
+            "engines",
+            "FAIL",
+            # Reason first: a long path would otherwise eat the whole detail.
+            f"not usable: {settings.engines_dir} ({_one_line(exc)})",
+            f"create {settings.engines_dir}, or point ENGINES_DIR at the checkout",
+        )
+    installed = [entry.engine_id for entry in entries if entry.installed]
+
+    checks: list[_Check] = [_python_check()]
+
+    uv = shutil.which("uv")
+    checks.append(
+        _Check("uv", "PASS", uv)
+        if uv
+        else _Check(
+            "uv",
+            "FAIL",
+            "not on PATH",
+            "install uv: https://docs.astral.sh/uv/getting-started/installation/",
+        )
+    )
+
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    missing_tools = [
+        name for name, found in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe)) if not found
+    ]
+    if missing_tools:
+        checks.append(
+            _Check(
+                "ffmpeg",
+                "FAIL",
+                f"missing on PATH: {', '.join(missing_tools)}",
+                "install ffmpeg with ffprobe: `sudo apt install ffmpeg` "
+                "(macOS: `brew install ffmpeg`)",
+            )
+        )
+    else:
+        checks.append(_Check("ffmpeg", "PASS", f"{ffmpeg} (ffprobe present)"))
+
+    checks.append(_probe_gpu())
+    # `.env` before the engine rows: it decides which engine is *expected* to be
+    # installed, and a bad value there explains a confusing engine row.
+    checks.append(
+        _env_check(
+            default_engine=default_engine,
+            known=known,
+            installed=installed,
+            engines_usable=registry_error is None,
+        )
+    )
+    if registry_error is not None:
+        checks.append(registry_error)
+    else:
+        checks.extend(_engine_checks(entries, settings.engines_dir, default_engine))
+        checks.extend(_model_checks(entries))
+    checks.append(_inbox_check(settings))
+    # Daemon health last: it is the only row that can legitimately be "in use".
+    checks.append(_check_port(settings.host, settings.port, settings.base_url))
+
+    _print_checks(checks)
+    failures = [check for check in checks if check.status == "FAIL"]
+    warnings = [check for check in checks if check.status == "WARN"]
+    if failures:
+        typer.secho(
+            f"doctor: {len(failures)} failed, {len(warnings)} warning(s) — "
+            "fix the FAIL rows above",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.secho(
+        f"doctor: {len(checks)} checks, {len(warnings)} warning(s), no failures",
+        fg=typer.colors.GREEN,
+    )
+
+
+@app.command("mcp-config")
+def mcp_config(
+    client: McpClient = typer.Option(
+        ...,
+        "--client",
+        help="Target client: claude-code, claude-desktop, vscode, cursor or command-code.",
+    ),
+) -> None:
+    """Print a ready-to-paste MCP server snippet for one client.
+
+    JSON on stdout with the absolute path to this checkout, so it needs neither a
+    daemon nor a network: paste it into the client's config file under the key
+    that client expects. `AGENT_VOICE_CLIENT_ID` becomes the `X-Agent-Id` header,
+    which selects that client's per-agent binding.
+    """
+    root = Path(__file__).resolve().parents[2]
+    server: dict[str, object] = {
+        "command": "uv",
+        "args": ["run", "--directory", str(root), "agent-voice", "mcp"],
+        "env": {"AGENT_VOICE_CLIENT_ID": client},
+    }
+
+    if client == "vscode":
+        # VS Code's `.vscode/mcp.json` uses a `servers` key and spells out the
+        # transport; the other four clients share Claude's `mcpServers` shape.
+        payload: dict[str, object] = {"servers": {"agent-voice": {"type": "stdio", **server}}}
+    else:
+        payload = {"mcpServers": {"agent-voice": server}}
+
+    typer.echo(json.dumps(payload, indent=2))
+
+
+# ---------------------------------------------------------------------------
 # engines
 # ---------------------------------------------------------------------------
 

@@ -41,7 +41,7 @@ and never wakes the GPU. It tells you the version, default engine/voice,
 ```
 server_info() -> {version, default_engine, default_voice, voices_count, voices[],
                   preset_speakers[], voice_design_available, installed_engines[],
-                  engines[], gpu_status{}}
+                  engines[], next_steps[], inbox_dir, gpu_status{}}
 ```
 
 Decisions to make from it:
@@ -52,6 +52,9 @@ Decisions to make from it:
 - `voice_design_available` → `design_voice` can run on the default engine without downloading
   another checkpoint.
 - `installed_engines` empty → no engine can run; report that, don't retry blindly.
+- `next_steps[]` → non-empty means the server cannot speak as configured yet; each entry
+  is the exact fix (install an engine, download weights, clone or design a voice). Empty
+  means you are ready.
 - `engines[].why_unavailable` explains exactly why an engine can't be used.
 - `gpu_status.loaded_models` non-empty → a model is already resident, so your first
   request is warm (fast); empty means a cold start is coming (tens of seconds).
@@ -271,9 +274,9 @@ returns the same artifact.
 - `elapsed_ms` — wall-clock cost of the call. Near zero on a cache hit.
 - `cached: true` — the disk cache answered; nothing touched the GPU.
 - `take` — which alternate delivery this is; `null` for the canonical take.
-- `real_time_factor` — **`duration_sec / elapsed_sec`**: above 1.0 means faster than real
+- `realtime_multiple` — **`duration_sec / elapsed_sec`**: above 1.0 means faster than real
   time (3.0 renders 30 s of speech in 10 s), below 1.0 means slower. `null` when the
-  duration is unknown.
+  duration is unknown. `real_time_factor` is the same value under its deprecated name.
   - On a cache hit the ratio is meaningless — `elapsed_ms` is only the ~1 ms lookup. Read it
     from a real render, and pair it with `cached`.
   - Reference point: a warm 0.6B render on the reference box measured 10.5 s of wall time
@@ -294,7 +297,7 @@ payload.
 | `TEXT_TOO_LONG` | Text over a configured cap (`MAX_TEXT_CHARS`, `MAX_INSTRUCT_CHARS`, `MAX_REF_TEXT_CHARS`, `MAX_DESIGN_SAMPLE_CHARS`) | Shorten it, split it into `speak_script` beats, or ask the operator to raise the cap |
 | `BAD_REQUEST` | The request is invalid — too many beats (`MAX_SCRIPT_BEATS`), a bad voice name, empty text | Fix the request; retrying it unchanged fails identically |
 | `CUDA_OOM` | The worker ran out of GPU memory | `unload_models()`, or use the 0.6b model (`quality="fast"`) |
-| `ENGINE_NOT_INSTALLED` | Engine present but its venv/deps are missing | `install_engine(engine_id)` (needs `ALLOW_AGENT_ENGINE_MUTATION=true`) |
+| `ENGINE_NOT_INSTALLED` | Engine present but its venv/deps are missing | `agent-voice engines install <id>`, or `install_engine(engine_id)` when mutation is enabled |
 | `AGENT_MUTATION_DISABLED` | Mutation is off, or you are not on loopback | Report it; do not retry. An operator has to enable it |
 | `DAEMON_RESTARTED` | Your job was pending or running when the daemon stopped | It cannot be resumed. Submit it again |
 | `JOB_CANCELLED` | The job was cancelled (by you, an unload, or a shutdown) | Resubmit if you still want the audio |

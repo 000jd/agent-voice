@@ -40,11 +40,17 @@ def _real(path: Path) -> Path:
     return Path(os.path.realpath(path))
 
 
-def ensure_within_base(path: str | Path, base: str | Path) -> Path:
+def ensure_within_base(
+    path: str | Path, base: str | Path, *, suggestion: str = ""
+) -> Path:
     """Return the resolved path if it is genuinely inside ``base``.
 
     Rejects traversal (``..``), absolute escapes, and symlinks — including
     symlinked *ancestors*, which a naive ``startswith`` check would miss.
+
+    ``suggestion`` lets a caller name the actual destination (the inbox, a
+    sandbox root) in the ``PATH_OUTSIDE_BASE`` fix; the default keeps the
+    historical MCP_BASE_PATH wording.
     """
     base_real = _real(Path(base))
     candidate = Path(path)
@@ -55,7 +61,8 @@ def ensure_within_base(path: str | Path, base: str | Path) -> Path:
         raise AgentVoiceError(
             ErrorCode.PATH_OUTSIDE_BASE,
             f"refusing to follow symlink: {candidate}",
-            "Pass the real file inside MCP_BASE_PATH, not a link to it.",
+            suggestion
+            or "Pass the real file inside MCP_BASE_PATH, not a link to it.",
         )
 
     resolved = _real(candidate)
@@ -63,7 +70,7 @@ def ensure_within_base(path: str | Path, base: str | Path) -> Path:
         raise AgentVoiceError(
             ErrorCode.PATH_OUTSIDE_BASE,
             f"path escapes MCP_BASE_PATH: {path}",
-            f"Move the file inside {base_real} or unset MCP_BASE_PATH.",
+            suggestion or f"Move the file inside {base_real} or unset MCP_BASE_PATH.",
         )
     return resolved
 

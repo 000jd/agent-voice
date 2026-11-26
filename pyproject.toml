@@ -4,11 +4,38 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-voice"
-version = "0.3.2"
+version = "0.3.3"
 description = "Headless, UI-free, multi-engine voice cloning and speech synthesis server for AI agents"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-license = { text = "MIT" }
+license = "MIT"
+keywords = [
+    "tts",
+    "text-to-speech",
+    "speech-synthesis",
+    "voice-cloning",
+    "voice-design",
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "local-first",
+    "fastapi",
+    "qwen3-tts",
+    "cuda",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: No Input/Output (Daemon)",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 # CORE DAEMON ONLY. This environment must never install torch.
 # Engine dependencies live in engines/<engine_id>/pyproject.toml.
@@ -42,6 +69,12 @@ demo = [
     # engine venvs must stay lean.
     "manim>=0.18",
 ]
+
+[project.urls]
+Homepage = "https://github.com/000jd/agent-voice"
+Repository = "https://github.com/000jd/agent-voice"
+Issues = "https://github.com/000jd/agent-voice/issues"
+Changelog = "https://github.com/000jd/agent-voice/blob/main/CHANGELOG.md"
 
 [project.scripts]
 agent-voice = "agent_voice.cli:app"

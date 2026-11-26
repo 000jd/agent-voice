@@ -444,9 +444,11 @@ class SynthesisResult(BaseModel):
     take: int | None = None
     """Which alternate delivery was rendered. A new take yields different audio
     without disturbing the cache entry for take 1."""
+    realtime_multiple: float | None = None
+    """duration_sec / elapsed_sec: 0.86 means slightly slower than real time,
+    7.1 about 7x faster. None for streamed output."""
     real_time_factor: float | None = None
-    """duration_sec / elapsed_sec. Above 1.0 means faster than real time, so a
-    3x RTF renders 30 s of speech in 10 s. None for streamed output."""
+    """Deprecated alias of realtime_multiple, kept for one release."""
 
 
 class BeatSpec(BaseModel):

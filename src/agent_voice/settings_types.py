@@ -39,12 +39,16 @@ class SettingsLike(Protocol):
     require_engine_approval: bool
     toolset: str
     allowed_hosts: list[str]
+    allow_any_path: bool
     mcp_base_path: str
     data_dir: Path
     engines_dir: Path
 
     @property
     def voices_dir(self) -> Path: ...
+
+    @property
+    def inbox_dir(self) -> Path: ...
 
     @property
     def cache_dir(self) -> Path: ...

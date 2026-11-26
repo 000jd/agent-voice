@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from agent_voice.api.app import create_app
 from agent_voice.config import Settings
@@ -230,8 +231,8 @@ def test_audio_wildcard_does_not_list_artifacts(client):
 
 def test_bearer_comparison_uses_compare_digest():
     """A byte-by-byte compare leaks the key prefix through timing."""
-    source = (REPO_ROOT / "src" / "agent_voice" / "api" / "app.py").read_text("utf-8")
-    assert "compare_digest" in source, "bearer_auth must use hmac.compare_digest"
+    source = (REPO_ROOT / "src" / "agent_voice" / "api" / "guard.py").read_text("utf-8")
+    assert "compare_digest" in source, "GuardMiddleware must use hmac.compare_digest"
 
 
 def test_wrong_key_length_rejected(authed_client):
@@ -440,3 +441,54 @@ def test_testserver_rejected_when_not_configured(tmp_path, monkeypatch):
 def test_allowed_hosts_accepts_all_documented_forms(tmp_path, raw):
     settings = _settings(tmp_path, AGENT_VOICE_ALLOWED_HOSTS=raw)
     assert isinstance(settings.allowed_hosts, list)
+
+
+# ---------------------------------------------------------------------------
+# v0.3.3: WebSocket handshake follows the same Host/Origin/auth rules
+# ---------------------------------------------------------------------------
+
+
+def _ws_close_code(test_client, **kwargs) -> int:
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with test_client.websocket_connect("/v1/audio/ws", **kwargs):
+            pass
+    return exc.value.code
+
+
+def test_ws_foreign_origin_is_rejected(client):
+    """A page on another origin must not attach to the audio socket."""
+    assert _ws_close_code(client, headers={"origin": "http://evil.example.com"}) == 1008
+
+
+def test_ws_foreign_host_is_rejected(client):
+    assert _ws_close_code(client, headers={"host": "evil.example.com"}) == 1008
+
+
+def test_ws_without_token_is_rejected(authed_client):
+    assert _ws_close_code(authed_client) == 1008
+
+
+def test_ws_authorization_bearer_connects(authed_client):
+    with authed_client.websocket_connect(
+        "/v1/audio/ws", headers={"Authorization": "Bearer secret-key"}
+    ) as ws:
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json() == {"type": "pong"}
+
+
+def test_ws_subprotocol_bearer_connects(authed_client):
+    """Browser clients cannot set Authorization; the subprotocol carries the token."""
+    with authed_client.websocket_connect(
+        "/v1/audio/ws", subprotocols=["bearer", "secret-key"]
+    ) as ws:
+        assert ws.accepted_subprotocol == "bearer"
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json() == {"type": "pong"}
+
+
+def test_ws_loopback_origin_connects_without_key(client):
+    with client.websocket_connect(
+        "/v1/audio/ws", headers={"origin": "http://127.0.0.1:8000"}
+    ) as ws:
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json() == {"type": "pong"}

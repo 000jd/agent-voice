@@ -34,6 +34,9 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     # code). Tests that exercise live registration opt out explicitly; staging
     # tests set it back to true.
     monkeypatch.setenv("REQUIRE_ENGINE_APPROVAL", "false")
+    # Legacy tests keep using clips from tmp_path; the inbox-default tests set
+    # AGENT_VOICE_ALLOW_ANY_PATH=false explicitly and use <DATA_DIR>/inbox/.
+    monkeypatch.setenv("AGENT_VOICE_ALLOW_ANY_PATH", "true")
     monkeypatch.setenv("MODEL_IDLE_TTL_SECONDS", "900")
     monkeypatch.setenv("MIN_ENGINE_RESIDENCY_SECONDS", "60")
     # Starlette's TestClient sends `Host: testserver`. That name is deliberately

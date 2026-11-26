@@ -317,6 +317,17 @@ async def test_speak_payload_is_compact(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_speak_reports_realtime_multiple_and_its_deprecated_alias(tmp_path):
+    """v0.3.3 renames the RTF field; both names carry the same number for now."""
+    async with mcp_client(tmp_path) as (client, _app):
+        body = payload(await client.call_tool("speak", {"text": "How fast is this?"}))
+        assert "realtime_multiple" in body
+        assert "real_time_factor" in body
+        assert body["realtime_multiple"] == body["real_time_factor"]
+        assert body["realtime_multiple"] is not None, "a real render has a wall clock"
+
+
+@pytest.mark.asyncio
 async def test_speak_reports_structured_error_for_unknown_engine(tmp_path):
     async with mcp_client(tmp_path) as (client, _app):
         body = await call_expecting_error(client, "speak", {"text": "Hi.", "engine": "nope"})
@@ -622,6 +633,34 @@ async def test_register_engine_rejects_traversal(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# v0.3.3: toolset-aware ENGINE_NOT_INSTALLED suggestions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_engine_not_installed_suggestion_omits_the_absent_tool(tmp_path):
+    """With mutation off there is no install_engine() to offer, so do not name it."""
+    async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
+        body = await call_expecting_error(
+            client, "speak", {"text": "Hi.", "engine": "qwen3_tts"}
+        )
+        assert body["error_code"] == "ENGINE_NOT_INSTALLED"
+        assert "agent-voice engines install" in body["suggestion"]
+        assert "install_engine" not in body["suggestion"]
+
+
+@pytest.mark.asyncio
+async def test_engine_not_installed_suggestion_names_the_tool_when_enabled(tmp_path):
+    async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="true") as (client, _app):
+        body = await call_expecting_error(
+            client, "speak", {"text": "Hi.", "engine": "qwen3_tts"}
+        )
+        assert body["error_code"] == "ENGINE_NOT_INSTALLED"
+        assert "agent-voice engines install" in body["suggestion"]
+        assert "install_engine" in body["suggestion"]
+
+
+# ---------------------------------------------------------------------------
 # MCP_BASE_PATH output relocation
 # ---------------------------------------------------------------------------
 
@@ -655,6 +694,103 @@ async def test_clone_voice_confined_to_mcp_base(tmp_path):
             client, "clone_voice", {"name": "escape", "ref_audio_path": str(outside)}
         )
         assert body["error_code"] == "PATH_OUTSIDE_BASE"
+
+
+# ---------------------------------------------------------------------------
+# v0.3.3: inbox confinement for the agent-facing clone
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_clone_voice_rejects_outside_path_by_default(tmp_path):
+    async with mcp_client(tmp_path, AGENT_VOICE_ALLOW_ANY_PATH="false") as (client, _app):
+        for probe in ("/etc/passwd", "/proc/self/environ"):
+            body = await call_expecting_error(
+                client, "clone_voice", {"name": "probe", "ref_audio_path": probe}
+            )
+            assert body["error_code"] == "PATH_OUTSIDE_BASE"
+            assert "inbox" in body["suggestion"].lower()
+
+
+@pytest.mark.asyncio
+async def test_clone_voice_accepts_inbox_clip(tmp_path, ref_wav):
+    async with mcp_client(tmp_path, AGENT_VOICE_ALLOW_ANY_PATH="false") as (client, app):
+        inbox = app.state.ctx.settings.inbox_dir
+        target = inbox / "clip.wav"
+        target.write_bytes(ref_wav.read_bytes())
+        body = payload(
+            await client.call_tool(
+                "clone_voice", {"name": "inboxvoice", "ref_audio_path": str(target)}
+            )
+        )
+        assert body["name"] == "inboxvoice"
+
+
+@pytest.mark.asyncio
+async def test_clone_voice_allow_any_path_permits_outside_clip(tmp_path, ref_wav):
+    async with mcp_client(tmp_path, AGENT_VOICE_ALLOW_ANY_PATH="true") as (client, _app):
+        body = payload(
+            await client.call_tool(
+                "clone_voice", {"name": "outsidevoice", "ref_audio_path": str(ref_wav)}
+            )
+        )
+        assert body["name"] == "outsidevoice"
+
+
+@pytest.mark.asyncio
+async def test_server_info_includes_inbox_dir(tmp_path):
+    async with mcp_client(tmp_path) as (client, app):
+        info = payload(await client.call_tool("server_info", {}))
+        assert info["inbox_dir"] == str(app.state.ctx.settings.inbox_dir)
+
+
+@pytest.mark.asyncio
+async def test_server_info_next_steps_is_empty_when_ready(tmp_path):
+    """A ready server has nothing to fix: the mock engine ships preset speakers."""
+    async with mcp_client(tmp_path) as (client, _app):
+        info = payload(await client.call_tool("server_info", {}))
+        assert info["preset_speakers"], "the mock engine advertises preset timbres"
+        assert info["next_steps"] == []
+
+
+@pytest.mark.asyncio
+async def test_server_info_next_steps_names_engine_install_when_no_engine(tmp_path):
+    async with mcp_client(tmp_path, ENGINES_DIR=tmp_path / "empty-engines") as (client, _app):
+        info = payload(await client.call_tool("server_info", {}))
+        assert info["installed_engines"] == []
+        assert any(
+            "agent-voice engines install" in step for step in info["next_steps"]
+        ), info["next_steps"]
+
+
+def test_next_steps_mentions_the_download_for_a_missing_default_weight():
+    """An installed default engine with no cached weights is one download away."""
+    from types import SimpleNamespace
+
+    from agent_voice.mcp_server import _next_steps
+    from agent_voice.schemas import EngineEntry, ModelEntry
+
+    entry = EngineEntry(
+        engine_id="qwen3_tts",
+        backend_name="qwen-tts",
+        backend_version="0.1.1",
+        installed=True,
+        models=[
+            ModelEntry(
+                engine_id="qwen3_tts",
+                alias="1.7b-base",
+                hf_repo="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                quality_tier="high",
+                est_vram_gb=4.4,
+            )
+        ],
+    )
+    settings = SimpleNamespace(default_engine="qwen3_tts", inbox_dir=Path("/data/inbox"))
+
+    steps = _next_steps([entry], settings, voices_count=1, preset_speakers=["Ryan"])
+    assert len(steps) == 1, steps
+    assert "agent-voice models download qwen3_tts 1.7b-base" in steps[0]
+    assert "agent-voice doctor" in steps[0]
 
 
 # ---------------------------------------------------------------------------
@@ -713,10 +849,36 @@ async def test_core_tool_descriptions_stay_within_budget(tmp_path):
     async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
         tools = await client.list_tools()
         total = sum(len(tool.description or "") for tool in tools)
-        # ~4 chars per token; 1600 tokens is the budget agreed for the core set.
-        assert total < 6400, (
+        # ~4 chars per token; 750 tokens is the budget agreed for the core set.
+        assert total < 3000, (
             f"core tool descriptions are {total} chars (~{total // 4} tokens); "
             "move detail into skills/agent-voice/SKILL.md"
+        )
+
+
+@pytest.mark.asyncio
+async def test_core_tool_schema_weight_stays_compact(tmp_path):
+    """The whole core tools/list payload is prompt budget on every request.
+
+    A 10,000-char target (~2,500 tokens) is below the structural floor of these 12
+    tools: with every description removed the payload is still ~11,900 chars,
+    because each tool carries a typed input schema, an output schema for its
+    Pydantic result, and speak_script/start_script_job share the full BeatSpec
+    schema twice. Reaching 10,000 would mean deleting required fields or the
+    structured output contract, so the assertion pins the achievable weight
+    instead: 14,388 chars measured, with a little headroom for edits.
+    """
+    async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
+        tools = await client.list_tools()
+        compact = json.dumps(
+            [tool.model_dump(mode="json", exclude_none=True) for tool in tools],
+            separators=(",", ":"),
+            default=str,
+        )
+        assert len(compact) <= 14_800, (
+            f"core tools/list payload is {len(compact)} chars (~{len(compact) // 4} "
+            "tokens); keep docstrings to 1-2 sentences and add detail to "
+            "skills/agent-voice/SKILL.md"
         )
 
 

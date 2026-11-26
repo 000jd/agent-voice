@@ -325,7 +325,9 @@ def resolve_target(
             default_engine=settings.default_engine,
         )
 
-    record = registry.require_installed(engine_id)
+    record = registry.require_installed(
+        engine_id, allow_agent_mutation=settings.allow_agent_engine_mutation
+    )
     known_aliases = {spec.alias for spec in record.manifest.models}
 
     if alias is not None and alias not in known_aliases:

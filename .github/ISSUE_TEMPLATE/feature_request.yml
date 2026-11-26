@@ -1,0 +1,86 @@
+name: Feature request
+description: Suggest a capability, improvement or documentation change
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. This project is deliberately small and
+        local-first, so the most persuasive requests explain the problem first
+        and the mechanism second.
+
+        Useful context before you file:
+        - `README.md` is the landing page; reference detail lives in `docs/`
+          (`api.md`, `config.md`, `engines.md`, `troubleshooting.md`,
+          `install/agent.md`).
+        - The IPC protocol is frozen at v1, and the core daemon never imports
+          torch — proposals that need either should say how they fit.
+        - Security defaults (mutation off, loopback bind, inbox confinement) are
+          not negotiable for a new feature; see `SECURITY.md`.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - MCP tools / agent experience
+        - REST / OpenAI-compatible API
+        - Streaming / WebSocket
+        - Engines and checkpoints
+        - CLI
+        - Configuration
+        - Documentation
+        - Performance
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that is hard, awkward or impossible today?
+      placeholder: "As an agent, I want ..., but ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: The behaviour or interface you would like. Concrete commands, JSON bodies or tool signatures help.
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, or other designs you rejected and why
+    validations:
+      required: false
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and impact
+      description: |
+        Which parts would change? Does it need a new engine capability, a new
+        config variable, a new MCP tool, or a docs update? Would it require GPU
+        work to verify?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions for this request.
+          required: true
+        - label: This is a feature request, not a bug report or a security report.
+          required: true
+        - label: I am willing to open a pull request for this (optional).
+          required: false

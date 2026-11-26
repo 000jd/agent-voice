@@ -193,6 +193,42 @@ def _preset_speech_surface(
     return speakers, design_available
 
 
+def _next_steps(
+    entries: list[EngineEntry],
+    settings: SettingsLike,
+    *,
+    voices_count: int,
+    preset_speakers: list[str],
+) -> list[str]:
+    """Actionable advice for a server that cannot speak yet; empty when ready.
+
+    Reads manifests only, like the rest of ``server_info()``: it must never spawn
+    a worker or touch the GPU.
+    """
+    default = next(
+        (entry for entry in entries if entry.engine_id == settings.default_engine), None
+    )
+    steps: list[str] = []
+    if default is None or not default.installed:
+        steps.append(f"Run `agent-voice engines install {settings.default_engine}`.")
+    elif not any(
+        model.downloaded_locally or model.hf_repo.startswith("local/")
+        for model in default.models
+    ):
+        alias = default.models[0].alias if default.models else None
+        download = f" {settings.default_engine} {alias}" if alias else ""
+        steps.append(
+            f"No {settings.default_engine} weights are cached: run "
+            f"`agent-voice models download{download}` or `agent-voice doctor`."
+        )
+    if not voices_count and not preset_speakers:
+        steps.append(
+            f"Put a 3-10 s reference clip in {settings.inbox_dir} and call "
+            "clone_voice(), or call design_voice()."
+        )
+    return steps
+
+
 def _guide_text() -> str:
     """Read the agent guide, falling back to a short summary when it is absent.
 
@@ -272,25 +308,11 @@ def build_mcp_server(ctx) -> FastMCP:
     # set documented below is always exactly what the caller gets back.
     @tool(annotations=read_only)
     async def server_info() -> dict[str, Any]:
-        """Call this first: a free, side-effect-free snapshot of the whole server.
+        """Call this first: a free, GPU-free snapshot of what this machine can do.
 
-        Use it whenever you do not yet know what this machine can do. It never
-        spawns a worker and never touches the GPU, so it costs nothing to call.
-
-        Read:
-            version: daemon version.
-            default_engine, default_voice: what speak() uses when you pass neither.
-            voices_count: 0 means you must clone_voice() before you can speak.
-            voices[]: voice_id, name, duration_sec for every registered voice.
-            preset_speakers[]: names speak(speaker=...) accepts on the default
-                engine right now; empty means only a cloned voice or
-                design_voice() can produce audio.
-            voice_design_available: whether design_voice() can run on the
-                default engine without a download.
-            installed_engines[]: ids of engines that can run right now.
-            engines[]: engine_id, installed, streaming, why_unavailable — the last
-                is the concrete reason an engine cannot be used.
-            gpu_status: the same snapshot gpu_status() returns (see its notes).
+        Read: default_engine, default_voice, voices_count, inbox_dir,
+        preset_speakers[], installed_engines[] and next_steps[], which says what to
+        fix when the server is not ready to speak.
         """
         from . import __version__
 
@@ -318,8 +340,15 @@ def build_mcp_server(ctx) -> FastMCP:
                 for voice in voices
             ],
             "installed_engines": [e.engine_id for e in entries if e.installed],
+            "inbox_dir": str(settings.inbox_dir),
             "preset_speakers": preset_speakers,
             "voice_design_available": voice_design_available,
+            "next_steps": _next_steps(
+                entries,
+                settings,
+                voices_count=len(voices),
+                preset_speakers=preset_speakers,
+            ),
             "engines": [
                 {
                     "engine_id": e.engine_id,
@@ -349,47 +378,16 @@ def build_mcp_server(ctx) -> FastMCP:
         take: int | None = None,
         pronunciations: dict[str, str] | None = None,
     ) -> SynthesisResult:
-        """Synthesise ONE utterance to a file. For several beats use speak_script().
+        """Synthesise ONE utterance to a file; use speak_script() for several beats.
 
-        Use it for a single line: no timing metadata, no stitching, cheapest path
-        to audio. Repeating the same call is free (deterministic disk cache).
+        Read: file_path (read this; audio is never inlined), duration_sec, cached
+        (a repeat is free), elapsed_ms, and realtime_multiple = duration_sec /
+        elapsed_sec (0.86 = slightly slower than real time, 7.1 = ~7x faster).
+        real_time_factor is a deprecated alias of realtime_multiple.
 
         Args:
-            text: What to say.
-            voice: Voice id or name. Defaults to the agent binding, then the server default.
-            speaker: Preset speaker on a custom_voice model (see server_info()).
-            instruct: Delivery/style instruction, e.g. "slow, warm and calm".
-            engine: Engine id, e.g. qwen3_tts_fast. Defaults to the configured engine.
-            model: Model alias, or `engine:model`. Overrides `quality`.
-            quality: "high" (1.7B, better) or "fast" (0.6B, quicker and smaller).
-            language: "Auto" or a language name such as "English".
-            format: wav, mp3, opus, flac or pcm.
-            seed: Fixed seed: the same inputs then produce byte-identical audio.
-            speed: Playback-rate multiplier applied by the engine.
-            take: Alternate delivery of the same line. take=2 derives a repeatable
-                new seed, so you can audition a different read of one line without
-                losing the canonical one. Omit for the canonical delivery.
-            pronunciations: Per-call word -> spoken-form overrides for this line,
-                e.g. {"kubectl": "kube control"}. Merged over the server lexicon.
-
-        Read:
-            file_path: absolute local path; read this. Audio is never returned inline.
-            download_url: HTTP URL for the same artifact, if you would rather hand a
-                URL to another process than copy bytes yourself.
-            duration_sec, format, engine_id, model_alias, voice_id: what was produced.
-            mode, speaker: which routing mode actually spoke — "clone" when a
-                reference voice was used, else the preset speaker name.
-            cached: true when the deterministic disk cache answered. The audio is
-                byte-identical to the original render and nothing touched the GPU,
-                so a repeat call is free — do not pre-render out of fear of cost.
-            chunks_used: >1 means the text exceeded the chunk limit and was
-                synthesised in pieces and stitched. Normal, not an error.
-            elapsed_ms: Wall-clock cost. Near zero on a cache hit, which makes a
-                latency regression obvious to a caller.
-            take: which alternate delivery this file is; null for the canonical take.
-            real_time_factor: duration_sec / elapsed_sec. Above 1.0 is faster than
-                real time, so 3.0 renders 30 s of speech in 10 s; null for streamed
-                output.
+            take: Alternate delivery of the same line, with a repeatable seed.
+            pronunciations: Per-call word -> spoken-form overrides.
         """
         from .api.routing import resolve_target
 
@@ -470,17 +468,9 @@ def build_mcp_server(ctx) -> FastMCP:
     ) -> ScriptResult:
         """Synthesise a multi-beat script into one stitched file with exact timings.
 
-        Use this when timing matters downstream (video, slides, subtitles) or the
-        content has several beats. Each beat is a BeatSpec; `pause_after_sec`
-        inserts real silence and is included in the timings, per-beat `voice`,
-        `speaker` and `instruct` enable multi-speaker scripts, and
-        `target_duration_sec` + `fit_mode` pin a beat to a fixed slot. For one
-        line, prefer speak().
-
-        Returns `file_path`, `duration_sec`, `beats[]` (start_sec, end_sec,
-        voice_id, cached, artifact_id) and, when export_srt, `srt_path` and
-        `timing_json_path`. Full field guide: resource agent-voice://guide.
-        `pronunciations` maps words to spoken forms for every beat.
+        Read: file_path, duration_sec, beats[] (start_sec/end_sec) and, when
+        export_srt, srt_path and timing_json_path. Each beat is a BeatSpec, so
+        per-beat voice, speaker, instruct, pause_after_sec and fit_mode are honoured.
         """
         try:
             _check_pronunciations(pronunciations)
@@ -510,18 +500,7 @@ def build_mcp_server(ctx) -> FastMCP:
     ) -> dict[str, Any]:
         """Start a script render in the background and return a job id immediately.
 
-        Use it when a script is long enough that blocking the tool call would time
-        out or stall your loop; each call creates a new job, so this is not
-        idempotent — reuse the job_id instead of re-submitting. Takes exactly the
-        same `beats`, the same call-level `pause_after_sec` default and the same
-        `pronunciations` overrides as speak_script (see BeatSpec for per-beat
-        `pause_after_sec`, `voice`, `speaker`, `instruct`, `fit_mode` and `take`).
-
-        Read:
-            job_id: pass it to get_job(). Progress advances beat by beat, and the
-                finished job's `result` is exactly the ScriptResult speak_script()
-                would have returned.
-            kind: always "script".
+        Same beats and options as speak_script(); poll get_job() for the result.
         """
         try:
             _check_pronunciations(pronunciations)
@@ -575,18 +554,9 @@ def build_mcp_server(ctx) -> FastMCP:
 
     @tool(annotations=read_only)
     async def get_job(job_id: str) -> dict[str, Any]:
-        """Poll a job started by start_script_job, download_model or install_engine.
+        """Poll a job until it leaves pending/running, then read the outcome.
 
-        Call it in a short loop (with a sleep) until `status` leaves
-        pending/running.
-
-        Read:
-            status: pending | running | succeeded | failed | cancelled.
-            progress: 0..1; advances per beat for scripts.
-            message: human-readable current step.
-            result: the finished payload. For kind "script" it is exactly the
-                ScriptResult speak_script() would have returned.
-            error: {error_code, message, suggestion} when status is failed.
+        Read: status, progress 0..1, `result` once succeeded and `error` when failed.
         """
         try:
             return ctx.jobs.get(job_id).model_dump(mode="json")
@@ -595,14 +565,7 @@ def build_mcp_server(ctx) -> FastMCP:
 
     @tool(annotations=destructive)
     async def cancel_job(job_id: str) -> dict[str, Any]:
-        """Cancel a running job. A job that already finished is returned unchanged.
-
-        Use it when you no longer need the result and want the GPU back sooner.
-
-        Read:
-            status: "cancelled" once the request took effect; a job that had
-                already finished keeps its terminal status.
-        """
+        """Cancel a running job; one that already finished is returned unchanged."""
         try:
             return ctx.jobs.cancel(job_id).model_dump(mode="json")
         except AgentVoiceError as exc:
@@ -619,23 +582,29 @@ def build_mcp_server(ctx) -> FastMCP:
     ) -> dict[str, Any]:
         """Register a reference voice from a local audio file. Do this before speaking.
 
-        Use it when list_voices() is empty or you need another speaker. 3-10 s of
-        clean single-speaker speech is the sweet spot; an accurate `ref_text` is
-        audibly better than audio-only `x_vector_only=true`, and a wrong
-        transcript is worse than none. Idempotent for the same name plus
-        byte-identical audio; differing audio fails unless overwrite=true.
-
-        Returns `voice_id` (pass it as `voice`), `duration_sec`, `warnings[]`.
+        3-10 s of clean single-speaker speech with an accurate ref_text clones best;
+        without MCP_BASE_PATH the clip must be in the inbox. Read: voice_id (pass as
+        `voice`) and warnings[].
         """
         from .security import ensure_within_base
 
         try:
             base = settings.mcp_base_path
-            source = (
-                ensure_within_base(ref_audio_path, base)
-                if base
-                else Path(ref_audio_path).expanduser()
-            )
+            if base:
+                source = ensure_within_base(ref_audio_path, base)
+            elif not settings.allow_any_path:
+                inbox = settings.inbox_dir
+                source = ensure_within_base(
+                    ref_audio_path,
+                    inbox,
+                    suggestion=(
+                        f"Put the reference clip in {inbox} (the inbox), or set "
+                        "AGENT_VOICE_ALLOW_ANY_PATH=true to allow any existing "
+                        "local path."
+                    ),
+                )
+            else:
+                source = Path(ref_audio_path).expanduser()
             return ctx.voices.add(
                 name=name,
                 source_path=source,
@@ -663,24 +632,9 @@ def build_mcp_server(ctx) -> FastMCP:
     ) -> DesignVoiceResult:
         """Design a new voice from a written description; no reference clip needed.
 
-        Use it when no preset speaker or cloned voice fits: the engine renders
-        `sample_text` in the timbre you describe and, with save_as_clone, registers
-        the result as a voice you can pass as `voice`. Each call is a fresh render.
-
-        Args:
-            name: Name to register the designed voice under.
-            instruct: The voice itself, e.g. "a calm middle-aged British narrator".
-            sample_text: 5-8 s of text to speak; the default line works everywhere.
-            save_as_clone: Register the render as a reusable voice.
-            overwrite: Replace an existing voice with this name.
-            take, seed: Alternate/repeatable deliveries, as in speak().
-            engine, model, quality: Which checkpoint does the designing.
-            candidates: 1-5 takes to audition; all are returned in `candidates`.
-
-        Read:
-            voice_id: pass as `voice`; null when save_as_clone is false.
-            preview_file_path: the first take, playable immediately.
-            candidates[]: take, seed, file_path, duration_sec — one per take.
+        Use it when no preset speaker or cloned voice fits; candidates>1 returns
+        several takes to audition. Read: voice_id (pass as `voice`) and
+        preview_file_path.
         """
         try:
             if not 1 <= candidates <= 5:
@@ -719,29 +673,12 @@ def build_mcp_server(ctx) -> FastMCP:
 
     @tool(annotations=read_only)
     async def list_voices() -> VoiceListResponse:
-        """List every registered voice. Use it when a voice id or name is unknown.
-
-        Read:
-            voices[].voice_id: pass as `voice`; voices[].name is the human label.
-            voices[].duration_sec: reference length; very short clips clone worse.
-            voices[].source: "cloned" from your clip, or "designed" by design_voice().
-            voices[].design_instruct: the description a designed voice was built from.
-            voices[].warnings[]: what to fix about the reference audio.
-            voices[].ref_text, voices[].x_vector_only_mode: how the voice was
-                registered, which explains a quality difference between two voices.
-        """
+        """List every registered voice with id, name, duration, source and warnings."""
         return VoiceListResponse(voices=ctx.voices.list())
 
     @tool(annotations=destructive)
     async def delete_voice(voice_id: str) -> dict[str, str]:
-        """Delete a voice and all of its cached prompts. This cannot be undone.
-
-        Use it to reclaim disk, or to replace bad reference audio: delete first,
-        then clone_voice() again with the same name.
-
-        Read:
-            deleted: the voice_id that was removed.
-        """
+        """Delete a voice and its cached prompts. This cannot be undone."""
         if not ctx.voices.delete(voice_id):
             _raise_tool_error(
                 AgentVoiceError(
@@ -1030,11 +967,7 @@ def build_mcp_server(ctx) -> FastMCP:
     async def gpu_status() -> dict[str, Any]:
         """Report worker state, resident models, VRAM and the idle-unload countdown.
 
-        Reads only: it never spawns or wakes a worker. `workers` tells you whether
-        the next call is warm; `loaded_models` what is resident; and
-        `unload_in_seconds` how long before the idle reaper drops it (null when
-        nothing is resident or work is queued). A small value means your next call
-        will be a cold start.
+        Reads only: it never spawns or wakes a worker.
         """
         return await ctx.workers.gpu_status()
 
@@ -1042,14 +975,7 @@ def build_mcp_server(ctx) -> FastMCP:
     async def unload_models(force: bool = False) -> dict[str, Any]:
         """Free the GPU now: kill workers and drop their loaded models.
 
-        Use it when another GPU application needs the VRAM, or after a large batch
-        you no longer need. Both workers and their models go — the next synthesis
-        pays a cold start. Without `force` it refuses with WORKER_BUSY while jobs
-        are running; force=true cancels them and frees the memory immediately.
-
-        Read:
-            unloaded: engine ids whose workers were killed.
-            cancelled_jobs: jobs cancelled by force=true.
+        Refuses with WORKER_BUSY while jobs run unless force=true.
         """
         try:
             return await ctx.workers.unload_models(force=force)

@@ -15,18 +15,15 @@ Three integration details are easy to get wrong and all of them are load-bearing
    enforced by middleware on the parent app, which Starlette applies to mounted
    sub-apps too.
 
-3. **Middleware order.** ``@app.middleware("http")`` handlers are applied in
-   *reverse* source order, so the handler declared **last** runs **first**.
-   ``host_guard`` is therefore declared after ``bearer_auth``: a forged ``Host``
-   must be rejected before any credential is examined. Verified empirically
-   against the pinned Starlette/FastAPI versions; if that order ever inverted,
-   the guard would silently stop protecting the auth check.
+3. **Both HTTP and WebSocket.** ``@app.middleware("http")`` only sees HTTP
+   scopes, so Host/Origin and Bearer checks live in the pure ASGI
+   :class:`~agent_voice.api.guard.GuardMiddleware`, which handles both. A
+   WebSocket is refused before ``accept()`` with close code 1008.
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import logging
 import re
@@ -34,7 +31,6 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -57,22 +53,14 @@ from ..schemas import (
 from ..security import is_loopback_client
 from ..voice_store import VoiceStore
 from ..worker_manager import WorkerManager
+from .guard import (
+    DEFAULT_ALLOWED_HOSTS,
+    GuardMiddleware,
+    allowed_host_names,
+    is_loopback_bind,
+)
 
 logger = logging.getLogger(__name__)
-
-PROTECTED_PREFIXES = ("/v1", "/audio")
-"""/audio is protected too: an artifact holds the user's own speech, or a clone of
-their voice, so it is no less sensitive than the request that produced it."""
-
-DEFAULT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]", "::1"})
-"""Loopback names in both IPv6 spellings. ``AGENT_VOICE_ALLOWED_HOSTS`` extends
-this set — it never replaces it, because relaxing the default is the
-DNS-rebinding hole itself.
-
-``testserver`` (what Starlette's TestClient sends) is deliberately NOT here: a
-production default should describe production, and a test harness can add it
-through the same setting every other extra host uses.
-"""
 
 ARTIFACT_ID_PATTERN = re.compile(r"[0-9a-f]{16}")
 """Exactly what the daemon generates: 16 lowercase hex chars (``uuid4().hex[:16]``)."""
@@ -126,56 +114,6 @@ def _torch_loaded() -> bool:
     return "torch" in sys.modules
 
 
-# ---------------------------------------------------------------------------
-# Host / Origin validation
-# ---------------------------------------------------------------------------
-
-
-def _canonical_host(value: str) -> str:
-    """Reduce a ``Host`` header to a comparable hostname.
-
-    Handles ``localhost``, ``127.0.0.1:8000``, ``[::1]:8000`` and a bare
-    ``[::1]``. IPv6 brackets are dropped so both spellings match one entry.
-    """
-    host = (value or "").strip().lower()
-    if not host:
-        return ""
-    if host.startswith("["):
-        end = host.find("]")
-        return host if end == -1 else host[1:end]
-    # One colon separates host from port; several mean a bare IPv6 literal.
-    if host.count(":") == 1:
-        return host.partition(":")[0]
-    return host
-
-
-def allowed_host_names(settings: Settings) -> frozenset[str]:
-    """The loopback defaults plus ``AGENT_VOICE_ALLOWED_HOSTS``."""
-    extra = {_canonical_host(entry) for entry in settings.allowed_hosts}
-    extra.discard("")
-    defaults = {_canonical_host(name) for name in DEFAULT_ALLOWED_HOSTS}
-    return frozenset(defaults | extra)
-
-
-def _origin_hostname(origin: str) -> str:
-    """Hostname out of an ``Origin`` URL, or ``""`` when it cannot be parsed.
-
-    An opaque origin (``null`` from a ``file://`` page, or garbage) yields ``""``
-    and is rejected: defaulting to "allow" on an unparseable origin is exactly
-    the mistake a DNS-rebinding guard exists to prevent.
-    """
-    try:
-        return (urlsplit(origin).hostname or "").lower()
-    except ValueError:
-        return ""
-
-
-def _is_loopback_bind(host: str) -> bool:
-    """True for bind addresses that cannot be reached from off-box."""
-    candidate = _canonical_host(host)
-    return candidate in {"localhost", "::1"} or candidate.startswith("127.")
-
-
 def _refuse_unsafe_bind(settings: Settings) -> None:
     """Refuse to serve a non-loopback interface with no authentication.
 
@@ -184,7 +122,7 @@ def _refuse_unsafe_bind(settings: Settings) -> None:
     the MCP shim spawning the daemon. An unauthenticated voice server on a LAN
     address is an open TTS/cloning relay for anyone who can reach the port.
     """
-    if settings.api_key or _is_loopback_bind(settings.host):
+    if settings.api_key or is_loopback_bind(settings.host):
         return
     raise AgentVoiceError(
         ErrorCode.BAD_REQUEST,
@@ -293,78 +231,14 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
 
     allowed_hosts = allowed_host_names(settings)
 
-    # -- auth middleware (must cover the mounted MCP app too) -----------
-    @app.middleware("http")
-    async def bearer_auth(request: Request, call_next):
-        api_key = request.app.state.ctx.settings.api_key
-        path = request.url.path
-        if not api_key or path == "/health" or path.startswith("/docs") or path.startswith(
-            "/openapi"
-        ):
-            return await call_next(request)
-        if not path.startswith(PROTECTED_PREFIXES) and not path.startswith("/mcp"):
-            return await call_next(request)
-
-        header = request.headers.get("authorization", "")
-        expected = f"Bearer {api_key}"
-        # Constant-time: `!=` short-circuits at the first differing byte, which
-        # leaks the key prefix to anyone able to time the 401s.
-        #
-        # Compared as UTF-8 bytes, not str: `hmac.compare_digest` raises
-        # TypeError on two `str` values when either holds a non-ASCII character,
-        # so `Authorization: Bearer café` used to surface as a 500 instead of a
-        # plain 401. `errors="replace"` keeps a lone surrogate from re-raising.
-        if not hmac.compare_digest(
-            header.encode("utf-8", errors="replace"), expected.encode("utf-8")
-        ):
-            return JSONResponse(
-                status_code=401,
-                content=ErrorResponse(
-                    error_code="BAD_REQUEST",
-                    message="unauthorized",
-                    suggestion="Send `Authorization: Bearer $AGENT_VOICE_API_KEY`.",
-                ).model_dump(mode="json"),
-            )
-        return await call_next(request)
-
-    # -- DNS-rebinding guard --------------------------------------------
-    # Declared AFTER bearer_auth deliberately: this Starlette applies middleware
-    # in reverse source order, so host_guard wraps — and therefore runs before —
-    # bearer_auth. A forged Host must never reach the credential check.
-    @app.middleware("http")
-    async def host_guard(request: Request, call_next):
-        raw_host = request.headers.get("host", "")
-        if _canonical_host(raw_host) not in allowed_hosts:
-            return JSONResponse(
-                status_code=421,
-                content=ErrorResponse(
-                    error_code=ErrorCode.BAD_REQUEST,
-                    message=f"host not allowed: {raw_host or '<missing>'}",
-                    suggestion=(
-                        "Connect via 127.0.0.1/localhost, or add this name to "
-                        "AGENT_VOICE_ALLOWED_HOSTS. A rebound DNS name can reach "
-                        "this port but must not be served."
-                    ),
-                ).model_dump(mode="json"),
-            )
-
-        # A present Origin must also be local: a browser page on another site is
-        # the other half of the rebinding attack.
-        origin = request.headers.get("origin")
-        if origin is not None and _origin_hostname(origin) not in allowed_hosts:
-            return JSONResponse(
-                status_code=403,
-                content=ErrorResponse(
-                    error_code=ErrorCode.BAD_REQUEST,
-                    message=f"origin not allowed: {origin}",
-                    suggestion=(
-                        "Cross-origin browser calls are rejected. Serve the page from "
-                        "127.0.0.1/localhost, or add the origin's host to "
-                        "AGENT_VOICE_ALLOWED_HOSTS."
-                    ),
-                ).model_dump(mode="json"),
-            )
-        return await call_next(request)
+    # One guard for HTTP *and* WebSocket. It rejects a forged Host/Origin and a
+    # missing credential before the WebSocket handshake is accepted, and the
+    # parent middleware also covers the mounted /mcp app.
+    app.add_middleware(
+        GuardMiddleware,
+        allowed_hosts=allowed_hosts,
+        api_key=settings.api_key,
+    )
 
     # -- error handling --------------------------------------------------
     @app.exception_handler(AgentVoiceError)
@@ -516,6 +390,7 @@ def require_agent_mutation(ctx: AppContext, request: Request | None = None) -> N
 
 __all__ = [
     "AppContext",
+    "DEFAULT_ALLOWED_HOSTS",
     "create_app",
     "record_mutation",
     "require_agent_mutation",

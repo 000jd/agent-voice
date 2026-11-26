@@ -1,0 +1,138 @@
+name: Bug report
+description: Report a reproducible defect in agent-voice
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem.
+
+        Before you file:
+        - Search existing issues — the same failure may already be tracked.
+        - Run `agent-voice doctor` and `agent-voice engines test mock`; their
+          output usually identifies the cause.
+        - **Do not paste secrets.** Redact `AGENT_VOICE_API_KEY`, tokens, personal
+          file paths and any private audio or transcripts.
+        - Security vulnerabilities go through
+          [SECURITY.md](https://github.com/000jd/agent-voice/blob/main/SECURITY.md),
+          not a public issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: agent-voice version
+      description: From `agent-voice status`, `GET /health`, or `server_info().version`
+      placeholder: "0.3.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux (NVIDIA CUDA)
+        - Linux (CPU / mock engine)
+        - Windows
+        - macOS
+        - Other / container
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      description: The engine involved in the failure
+      options:
+        - mock
+        - qwen3_tts_fast
+        - qwen3_tts
+        - Not engine-specific (daemon, MCP, CLI, docs)
+        - Unknown
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Python, GPU, driver and ffmpeg versions
+      description: Output of `python --version`, `nvidia-smi --query-gpu=name,driver_version --format=csv`, `ffmpeg -version`
+      placeholder: "Python 3.12.12, RTX 4060 Ti 16 GB, driver 580.178.04, ffmpeg 6.1.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `agent-voice doctor`
+      description: Paste the full output, including PASS/FAIL/WARN rows. Redact paths if needed.
+      render: text
+      placeholder: |
+        PASS  python        3.12.12
+        PASS  uv            0.9.26
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that reproduces the problem, with exact commands or request bodies.
+      render: shell
+      placeholder: |
+        1. AGENT_VOICE_DEFAULT_ENGINE=mock uv run agent-voice serve
+        2. curl -s -X POST localhost:8000/v1/audio/speech -H 'content-type: application/json' -d '{"input":"hello"}' -o out.wav
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected to happen
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead. Include the full `{error_code, message, suggestion}` body if there is one.
+      render: json
+      placeholder: |
+        {"error_code": "...", "message": "...", "suggestion": "..."}
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Daemon output, `data/daemon.log`, or `journalctl --user -u agent-voice`. Redact secrets.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: MCP client and config (redacted), `.env` values that differ from `.env.example`, engine manifest snippets, model aliases.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I removed API keys, tokens and private audio/transcripts from this report.
+          required: true
+        - label: This is not a security vulnerability (those follow SECURITY.md).
+          required: true

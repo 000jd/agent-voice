@@ -99,6 +99,12 @@ class Settings(BaseSettings):
     """Extra Host header values accepted by the DNS-rebinding guard, beyond the
     loopback defaults. Accepts `a,b` from the environment."""
 
+    allow_any_path: bool = Field(default=False, alias="AGENT_VOICE_ALLOW_ANY_PATH")
+    """When false (the default), agent-supplied clone_voice paths are confined to
+    ``<DATA_DIR>/inbox/``. The CLI `voices add` is an operator command and stays
+    unrestricted; set this true only for a trusted local agent that needs other
+    paths."""
+
     # --- Paths ----------------------------------------------------------
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
     engines_dir: Path = Field(default=Path("./engines"), alias="ENGINES_DIR")
@@ -148,6 +154,10 @@ class Settings(BaseSettings):
         return self.data_dir / "voices"
 
     @property
+    def inbox_dir(self) -> Path:
+        return self.data_dir / "inbox"
+
+    @property
     def cache_dir(self) -> Path:
         return self.data_dir / "cache"
 
@@ -181,6 +191,7 @@ class Settings(BaseSettings):
         for path in (
             self.data_dir,
             self.voices_dir,
+            self.inbox_dir,
             self.cache_dir,
             self.jobs_dir,
             self.artifacts_dir,

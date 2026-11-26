@@ -47,6 +47,10 @@ AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""
 # end-to-end IPC v1 conformance against a live worker (~1 s, no GPU)
 .venv/bin/agent-voice engines test mock
 
+# environment + client onboarding
+.venv/bin/agent-voice doctor
+.venv/bin/agent-voice mcp-config --client claude-code
+
 # design a voice from a description, in-process, no daemon needed
 .venv/bin/agent-voice voices design narrator \
   --instruct "warm baritone, measured pace, late-night radio"
@@ -80,9 +84,16 @@ command body. `--candidates 2..5` renders several takes to audition and saves no
   language model; leave it off unless you specifically want that.
 - **Loopback only.** Even with mutation enabled, both the daemon and the calling client must be on
   loopback. A non-loopback peer gets `AGENT_MUTATION_DISABLED`.
-- **Loopback by default end to end.** The server binds `127.0.0.1`, a Host/Origin guard rejects
-  DNS-rebinding attempts, and `/audio` sits behind the bearer token because an artifact is the
-  user's own speech. Set `AGENT_VOICE_API_KEY` before exposing anything.
+- **Loopback by default end to end.** The server binds `127.0.0.1`, a pure ASGI Host/Origin guard
+  rejects DNS-rebinding attempts on HTTP **and** WebSocket handshakes, and `/audio` sits behind
+  the bearer token because an artifact is the user's own speech. Set `AGENT_VOICE_API_KEY` before
+  exposing anything. A WebSocket without a valid token is closed with code `1008` before
+  `accept()`; browser clients may carry the key in
+  `Sec-WebSocket-Protocol: bearer, <key>` (the server echoes `bearer`).
+- **Agent clone paths are confined.** `AGENT_VOICE_ALLOW_ANY_PATH=false` (default): `clone_voice`
+  over REST/MCP reads only `<DATA_DIR>/inbox/` unless `MCP_BASE_PATH` is set. A rejected path is
+  `PATH_OUTSIDE_BASE` before any ffmpeg probe. The CLI `voices add` is a human operator path and
+  remains unrestricted.
 - **Input caps are admission control.** `MAX_SCRIPT_BEATS=200`, `MAX_INSTRUCT_CHARS=1000`,
   `MAX_DESIGN_SAMPLE_CHARS=500` and `MAX_REF_TEXT_CHARS=2000` are checked before routing and
   before a worker is spawned, so an oversized request costs a round-trip and no GPU time.

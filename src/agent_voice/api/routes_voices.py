@@ -20,18 +20,36 @@ router = APIRouter(tags=["voices"])
 
 
 def _confined_path(request: Request, raw_path: str) -> Path:
-    """Resolve a caller-supplied path, respecting MCP_BASE_PATH when set."""
+    """Resolve a caller-supplied path under the safe confinement policy.
+
+    MCP_BASE_PATH wins; otherwise agent calls read only from the data inbox
+    unless the operator explicitly opts into arbitrary local paths. The CLI
+    `voices add` command bypasses this route and stays unrestricted.
+    """
     ctx = request.app.state.ctx
-    base = ctx.settings.mcp_base_path
+    settings = ctx.settings
+    base = settings.mcp_base_path
     if base:
-        return ensure_within_base(raw_path, base)
-    candidate = Path(raw_path).expanduser()
-    if not candidate.is_absolute():
-        raise AgentVoiceError(
-            ErrorCode.BAD_REQUEST,
-            f"relative ref_audio_path is ambiguous: {raw_path}",
-            "Pass an absolute path, or set MCP_BASE_PATH and use a relative one.",
+        candidate = ensure_within_base(raw_path, base)
+    elif not settings.allow_any_path:
+        inbox = settings.inbox_dir
+        candidate = ensure_within_base(
+            raw_path,
+            inbox,
+            suggestion=(
+                f"Put the reference clip in {inbox} (the inbox), or set "
+                "AGENT_VOICE_ALLOW_ANY_PATH=true to allow any existing local path."
+            ),
         )
+    else:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            raise AgentVoiceError(
+                ErrorCode.BAD_REQUEST,
+                f"relative ref_audio_path is ambiguous: {raw_path}",
+                "Pass an absolute path, or set MCP_BASE_PATH and use a relative one.",
+            )
+
     if not candidate.is_file():
         raise AgentVoiceError(
             ErrorCode.BAD_REQUEST,
