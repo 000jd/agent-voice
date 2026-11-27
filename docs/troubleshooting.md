@@ -257,7 +257,7 @@ polished, and `doctor` exits 0 for it.
 ```json
 {
   "error_code": "PATH_OUTSIDE_BASE",
-  "message": "path escapes MCP_BASE_PATH: /home/me/videos/talk.mp4",
+  "message": "path escapes the inbox (/repo/data/inbox): /home/me/videos/talk.mp4",
   "suggestion": "Put the file in /repo/data/inbox (the inbox), or set AGENT_VOICE_ALLOW_ANY_PATH=true to allow any existing local path."
 }
 ```

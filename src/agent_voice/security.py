@@ -44,7 +44,11 @@ def _real(path: Path) -> Path:
 
 
 def ensure_within_base(
-    path: str | Path, base: str | Path, *, suggestion: str = ""
+    path: str | Path,
+    base: str | Path,
+    *,
+    suggestion: str = "",
+    base_label: str = "MCP_BASE_PATH",
 ) -> Path:
     """Return the resolved path if it is genuinely inside ``base``.
 
@@ -52,8 +56,9 @@ def ensure_within_base(
     symlinked *ancestors*, which a naive ``startswith`` check would miss.
 
     ``suggestion`` lets a caller name the actual destination (the inbox, a
-    sandbox root) in the ``PATH_OUTSIDE_BASE`` fix; the default keeps the
-    historical MCP_BASE_PATH wording.
+    sandbox root) in the ``PATH_OUTSIDE_BASE`` fix. ``base_label`` names the
+    base in the *message*; both default to the historical MCP_BASE_PATH wording
+    so an MCP-confined caller sees exactly the same text as before.
     """
     base_real = _real(Path(base))
     candidate = Path(path)
@@ -72,7 +77,7 @@ def ensure_within_base(
     if resolved != base_real and base_real not in resolved.parents:
         raise AgentVoiceError(
             ErrorCode.PATH_OUTSIDE_BASE,
-            f"path escapes MCP_BASE_PATH: {path}",
+            f"path escapes {base_label}: {path}",
             suggestion or f"Move the file inside {base_real} or unset MCP_BASE_PATH.",
         )
     return resolved
@@ -125,7 +130,12 @@ def resolve_ref_audio_path(
             suggestion=f"Move the file inside {mcp_base_path} or unset MCP_BASE_PATH.",
         )
     elif not allow_any_path:
-        candidate = ensure_within_base(raw_path, inbox_dir, suggestion=inbox_hint)
+        candidate = ensure_within_base(
+            raw_path,
+            inbox_dir,
+            suggestion=inbox_hint,
+            base_label=f"the inbox ({inbox_dir})",
+        )
     else:
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():

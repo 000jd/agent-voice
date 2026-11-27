@@ -294,6 +294,51 @@ def _entry(engine_id: str, *, installed: bool, aliases: tuple[str, ...] = ()) ->
     )
 
 
+def test_wrong_kind_is_refused_before_the_install_check(
+    tmp_path: Path, settings: Settings
+) -> None:
+    """A missing venv must not mask the real answer: wrong family.
+
+    On a fresh clone phonon and qwen3_tts are discovered but not installed. The
+    kind is manifest data, so `speak(engine=phonon)` must say "cannot speak",
+    not "install phonon" followed by the same refusal.
+    """
+    engines = tmp_path / "engines"
+    for engine_id in ("phonon", "qwen3_tts"):
+        source = REPO_ROOT / "engines" / engine_id
+        target = engines / engine_id
+        target.mkdir(parents=True)
+        for filename in ("engine.yaml", "worker.py"):
+            (target / filename).write_bytes((source / filename).read_bytes())
+
+    registry = EngineRegistry(engines)
+    assert registry.get("phonon").installed is False
+    assert registry.get("qwen3_tts").installed is False
+
+    with pytest.raises(AgentVoiceError) as asr_refusal:
+        resolve_asr_target(settings=settings, registry=registry, engine="qwen3_tts")
+    assert asr_refusal.value.error_code == ErrorCode.BAD_REQUEST
+    assert "cannot transcribe" in asr_refusal.value.message
+
+    voices = VoiceStore(settings.voices_dir, max_ref_text_chars=settings.max_ref_text_chars)
+    bindings = BindingStore(settings.bindings_path)
+    with pytest.raises(AgentVoiceError) as tts_refusal:
+        resolve_target(
+            settings=settings,
+            registry=registry,
+            voices=voices,
+            bindings=bindings,
+            engine="phonon",
+            model="phonon-2.5",
+        )
+    assert tts_refusal.value.error_code == ErrorCode.BAD_REQUEST
+    assert "cannot speak" in tts_refusal.value.message
+
+    with pytest.raises(AgentVoiceError) as missing:
+        resolve_asr_target(settings=settings, registry=registry, engine="ghost")
+    assert missing.value.error_code == ErrorCode.ENGINE_NOT_FOUND
+
+
 def test_doctor_asr_row_warns_when_the_default_is_missing(tmp_path: Path) -> None:
     settings = Settings(
         DATA_DIR=tmp_path / "data",

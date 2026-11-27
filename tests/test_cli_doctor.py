@@ -270,7 +270,9 @@ def test_doctor_warns_when_nvidia_smi_fails(
 def test_doctor_warns_when_dotenv_is_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tools: None, free_port: int
 ) -> None:
-    # No .env in this cwd: a fresh checkout. That is supported, so it is a WARN.
+    # No .env in this home: a fresh checkout. That is supported, so it is a WARN.
+    # Setting both keeps the test working before and after the v0.6.0 home change.
+    monkeypatch.setenv("AGENT_VOICE_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     reset_settings_cache()
 
@@ -289,6 +291,7 @@ def test_doctor_fails_on_a_ghost_engine_from_the_environment_without_a_dotenv(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tools: None, free_port: int
 ) -> None:
     """M4: no `.env` must not skip the engine check — the shell can set it."""
+    monkeypatch.setenv("AGENT_VOICE_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)  # a fresh checkout: no `.env` here
     monkeypatch.setenv("AGENT_VOICE_DEFAULT_ENGINE", "ghost_engine")
     reset_settings_cache()
@@ -303,9 +306,17 @@ def test_doctor_fails_on_a_ghost_engine_from_the_environment_without_a_dotenv(
 
 
 def test_doctor_env_row_reports_presence_and_the_effective_engine(
-    tools: None, free_port: int
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tools: None, free_port: int
 ) -> None:
-    # The real checkout has a .env: presence is PASS and the engine verdict follows.
+    # Create the .env this test needs: a checkout-local file is gitignored and
+    # absent on a fresh clone, which made this test pass only on a dev machine.
+    monkeypatch.setenv("AGENT_VOICE_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("AGENT_VOICE_DEFAULT_ENGINE=mock\n", "utf-8")
+    # The shell variable would win over the file and mask it.
+    monkeypatch.delenv("AGENT_VOICE_DEFAULT_ENGINE", raising=False)
+    reset_settings_cache()
+
     result = runner.invoke(app, ["doctor"])
     output = _text(result)
 
@@ -322,6 +333,7 @@ def test_doctor_env_row_reports_presence_and_the_effective_engine(
 def test_doctor_fails_on_an_unresolvable_default_engine(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tools: None, free_port: int
 ) -> None:
+    monkeypatch.setenv("AGENT_VOICE_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("AGENT_VOICE_DEFAULT_ENGINE=ghost_engine\n", "utf-8")
     monkeypatch.delenv("AGENT_VOICE_DEFAULT_ENGINE", raising=False)
@@ -425,6 +437,7 @@ def test_doctor_reports_an_invalid_dotenv_as_a_row(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tools: None
 ) -> None:
     """`AGENT_VOICE_PORT=abc` in .env used to traceback out of get_settings()."""
+    monkeypatch.setenv("AGENT_VOICE_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("AGENT_VOICE_PORT=abc\n", "utf-8")
     # The shell variable would win over the file and mask the bad value.

@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        # Field names are aliases of last resort for the constructor: without
+        # this, Settings(api_key="x") is dropped silently by extra="ignore".
+        populate_by_name=True,
         extra="ignore",
         case_sensitive=False,
     )

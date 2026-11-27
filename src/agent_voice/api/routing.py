@@ -328,9 +328,10 @@ def resolve_target(
             default_engine=settings.default_engine,
         )
 
-    record = registry.require_installed(
-        engine_id, allow_agent_mutation=settings.allow_agent_engine_mutation
-    )
+    # `kind` is manifest data, not an install fact. Check it before the install
+    # gate: otherwise `speak(engine="phonon")` on a machine without Phonon says
+    # "install phonon" (a needless multi-GB download) and only then refuses.
+    record = registry.get(engine_id)
     if record.manifest.kind != "tts":
         speaking = ", ".join(e.engine_id for e in registry.list_entries(kind="tts"))
         raise AgentVoiceError(
@@ -339,6 +340,9 @@ def resolve_target(
             "Use transcribe(audio_path=...) for speech recognition, or pick a tts "
             f"engine. Speaking engines: {speaking or '(none installed)'}.",
         )
+    record = registry.require_installed(
+        engine_id, allow_agent_mutation=settings.allow_agent_engine_mutation
+    )
     known_aliases = {spec.alias for spec in record.manifest.models}
 
     if alias is not None and alias not in known_aliases:
@@ -518,9 +522,9 @@ def resolve_asr_target(
     if engine_id is None:
         engine_id = settings.default_asr_engine
 
-    record = registry.require_installed(
-        engine_id, allow_agent_mutation=settings.allow_agent_engine_mutation
-    )
+    # Same ordering as resolve_target: refuse the wrong family from the manifest
+    # before charging the caller an install they cannot use.
+    record = registry.get(engine_id)
     if record.manifest.kind != "asr":
         available = registry.asr_engine_ids()
         raise AgentVoiceError(
@@ -529,6 +533,9 @@ def resolve_asr_target(
             f"Pick a kind: asr engine: {', '.join(available) or '(none installed)'}, "
             "or set AGENT_VOICE_DEFAULT_ASR_ENGINE.",
         )
+    record = registry.require_installed(
+        engine_id, allow_agent_mutation=settings.allow_agent_engine_mutation
+    )
 
     if alias_from_model is not None:
         known = {spec.alias for spec in record.manifest.models}

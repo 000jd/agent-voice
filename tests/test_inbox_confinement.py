@@ -15,6 +15,8 @@ from fastapi.testclient import TestClient
 
 from agent_voice.api.app import create_app
 from agent_voice.config import Settings
+from agent_voice.schemas import AgentVoiceError, ErrorCode
+from agent_voice.security import resolve_media_path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,6 +43,36 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
     )
     base.update(overrides)
     return Settings(**base)
+
+
+def test_inbox_confinement_message_names_the_inbox(tmp_path):
+    settings = _settings(tmp_path)
+    with pytest.raises(AgentVoiceError) as excinfo:
+        resolve_media_path(
+            "/etc/passwd",
+            inbox_dir=settings.inbox_dir,
+            mcp_base_path="",
+            allow_any_path=False,
+        )
+
+    assert excinfo.value.error_code == ErrorCode.PATH_OUTSIDE_BASE
+    assert "the inbox" in excinfo.value.message
+    assert "MCP_BASE_PATH" not in excinfo.value.message
+
+
+def test_mcp_base_confinement_message_keeps_the_historical_label(tmp_path):
+    base = tmp_path / "sandbox"
+    base.mkdir()
+    with pytest.raises(AgentVoiceError) as excinfo:
+        resolve_media_path(
+            "/etc/passwd",
+            inbox_dir=tmp_path / "inbox",
+            mcp_base_path=str(base),
+            allow_any_path=False,
+        )
+
+    assert excinfo.value.error_code == ErrorCode.PATH_OUTSIDE_BASE
+    assert "MCP_BASE_PATH" in excinfo.value.message
 
 
 @pytest.mark.parametrize("probe", ["/etc/passwd", "/proc/self/environ"])
