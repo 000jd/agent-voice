@@ -28,6 +28,7 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("ENGINES_DIR", str(REPO_ROOT / "engines"))
     monkeypatch.setenv("AGENT_VOICE_DEFAULT_ENGINE", "mock")
+    monkeypatch.setenv("AGENT_VOICE_DEFAULT_ASR_ENGINE", "mock_asr")
     monkeypatch.setenv("MCP_BASE_PATH", "")
     monkeypatch.setenv("ALLOW_AGENT_ENGINE_MUTATION", "true")
     # The production default is now True (an agent-authored plugin is executable
@@ -44,6 +45,7 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     # way an operator would: through the allowed-hosts setting.
     monkeypatch.setenv("AGENT_VOICE_ALLOWED_HOSTS", "testserver")
     monkeypatch.delenv("AGENT_VOICE_API_KEY", raising=False)
+    monkeypatch.delenv("FERMION_CACHE_DIR", raising=False)
     reset_settings_cache()
     yield
     reset_settings_cache()

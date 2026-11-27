@@ -77,6 +77,11 @@ def test_openapi_documents_all_routes(client):
         "/v1/models/{engine_id}/{model_alias}/download",
         "/v1/agents/bindings",
         "/v1/audio/speech/pcm-stream",
+        "/v1/audio/transcriptions",
+        "/v1/agent/transcribe",
+        "/v1/agent/dub/prepare",
+        "/v1/agent/dub/render",
+        "/v1/agent/dub/jobs",
         "/v1/gpu",
         "/audio/{artifact_id}",
     }

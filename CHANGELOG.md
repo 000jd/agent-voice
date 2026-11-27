@@ -11,6 +11,172 @@ given for every release so a tag can be verified against the history.
 
 No unreleased changes.
 
+## [0.5.0] — 2026-11-27 — `<commit>`
+
+"Speech in: pluggable ASR engines, agent-native two-stage dubbing, and a CPU
+listener that never touches the GPU."
+
+### Added
+
+- **`kind: tts | asr` on the engine manifest** (default `tts`), so speech
+  recognition is a family of plugins rather than a core feature. Every v0.4
+  manifest keeps loading unchanged. `kind` decides the IPC method
+  (`synthesize`/`stream_pcm` versus `transcribe`) and the `engines test` table;
+  `resolve_target` and `resolve_asr_target` each refuse the wrong kind with
+  `BAD_REQUEST` before any worker spawns.
+- **`transcribe` IPC method** (protocol v1, additive): request
+  `{model_alias, audio_path, language, word_timestamps, hotwords}`, response
+  `{text, language, duration_sec, truncated, segments[{index, start_sec, end_sec,
+  text, words?}]}`. No framing change and no version bump: a TTS worker answers
+  `BAD_REQUEST unknown method` and an ASR worker answers that to `synthesize`.
+  Word timings are returned **only** when `word_timestamps` is true.
+- **`phonon` ASR engine** (`engines/phonon/`, `fermion-research==0.2.15`,
+  CPU-only torch from the `pytorch-cpu` index): Phonon-2.5, 25 languages,
+  **0 MB VRAM**, 156 MB download. Measured **≈42–48× real time** on a Ryzen 7
+  5700X with **1.0 GB** peak RSS and a 1.05 s warm load; the first load is 50 s
+  (download + SHA-256 verification + unpack). Three aliases: `phonon-2.5`
+  (default), `phonon-2.5-en`, `phonon-2` (`fast`). The spike is recorded in
+  `docs/phase0-asr-report.md`.
+- **`mock_asr` engine**: dependency-free, reads a 16 kHz WAV with the stdlib,
+  emits deterministic timed segments and honours `cancel`. The reference for the
+  `kind: asr` shape; `agent-voice engines test mock_asr` needs no GPU and no deps.
+- **Transcription surface**: `POST /v1/audio/transcriptions` (OpenAI multipart,
+  `json`/`text`/`srt`/`vtt`/`verbose_json`, bearer-protected by the `/v1` guard),
+  `POST /v1/agent/transcribe` (a confined local path), MCP `transcribe()`, and
+  `agent-voice transcribe <file> [--engine] [--model] [--language] [--hotwords]
+  [--words] [--srt] [--project]` — the last one in-process, no daemon.
+- **Two-stage dubbing with no bundled translation model**: `dub prepare`
+  transcribes, keeps the timing, extracts a 24 kHz bed and a 5–10 s speaker
+  reference; the *caller* translates in its own context; `dub render` speaks the
+  lines into their original slots, retimes each with `atempo` up to
+  `max_atempo`, ducks the bed with `sidechaincompress` + `alimiter` and muxes the
+  video (`-c:v copy` unless `burn_subtitles`). A line that still overruns is
+  reported in `overflow_warnings`, never truncated. Surfaces:
+  `POST /v1/agent/dub/prepare`, `/v1/agent/dub/render`, `/v1/agent/dub/jobs`
+  (`Job.kind == "dub"`), MCP `dub_prepare`/`dub_render`/`start_dub_job` plus the
+  `dub_video` prompt, and `agent-voice dub prepare|render`.
+- **ASR-aware `engines test`**: `ASR_STEP_NAMES` is the sibling table
+  (`spawn+connect, hello, load_model, transcribe, cancel, health, shutdown`), and
+  `_skip_rest` now takes the table as a keyword argument instead of reading the
+  module global. The `transcribe` row sends a 1 s synthetic 16 kHz tone and passes
+  on a well-formed reply, never on words. The ASR `cancel` row starts a 20 s
+  transcribe, waits for the worker to report a request in flight, then cancels —
+  and passes on `{cancelled: false}` too, because a CPU decode can legitimately
+  finish first. The detail string records which happened.
+- **`doctor` rows for the new surfaces**: `asr` (the configured ASR engine and its
+  aliases, or a WARN naming `engines install <id>`) and `dub filters`
+  (`sidechaincompress`/`alimiter` present). Both WARN-only — a TTS-only host and a
+  plain-mix dub are supported setups.
+- `AGENT_VOICE_DEFAULT_ASR_ENGINE` (default `phonon`), `MAX_TRANSCRIBE_SECONDS`
+  (3600, a cap on work checked before extraction), `MAX_DUB_SEGMENTS` (500,
+  checked before synthesis), `data/dubs/<dub_id>/` in the DATA_DIR layout, and
+  `MAX_HOTWORDS = 25` as a structural contract constant.
+- MCP: `server_info()` gains `default_asr_engine`, `asr_engines[]` and
+  `dubbing_available`; `gpu_status()` gains `cpu_engines[]`.
+- `engines/ADDING_AN_ENGINE.md` gains a full **"Adding an ASR engine"** section:
+  the `transcribe` shape, the three segment-grouping rules (sentence punctuation,
+  a pause ≥ 0.8 s, a 7 s cap), the hotword cap, and a worked
+  `engines/faster_whisper/` sketch with **zero core daemon edits**.
+
+### Changed
+
+- **Behaviour change — `device: cpu` engines are exempt from the GPU owner slot.**
+  `_begin_job` acquires the GPU only for `device: gpu`; the VRAM-pressure reaper
+  skips CPU workers. **Kokoro now declares `cpu`**, so a Kokoro render no longer
+  takes the single-GPU-owner slot: it no longer evicts, and is no longer evicted
+  by, a resident Qwen model. `phonon` lands in the same bucket. Anyone who relied
+  on Kokoro serialising against a GPU engine will see them run concurrently; both
+  still hold 0 MB of VRAM.
+- **`engines test` is kind-aware.** A `kind: asr` engine walks the transcription
+  table; a `tts` engine keeps the exact v0.4 sequence. Exit-code contract
+  unchanged: any `ok is not True` (after the existing SKIP semantics) still exits 1.
+- **`_conformance_target` returns a step kind as its first element** (`"transcribe"`
+  or a model mode) rather than only a mode, which is what lets one function pick
+  the compute step for both families.
+- **Path confinement covers transcription.** `resolve_media_path` is
+  `resolve_ref_audio_path` under a different field noun, so `transcribe` and
+  `dub_prepare` read exactly where `clone_voice` may — `MCP_BASE_PATH`, then the
+  inbox, then `AGENT_VOICE_ALLOW_ANY_PATH`. A `403 PATH_OUTSIDE_BASE` is raised
+  before any ffmpeg work.
+- Docs: the two inbox-confinement gaps from the v0.4 audit are fixed — the
+  `README.md` security section now states `MCP_BASE_PATH` precedence and names
+  `403 PATH_OUTSIDE_BASE` for transcription input, and the Manim demo entry notes
+  that a real-engine run needs a registered voice. `SKILL.md` gained transcription
+  and dubbing sections, an `inbox_dir` bullet in the `server_info()` key list, an
+  `inbox_dir`-anchored `clone_voice` example, `PATH_OUTSIDE_BASE` /
+  `INVALID_REF_AUDIO` rows in the error table and the operator escape-hatch
+  paragraph. `docs/api.md` documents the five new endpoints and the new caps,
+  `docs/config.md` the three new variables and `data/dubs/`,
+  `docs/troubleshooting.md` the Phonon install, the missing
+  `sidechaincompress` and `PATH_OUTSIDE_BASE` on a transcription.
+- `pyproject.toml`: version `0.5.0`, `asr` / `speech-to-text` / `phonon` keywords.
+  No dependency changes; the core venv still installs no torch.
+- Engine count in `AGENTS.md` corrected to **six** (four TTS + two ASR), and the
+  MCP tool count to **24** (16 core) now that transcription and dubbing are core.
+
+### Security
+
+- Transcription input is confined by the **same** resolver as a cloning reference
+  clip, so reading a file for a transcript cannot become a hole in the inbox
+  boundary. `PATH_OUTSIDE_BASE` is raised before the file is opened.
+- `hotwords` is capped at **25** terms of at most 64 characters each, in the
+  schema, before a worker sees it — the same structural reasoning that caps the
+  lexicon: an unbounded bias list is unbounded decoder work.
+- The OpenAI multipart route takes **only the suffix** from a client filename and
+  generates the rest, so `../../cron.d/x` cannot choose where the bytes land. The
+  upload is streamed 1 MB at a time and deleted in a `finally`.
+- `MAX_TRANSCRIBE_SECONDS` and `MAX_DUB_SEGMENTS` are admission checks: an
+  over-long clip costs one ffprobe, and an over-long render is refused before the
+  first line is synthesised.
+
+### Fixed
+
+- The `VOICE_REQUIRED` suggestion names `settings.inbox_dir` instead of a
+  placeholder path, so an agent that has never read the config still gets a path
+  it can use.
+- `README.md` no longer implies the Manim demo works end to end on a real engine
+  without a registered voice.
+- `agent-voice transcribe --project <slug>` now actually applies the project
+  lexicon's terms as hotwords. The flag was validated and then dropped before
+  the service call, so the documented scoped-lexicon path was a no-op.
+- `agent-voice models download` now asks the backend-aware
+  `weights_downloaded` predicate. A Fermion model is a packed `.fsq` archive,
+  not a `.safetensors` file, so the old HF-cache check re-ran
+  `snapshot_download` on every invocation while `doctor` correctly reported the
+  model present.
+- `mock_asr` reports its one fixed language (`English`) instead of echoing a
+  requested language it cannot recognise; the manifest declares
+  `multilingual: false` and the reply must agree with it.
+- The Phonon worker forces `FERMION_DEVICE=cpu` (not `setdefault`), so an
+  operator's stray `FERMION_DEVICE=cuda`/`mlx` cannot silently defeat the
+  zero-VRAM promise. It also retries a transcription without `hotword_lambda`
+  if the installed backend rejects that optional kwarg — the Phase 0 spike
+  measured `hotwords=` only — and segment grouping now closes on `done."` /
+  `really?)` rather than only a bare period.
+- `engines/phonon/pyproject.toml` limits uv's resolution environments to Linux,
+  Windows and Apple silicon: Fermion pins `torch>=2.2,<2.3` on Intel macOS,
+  which cannot coexist with the engine's `torch==2.15.0` CPU pin. Without the
+  limit, `uv sync` failed before reaching the host.
+- `dub_render` now reports `bed_ducked`, refuses a blank translated line before
+  any synthesis, writes the translated `segments[]` into `.timing.json` (which
+  the docs already promised), and names the deliverable
+  `<artifacts>/dub_<dub_id>.mp4`.
+
+### Known limitations
+
+- Phonon-2.5 **auto-detects** the language and does not report which one it chose,
+  so `TranscribeResult.language` is `"auto"` for it. There is no per-request
+  language control on that checkpoint; `phonon-2.5-en` is the fixed-English one.
+- The Phonon result carries **no confidence field**, so none is exposed. Do not
+  read confidence into a transcript.
+- A prepared-but-never-rendered dub is kept under `data/dubs/<dub_id>/` on
+  purpose (so a translation session can span a restart) and is **not**
+  garbage-collected. Delete that directory to reclaim the space.
+- An inaccurate ASR transcript for the speaker reference cannot be overridden
+  without a manual `clone_voice`: `DubRenderRequest` has no `speaker_ref_text`
+  field in this release.
+- `models download --no-wait` is still accepted but ignored (L1, unchanged).
+
 ## [0.4.0] — 2026-11-26 — `9d6ede1`
 
 "Expressive markup, a zero-GPU Kokoro engine, scoped lexicons and code mode."
@@ -359,7 +525,8 @@ Initial release.
 - `MCP_BASE_PATH` confinement for reference reads and artifact relocation.
 - Every external command run as an argv list with `shell=False`.
 
-[Unreleased]: https://github.com/000jd/agent-voice/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/000jd/agent-voice/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/000jd/agent-voice/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/000jd/agent-voice/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/000jd/agent-voice/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/000jd/agent-voice/compare/v0.3.1...v0.3.2

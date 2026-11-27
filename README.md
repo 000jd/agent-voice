@@ -2,39 +2,45 @@
 
 # agent-voice
 
-**Headless, UI-free, multi-engine voice cloning and speech synthesis server for AI agents.**
+**Headless, UI-free, multi-engine voice cloning, speech synthesis and transcription server for AI agents.**
 
 [![CI](https://github.com/000jd/agent-voice/actions/workflows/ci.yml/badge.svg)](https://github.com/000jd/agent-voice/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v0.4.0-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v0.5.0-blue)](CHANGELOG.md)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 </div>
 
-> **Status: Beta (v0.4.0).** Linux + NVIDIA CUDA is verified on an RTX 4060 Ti 16 GB
+> **Status: Beta (v0.5.0).** Linux + NVIDIA CUDA is verified on an RTX 4060 Ti 16 GB
 > (driver 580.178.04, torch 2.11.0+cu128). **Kokoro-82M runs on the CPU** with zero
-> GPU memory, on Linux and macOS. Windows is untested.
+> GPU memory, on Linux and macOS. **Phonon-2.5 transcribes on the CPU too** — 0 MB VRAM.
+> Windows is untested.
 
 An agent asks for speech over MCP or HTTP; `agent-voice` keeps the GPU idle until
 something actually needs it, routes the request to an isolated engine subprocess,
 and returns a file path or a PCM stream. No desktop app, no web UI, no base64 blobs
 in tool results. Most local TTS servers are built for humans — a window, a waveform,
 a "Generate" button. Agents need deterministic caching, honest error codes, a GPU
-that is genuinely free when idle, and tools that return compact JSON.
+that is genuinely free when idle, and tools that return compact JSON. Since v0.5.0
+the same plugin system also runs **speech recognition**, so an agent can watch a
+video, read it, and re-voice it.
 
 ## At a glance
 
 | | |
 |---|---|
 | **Daemon** | FastAPI + FastMCP, Python 3.12, core venv installs **no torch** |
-| **Engines** | `mock` (CPU tone generator), `kokoro` (82M, **CPU-only**), `qwen3_tts` (official), `qwen3_tts_fast` (CUDA graphs) |
+| **Engines** | `mock` (CPU tone generator), `kokoro` (82M TTS, **CPU-only**), `qwen3_tts` (official), `qwen3_tts_fast` (CUDA graphs), `phonon` (ASR, **CPU-only**), `mock_asr` (ASR, no deps) |
+| **Kinds** | `kind: tts` speaks, `kind: asr` listens; `device: cpu` engines never take the GPU slot |
 | **Voice modes** | clone a 3–10 s clip · nine Qwen preset speakers · eight Kokoro voices · design a voice from words |
-| **Zero-GPU option** | Kokoro-82M: **0 MB VRAM**, native 24 kHz, **3.4–5.2× real time**, 1.37 GB RSS |
+| **Zero-GPU option** | Kokoro-82M (TTS): **0 MB VRAM**, native 24 kHz, **3.4–5.2× real time**, 1.37 GB RSS |
+| **Transcription** | Phonon-2.5 on the **CPU**: 25 languages, **0 MB VRAM**, **≈42–48× real time** on a Ryzen 7 5700X, 156 MB download |
+| **Dubbing** | Two-stage: `dub prepare` (transcribe + speaker ref) → agent translates → `dub render` (speak in the original slots) |
 | **Markup** | `[pause 1.5s]`, `[slow]`, `[fast]`, `[emphasis]`, `[spell]`, paragraph gaps — parsed before synthesis |
-| **Interfaces** | MCP (stdio + Streamable HTTP), REST, OpenAI-compatible, raw PCM stream, WebSocket with barge-in |
+| **Interfaces** | MCP (stdio + Streamable HTTP), REST, OpenAI-compatible (speech **and** transcriptions), raw PCM stream, WebSocket with barge-in |
 | **GPU when idle** | 0 workers, ~631 MiB VRAM (= desktop baseline) |
 | **Cache** | SHA-256 over the full synthesis parameter set, consulted before a worker spawns |
-| **Security defaults** | loopback bind, Host/Origin guard on HTTP **and** WS, agent mutation off, reference clips confined to an inbox |
+| **Security defaults** | loopback bind, Host/Origin guard on HTTP **and** WS, agent mutation off, reference clips **and transcription input** confined to an inbox |
 
 ## Requirements
 
@@ -45,14 +51,18 @@ that is genuinely free when idle, and tools that return compact JSON.
   non-WAV output format is converted the same way.
 - `espeak-ng` for `kokoro` (English out-of-dictionary fallback and non-English
   G2P). Common English works without it; `agent-voice doctor` reports it.
-- For GPU engines: an NVIDIA GPU with a recent driver. `kokoro` needs no GPU.
+- For GPU engines: an NVIDIA GPU with a recent driver. `kokoro`, `phonon` and the
+  mock engines need no GPU.
+- For dubbing with the original audio bed kept: an ffmpeg whose filter list has
+  `sidechaincompress` and `alimiter` (any modern build). Without them a dub still
+  renders, with a plain mix instead of a ducked one, and `agent-voice doctor` warns.
 
 ### Platform support
 
 | Platform | Status | Notes |
 |---|---|---|
 | Linux + NVIDIA CUDA | **Verified** | Reference box: RTX 4060 Ti 16 GB, driver 580.178.04, torch 2.11.0+cu128 |
-| Linux / macOS, CPU | **Verified** | `kokoro` (82M, 3.4–5.2× real time, 0 MB VRAM) and `mock` |
+| Linux / macOS, CPU | **Verified** | `kokoro` (TTS, 82M, 3.4–5.2× real time) and `phonon` (ASR, ≈42–48× real time), both 0 MB VRAM, plus `mock`/`mock_asr` |
 | Windows | **Untested** | Code paths exist (loopback TCP IPC, NSSM autostart); nobody has run the suite on Windows |
 
 ## Install
@@ -100,6 +110,60 @@ verify the plumbing (`AGENT_VOICE_DEFAULT_ENGINE=mock`); `mock-custom` answers
 `speaker=` and `mock-design` answers `design_voice`, so the whole routing surface is
 testable without a GPU:
 `uv run agent-voice voices design probe --engine mock --model mock-design --instruct "quiet and precise"`.
+
+## Quickstart: transcribe
+
+Speech recognition is a plugin family too (`kind: asr`), and **Phonon-2.5 runs on the
+CPU**: 25 languages, 156 MB, **0 MB of VRAM**, and ≈42–48× real time on a Ryzen 7
+5700X. Nothing about it touches CUDA, so it runs alongside a resident GPU TTS model
+instead of evicting it.
+
+```bash
+uv run agent-voice engines install phonon          # CPU torch + fermion-research
+uv run agent-voice models download phonon phonon-2.5   # 156 MB, once
+uv run agent-voice engines test phonon             # 7/7 IPC v1, 0 MB VRAM
+
+cp interview.mp4 data/inbox/                       # the inbox is the read root
+uv run agent-voice transcribe data/inbox/interview.wav --srt --words
+```
+
+`transcribe` runs in-process (no daemon), extracts a 16 kHz mono WAV with ffmpeg,
+and prints a `TranscribeResult` plus its `.json`, `.srt` and `.vtt` paths. `--words`
+adds per-word timings; `--hotwords "CUDA,Manim"` biases the decoder toward names it
+would otherwise miss (capped at 25); `--project` offers a scoped lexicon's terms as
+hotwords. Details: [docs/engines.md](docs/engines.md#phonon-the-cpu-asr-engine) and
+[docs/phase0-asr-report.md](docs/phase0-asr-report.md).
+
+## Dubbing
+
+Dubbing is **two stages**, and the middle one is deliberately not ours:
+
+1. **`dub prepare`** transcribes the source, keeps the timing, extracts a 24 kHz bed
+   and a clean 5–10 s speaker reference, and writes `data/dubs/<dub_id>/project.json`.
+2. **You translate.** The caller is an LLM; translating the returned segments into the
+   target language, tightening each line to fit its slot, is exactly what it is good at.
+3. **`dub render`** speaks each translated line through the ordinary voice path (cache,
+   markup, lexicon), retimes it into its source slot up to `--max-atempo`, places it on
+   the timeline and ducks the original bed under it with ffmpeg's `sidechaincompress`.
+
+```bash
+uv run agent-voice dub prepare data/inbox/episode.mp4        # -> dub_id + timed segments
+# translate the segments in your own context, write segments.json
+uv run agent-voice dub render <dub_id> segments.json --auto-clone-source
+```
+
+**Why no bundled translation model?** Because the caller already is one. Shipping a
+translator would mean a second multi-gigabyte download, a second tokenizer and a second
+set of language-pair bugs, to produce worse prose than the model that is already holding
+the conversation — and it would make the daemon the bottleneck for a job it cannot do
+well. The tool hands back timed text and takes back translated text; the translation
+never leaves the agent's context.
+
+A line that still overruns after `max_atempo` is reported in `overflow_warnings` —
+never truncated, because a silently cut sentence is a lie about what was said. The MCP
+surface is the same two calls (`dub_prepare`, `dub_render`, plus `start_dub_job` for a
+background render), and `dub_video(media_path, target_language)` is a packaged prompt
+that walks the whole loop.
 
 ## Quickstart: GPU engine
 
@@ -158,12 +222,23 @@ SDK and autostart units: **[docs/install/agent.md](docs/install/agent.md)**.
 | `1.7b-custom` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | 1.7B | ~4.4 GB | `custom_voice` | Apache-2.0 |
 | `0.6b-custom` | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | 0.6B | ~2.2 GB | `custom_voice` | Apache-2.0 |
 | `1.7b-design` | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | 1.7B | ~4.4 GB | `voice_design` | Apache-2.0 |
+| `phonon-2.5` | `FermionResearch/Phonon-2.5` | 0.6B (int6) | **0 MB** | `asr` | **CC-BY-4.0 weights / Apache-2.0 code** |
+| `phonon-2.5-en` | `FermionResearch/Phonon-2.5-English` | 0.6B (int6) | **0 MB** | `asr` | **CC-BY-4.0 weights / Apache-2.0 code** |
+| `phonon-2` | `FermionResearch/Phonon-2` | 0.6B (int6) | **0 MB** | `asr` | **CC-BY-4.0 weights / Apache-2.0 code** |
 
 The five Qwen3-TTS 12Hz checkpoints and Kokoro-82M are Apache-2.0 according to
 their Hugging Face model cards; the `kokoro` engine code (`kokoro==0.9.4`) is
 Apache-2.0 too. Weights are downloaded separately and remain under their own
 licence; this repository's own code and `mock` are MIT. Which weights you pull, and
 under what licence you use them, is your call.
+
+**The licence column now mixes two regimes.** The three Phonon checkpoints are
+**CC-BY-4.0** (they derive from NVIDIA's Parakeet TDT 0.6B v3 and inherit its
+licence), while the `fermion-research` package that runs them is Apache-2.0. CC-BY
+requires attribution when you redistribute: the model cards and the `NOTICE` inside
+each repo carry the notice, so keep it with the weights. Downloads are 156 MB
+(`phonon-2.5`), 158 MB (`phonon-2.5-en`) and 164 MB (`phonon-2`); all three report
+`0 MB` VRAM because they run on the CPU.
 
 ## Expressive markup
 
@@ -228,11 +303,15 @@ flowchart LR
     W -->|IPC v1| E2[qwen3_tts<br/>GPU]
     W -->|IPC v1| E3[kokoro<br/>CPU, 0 MB VRAM]
     W -->|IPC v1| E4[mock<br/>CPU]
+    W -->|IPC v1| E5[phonon<br/>ASR, CPU, 0 MB VRAM]
+    W -->|IPC v1| E6[mock_asr<br/>ASR, CPU]
 ```
 
 The daemon holds no model code: each engine is a plugin directory with an
 `engine.yaml` manifest and a `worker.py` speaking IPC v1, spawned lazily, routed to,
-and reaped when idle. See [docs/engines.md](docs/engines.md) and
+and reaped when idle. `kind: tts` engines answer `synthesize`; `kind: asr` engines
+answer `transcribe`; `device: cpu` engines skip the GPU slot entirely. See
+[docs/engines.md](docs/engines.md) and
 [engines/ADDING_AN_ENGINE.md](engines/ADDING_AN_ENGINE.md).
 
 ## Security & consent
@@ -243,9 +322,14 @@ and reaped when idle. See [docs/engines.md](docs/engines.md) and
 - **Agent mutation is off.** `ALLOW_AGENT_ENGINE_MUTATION=false`; enabling it lets an
   agent write and execute Python, so it stays loopback-only and
   `REQUIRE_ENGINE_APPROVAL=true` stages plugins for human review.
-- **Reference clips are confined.** `AGENT_VOICE_ALLOW_ANY_PATH=false` (default)
-  means agent/MCP `clone_voice` reads only `<DATA_DIR>/inbox/`; the operator CLI
-  `voices add` stays unrestricted.
+- **Reference clips and transcription input are confined.** `AGENT_VOICE_ALLOW_ANY_PATH=false`
+  (default) means agent/MCP `clone_voice` **and** `transcribe`/`dub_prepare` read only
+  `<DATA_DIR>/inbox/`; the operator CLI `voices add` stays unrestricted. Precedence is
+  `MCP_BASE_PATH` first, then the inbox, then (with `ALLOW_ANY_PATH=true`) any existing
+  absolute path. A path that escapes its base is `403 PATH_OUTSIDE_BASE` before any
+  ffmpeg probe or media work, and REST and MCP share one resolver
+  (`resolve_media_path` delegates to `resolve_ref_audio_path`), so the two surfaces
+  cannot drift.
 - **Consent is yours.** Cloning a real person's voice without their consent is
   impersonation. The software runs locally and offline; the licence to use a voice
   does not come with it. See [SECURITY.md](SECURITY.md).
@@ -254,18 +338,18 @@ and reaped when idle. See [docs/engines.md](docs/engines.md) and
 
 | Document | What is in it |
 |---|---|
-| [docs/api.md](docs/api.md) | Every endpoint, markup grammar, auth rules, MCP tools, `server_info`, return fields, scripts/timings, scoped lexicon |
+| [docs/api.md](docs/api.md) | Every endpoint (speech in and out), markup grammar, auth rules, MCP tools, `server_info`, return fields, scripts/timings, scoped lexicon |
 | [docs/config.md](docs/config.md) | Every environment variable with its default and effect |
-| [docs/engines.md](docs/engines.md) | Kokoro on CPU, five Qwen checkpoints, three modes, preset speakers, design→clone, adding an engine, GPU lifecycle |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | espeak-ng, spaCy model, CPU wheels, CUDA capture, tokenizer pin, ffmpeg, `doctor`, common errors |
+| [docs/engines.md](docs/engines.md) | Kokoro and Phonon on CPU, five Qwen checkpoints, three modes, preset speakers, design→clone, `kind`/`device`, adding an engine, GPU lifecycle |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | espeak-ng, Phonon install, `sidechaincompress`, spaCy model, CPU wheels, CUDA capture, tokenizer pin, ffmpeg, `doctor`, `PATH_OUTSIDE_BASE`, common errors |
 | [docs/install/agent.md](docs/install/agent.md) | MCP client configs, HTTP MCP, LangChain/OpenAI, systemd and Windows autostart |
-| [docs/phase0-report.md](docs/phase0-report.md) / [phase0-kokoro-report.md](docs/phase0-kokoro-report.md) | Measured GPU and CPU performance, dependency findings |
-| [CHANGELOG.md](CHANGELOG.md) | Release history, v0.1.0 → v0.4.0 |
+| [docs/phase0-report.md](docs/phase0-report.md) / [phase0-kokoro-report.md](docs/phase0-kokoro-report.md) / [phase0-asr-report.md](docs/phase0-asr-report.md) | Measured GPU performance, the Kokoro CPU spike, and the Phonon ASR CPU spike |
+| [CHANGELOG.md](CHANGELOG.md) | Release history, v0.1.0 → v0.5.0 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) | Dev setup and gates · supported versions and threat model |
 | [AGENTS.md](AGENTS.md) | Architecture and house rules for agents working on this repo |
 | [skills/agent-voice/SKILL.md](skills/agent-voice/SKILL.md) | Installable agent skill / playbook (also served as `agent-voice://guide`) |
-| [engines/ADDING_AN_ENGINE.md](engines/ADDING_AN_ENGINE.md) | The engine contract, IPC v1 and worked examples |
-| [examples/manim_demo/](examples/manim_demo/) | End-to-end timed narration rendered with Manim and muxed with ffmpeg |
+| [engines/ADDING_AN_ENGINE.md](engines/ADDING_AN_ENGINE.md) | The engine contract, IPC v1, worked TTS examples and a full ASR engine walkthrough |
+| [examples/manim_demo/](examples/manim_demo/) | End-to-end timed narration rendered with Manim and muxed with ffmpeg. Its `--engine mock` run is self-contained; a **real** engine needs a registered voice first (`voices add` or `clone_voice`), because a clone-only checkpoint cannot speak with nothing to clone |
 
 ## Development
 

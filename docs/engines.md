@@ -5,20 +5,65 @@ An **engine** is a plugin directory under `engines/<engine_id>/` containing an
 never imports model code; it spawns a worker lazily, routes work to it, and reaps
 it when idle. Adding an engine never requires touching the daemon.
 
-Four engines ship:
+Six engines ship, in **two kinds**:
 
-| Engine id | Backend | Venv | Streaming | When to use |
-|---|---|---|---|---|
-| `qwen3_tts_fast` | `faster-qwen3-tts` (CUDA graphs) | own `uv` venv | native PCM | default GPU; fastest, real streaming |
-| `qwen3_tts` | `qwen-tts` (official) | own `uv` venv | emulated | GPU fallback when graph capture misbehaves |
-| `kokoro` | `kokoro==0.9.4` (CPU PyTorch) | own `uv` venv | native PCM | **no GPU**: 82M, 24 kHz, 3.4–5.2× real time |
-| `mock` | built-in tone generator | core interpreter | native PCM | CPU-only testing of the full routing surface |
+| Engine id | Kind | Device | Backend | Venv | Streaming | When to use |
+|---|---|---|---|---|---|---|
+| `qwen3_tts_fast` | `tts` | `gpu` | `faster-qwen3-tts` (CUDA graphs) | own `uv` venv | native PCM | default GPU; fastest, real streaming |
+| `qwen3_tts` | `tts` | `gpu` | `qwen-tts` (official) | own `uv` venv | emulated | GPU fallback when graph capture misbehaves |
+| `kokoro` | `tts` | `cpu` | `kokoro==0.9.4` (CPU PyTorch) | own `uv` venv | native PCM | **no GPU**: 82M, 24 kHz, 3.4–5.2× real time |
+| `mock` | `tts` | `gpu`* | built-in tone generator | core interpreter | native PCM | CPU-only testing of the full routing surface |
+| `phonon` | `asr` | `cpu` | `fermion-research==0.2.15` | own `uv` venv | — | **no GPU**: real transcription, 25 languages, ≈42–48× real time |
+| `mock_asr` | `asr` | `cpu` | built-in synthetic transcript | core interpreter | — | testing transcription with no deps |
+
+\* `mock` leaves `device` at its default. It costs nothing either way, since it never
+allocates VRAM.
 
 The two Qwen backends need **mutually exclusive** dependency universes
 (`transformers==4.57.3` for `qwen-tts`, `transformers==5.15.1` for
 `faster-qwen3-tts`), which is why they are separate plugins with separate venvs.
 They cannot share an environment. `kokoro` is separate for a different reason: its
 venv pins CPU-only torch, so it can never see a CUDA device even on a GPU box.
+`phonon` is separate for that same reason plus the opposite job.
+
+## Two manifest fields: `kind` and `device`
+
+They decide different things and both default to the v0.4 behaviour, so every older
+manifest keeps loading unchanged:
+
+| Field | Values | What it decides |
+|---|---|---|
+| `kind` | `tts` (default) · `asr` | Which IPC method the daemon calls — `synthesize`/`stream_pcm` versus `transcribe` — and which conformance table `engines test` walks. Routing refuses a wrong-kind request with `BAD_REQUEST` before a worker spawns |
+| `device` | `gpu` (default) · `cpu` | **Scheduling**, not routing. A `cpu` engine is exempt from the single-GPU-owner slot: `_begin_job` never acquires it, so a transcription runs while a TTS model is resident instead of evicting it. The VRAM-pressure reaper also leaves `cpu` workers alone |
+
+Declare `device: cpu` honestly. A `cpu` engine that grabs a CUDA context breaks the
+"0 MB VRAM" promise an operator planned around; a `gpu` engine marked `cpu` would
+hold no slot while competing for the card anyway.
+
+## Speech in: the transcribe path
+
+A `kind: asr` engine answers `transcribe` instead of `synthesize`:
+
+```text
+transcribe  req  {"model_alias", "audio_path", "language", "word_timestamps", "hotwords"}
+            resp {"model_alias", "backend_name", "backend_version", "language",
+                  "duration_sec", "text", "truncated",
+                  "segments": [{"index", "start_sec", "end_sec", "text", "words"?}]}
+```
+
+The daemon extracts a **16 kHz mono WAV** once with ffmpeg and hands the worker that
+path, so no worker ever decodes a container. Segments group on sentence punctuation,
+a pause `>= 0.8 s`, and a 7 s cap — the shape subtitles and dubbing both rely on.
+`words[]` is populated only when `word_timestamps` was asked for, and `hotwords` is a
+decoder bias list capped at 25 terms.
+
+Two doors reach it: `POST /v1/agent/transcribe` (a confined local path) and
+`POST /v1/audio/transcriptions` (OpenAI multipart). The CLI is
+`agent-voice transcribe <file>`, and MCP is `transcribe()`.
+
+Dubbing builds on both: `dub_prepare` transcribes and extracts a bed plus a speaker
+reference; the caller translates; `dub_render` speaks the translated lines into their
+original slots. See [api.md](api.md#dubbing).
 
 ## Five checkpoints, three modes
 
@@ -254,6 +299,62 @@ documented as the alternative but is not shipped: its weights are GitHub release
 assets, not Hugging Face ones, so `models download` and `hf_model_downloaded()`
 would need a custom downloader.
 
+## Phonon: the CPU ASR engine
+
+`phonon` is the listening half of the daemon and the first shipped `kind: asr`
+engine. It is a real speech recogniser — a 0.6B FastConformer/TDT model compressed
+to int6 — that runs on the **CPU** at ≈42–48× real time, uses **0 MB of VRAM**
+and comes from a **156 MB** download. It declares `device: cpu`, so it is exempt
+from the GPU owner slot: transcribing while a Qwen model is resident does not evict
+it.
+
+| | |
+|---|---|
+| Models | `phonon-2.5` (default, 25 languages, 156 MB), `phonon-2.5-en` (English, 158 MB), `phonon-2` (164 MB, `quality_tier: fast`) |
+| Backend | `fermion-research==0.2.15`, CPU-only PyTorch, `engines/phonon/.venv` |
+| Licence | **CC-BY-4.0 weights** (derived from NVIDIA Parakeet TDT 0.6B v3), **Apache-2.0 code**. Attribution is required on redistribution; the model card and `NOTICE` carry it |
+| VRAM | **0 MB**: `CUDA_VISIBLE_DEVICES=""` before the torch import, `gpu_vram_mb: 0`, no `nvidia-*` wheel |
+| Modes | `asr`. No speech output at all — `synthesize` on it is `BAD_REQUEST` |
+| Languages | 25 with `phonon-2.5`: en, es, fr, de, it, pt, nl, pl, ru, uk, ro, cs, sk, bg, hr, sv, da, fi, et, lv, lt, hu, sl, mt, el |
+| Capabilities | `word_timestamps: true`, `hotwords: true`, `multilingual: true` |
+| Measured | 39.4–47.9× real time across nine runs on a Ryzen 7 5700X, ≈1.00 GB peak RSS, 1.05 s warm load |
+
+Phonon's `pyproject.toml` limits uv's resolution environments to Linux, Windows and
+Apple silicon. Fermion pins `torch>=2.2,<2.3` on Intel macOS, which cannot coexist with
+this engine's `torch==2.15.0` CPU pin; Intel Macs are not a supported Phonon host.
+
+Phonon has **no per-request language control** on 2.5: it auto-detects, and the
+worker reports `"auto"` when the backend says nothing. It also has **no confidence
+field**, so neither is exposed. `phonon-2.5-en` is a fixed-English checkpoint
+instead.
+
+### Install and verify
+
+```bash
+uv run agent-voice engines install phonon
+uv run agent-voice models download phonon phonon-2.5     # 156 MB, once
+uv run agent-voice doctor                                 # `asr` row + weights present
+uv run agent-voice engines test phonon                    # 7/7 IPC v1, 0 MB VRAM
+```
+
+`engines test` walks the **ASR table**: `spawn+connect → hello → load_model →
+transcribe → cancel → health → shutdown`. The `transcribe` row sends a 1 s 16 kHz
+tone and passes on a well-formed reply (a `segments` list and a string `text`),
+never on words. The `cancel` row starts a 20 s transcribe, waits for the worker to
+report a request in flight, then cancels and passes on a well-formed
+`{cancelled: bool}` — `cancelled: false` included, because a CPU decode can finish
+before the round trip. The detail string says which happened.
+
+### The first call is slow
+
+`load_speech` unpacks `~/.cache/fermion/speech/FermionResearch__Phonon-2.5/` on the
+first use: **50.1 s** measured, including a 0.16 GB download and a per-member
+SHA-256 verification. Every later load is **1.05 s**. `load_model` has a 600 s
+budget for exactly this reason — do not lower it.
+
+Measured numbers and the exact dependency recipe:
+[phase0-asr-report.md](phase0-asr-report.md).
+
 ## Adding an engine
 
 The full contract is in
@@ -273,6 +374,8 @@ backend_name: example-tts     # PyPI distribution name — part of the cache key
 backend_version: "1.2.3"      # must match what is installed — part of the cache key
 protocol_version: 1
 venv_python: .venv/bin/python # null => run in the core interpreter (zero-dep engines)
+kind: tts                     # tts (default) | asr
+device: gpu                   # gpu (default) | cpu — cpu never takes the GPU slot
 
 capabilities:
   streaming: true             # true only if PCM arrives during decode
@@ -294,9 +397,15 @@ models:
     preset_speakers: [Ash, Blair]
 ```
 
-The shipped `engines/kokoro/engine.yaml` is the worked example of a CPU engine:
-`est_vram_gb: 0.0`, `voice_clone: false`, one `custom_voice` model, eight preset
-speakers. The shipped Qwen manifests are the worked example of the three-mode
+An ASR engine swaps `kind: asr` / `device: cpu` in, drops `mode`/`preset_speakers`,
+and adds `word_timestamps`/`hotwords`/`multilingual` to `capabilities`. The full
+walkthrough, with a complete `faster_whisper` sketch, is in
+[`engines/ADDING_AN_ENGINE.md#6-adding-an-asr-engine`](../engines/ADDING_AN_ENGINE.md#6-adding-an-asr-engine).
+
+The shipped `engines/kokoro/engine.yaml` is the worked example of a CPU **TTS**
+engine: `device: cpu`, `est_vram_gb: 0.0`, `voice_clone: false`, one
+`custom_voice` model, eight preset speakers. `engines/phonon/engine.yaml` is the
+ASR one. The shipped Qwen manifests are the worked example of the three-mode
 routing surface.
 
 Rules that keep the system honest:
@@ -309,11 +418,17 @@ Rules that keep the system honest:
   `MODEL_NOT_FOUND` instead of a clear answer.
 - `preset_speakers: []` on a `custom_voice` model means "accept any name", which
   is only right if the backend validates the name itself.
+- `kind` and `device` are declarations, not hints. `kind: asr` puts the engine in
+  the transcription family; `device: cpu` exempts it from the GPU owner slot. Say
+  `device: cpu` only if the worker really allocates no VRAM.
 - `worker.py` must keep reading the socket while inference runs, so `cancel` and
   `health` land mid-decode. Copy the parent-death guards
   (`PR_SET_PDEATHSIG` + a 2 s `os.getppid()` poll) or an orphan keeps VRAM.
 - Audio is always 24 kHz mono int16 LE. Never build a shell string; argv lists
   with `shell=False` only.
+- An ASR worker returns segments grouped on **sentence punctuation**, a pause
+  **≥ 0.8 s** and a **7 s** cap, and `words[]` only when `word_timestamps` asked
+  for it. `engines/phonon/worker.py::group_words_into_segments` is the reference.
 
 Then install and verify:
 
@@ -323,14 +438,17 @@ uv run agent-voice engines test <engine_id>   # full IPC v1 conformance, exits n
 ```
 
 `engines test` walks `spawn+connect → hello → load_model → synthesize → cancel →
-health → shutdown`, printing a pass/fail row per step. Skipped steps are `SKIP`
-with a reason, never a pass. It picks a clone model first; when an engine has none
-(Kokoro), it uses the first `custom_voice` checkpoint's first preset speaker and
-sends `mode` + `speaker`, so a preset-only engine reaches 7/7 as well. `mock` needs
-no GPU, so it is the reference runner:
+health → shutdown` for a TTS engine, and `… → transcribe → cancel → …` for an ASR
+one, printing a pass/fail row per step. Skipped steps are `SKIP` with a reason,
+never a pass. It picks a clone model first; when an engine has none (Kokoro), it
+uses the first `custom_voice` checkpoint's first preset speaker and sends `mode` +
+`speaker`, so a preset-only engine reaches 7/7 as well. An ASR engine is exercised
+with a 1 s tone and passes on a well-formed reply, not on words. `mock` and
+`mock_asr` need no GPU, so they are the reference runners:
 
 ```bash
 uv run agent-voice engines test mock
+uv run agent-voice engines test mock_asr
 ```
 
 Agent-authored engines go through the same path but are gated: with
@@ -343,8 +461,12 @@ skips the prompt).
 ## GPU lifecycle
 
 - **0 workers at boot, 0 MB VRAM.** Only the core daemon runs; it holds no model
-  code. When a `kokoro` worker *is* resident it still contributes 0 MB of VRAM —
-  the model lives in system RAM.
+  code. When a `kokoro` or `phonon` worker *is* resident it still contributes 0 MB
+  of VRAM — the model lives in system RAM.
+- **`device: cpu` engines never take the GPU slot.** `_begin_job` skips
+  `_acquire_gpu` for them, so a transcription runs next to a resident Qwen model
+  instead of evicting it, and `gpu_status().active_engine` keeps meaning "the GPU
+  owner" rather than "whatever ran last". The VRAM-pressure reaper skips them too.
 - **The cache is consulted before any worker is spawned.** A hit costs a disk
   read and never wakes the GPU.
 - **Workers are lazy and reapable.** A worker spawns on the first uncached request
@@ -363,7 +485,9 @@ skips the prompt).
 
 `gpu_status()` (or `GET /v1/gpu`) reports `active_engine`, `loaded_models`,
 `workers`, `vram_used_mb`, `vram_free_mb`, `queue_depth`, `in_flight`,
-`unload_in_seconds` and `last_used_at`.
+`unload_in_seconds`, `last_used_at`, and `cpu_engines[]` — the alive workers that
+hold no VRAM, so `active_engine` can keep meaning "the GPU owner" while a
+transcription is plainly visible.
 
 ## Concurrency and backpressure
 

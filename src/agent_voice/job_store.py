@@ -18,7 +18,7 @@ from typing import Any, Literal
 from .clock import Clock, get_clock
 from .schemas import ErrorCode, ErrorResponse, Job, JobStatus
 
-JobKind = Literal["script", "download_model", "install_engine"]
+JobKind = Literal["script", "download_model", "install_engine", "dub"]
 
 _INTERRUPTIBLE_STATUSES: frozenset[str] = frozenset({"pending", "running"})
 """A job in one of these states cannot survive a daemon restart: its work lived in

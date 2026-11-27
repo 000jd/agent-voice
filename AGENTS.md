@@ -1,8 +1,9 @@
 # AGENTS.md
 
-`agent-voice` is a headless, UI-free voice-cloning and speech-synthesis server that an AI agent
-drives over MCP or HTTP. The agent asks for speech, gets back a file path or a PCM stream, and
-the GPU stays at 0 MB the rest of the time.
+`agent-voice` is a headless, UI-free speech server — synthesis, voice cloning, speech
+recognition and two-stage dubbing — that an AI agent drives over MCP or HTTP. The agent asks
+for speech or a transcript, gets back a file path or a PCM stream, and the GPU stays at 0 MB
+the rest of the time.
 
 ## Architecture, in seven bullets
 
@@ -11,11 +12,32 @@ the GPU stays at 0 MB the rest of the time.
 - **Isolated per-engine venvs.** Each engine is a directory under `engines/<engine_id>/` with an
   `engine.yaml` manifest and a `worker.py`, installed into its own `uv` venv. Two engines that
   need mutually exclusive dependency sets coexist without conflict.
-- **Four engines.** `qwen3_tts_fast` (CUDA graphs) and `qwen3_tts` (official) run on the GPU;
-  `kokoro` (`kokoro==0.9.4`, CPU-only torch) and `mock` run on the CPU. Kokoro is preset-timbre
-  only (`voice_clone: false`, `voice_design: false`, `instruct_control: false`) and never
-  initialises CUDA: `CUDA_VISIBLE_DEVICES=""` before the torch import, `device="cpu"` on
+- **Six engines, two kinds.** `kind: tts` speaks, `kind: asr` listens, and the
+  manifest declares which. Four TTS engines: `qwen3_tts_fast` (CUDA graphs) and
+  `qwen3_tts` (official) on the GPU, `kokoro` (`kokoro==0.9.4`, CPU-only torch) and
+  `mock` on the CPU. Two ASR engines: `phonon` (`fermion-research==0.2.15`, 25
+  languages, 0 MB VRAM) and `mock_asr` (dependency-free, timed synthetic
+  transcript). Kokoro is preset-timbre only (`voice_clone: false`,
+  `voice_design: false`, `instruct_control: false`) and never initialises CUDA:
+  `CUDA_VISIBLE_DEVICES=""` before the torch import, `device="cpu"` on
   `KPipeline`, `gpu_vram_mb: 0`.
+- **`kind` routes, `device` schedules.** `kind` picks the IPC method
+  (`synthesize`/`stream_pcm` vs `transcribe`) and the `engines test` table;
+  `device: cpu` makes an engine **exempt from the single-GPU-owner slot**, so a
+  transcription runs next to a resident TTS model instead of evicting it, and the
+  VRAM-pressure reaper leaves it alone. Both default to the v0.4 behaviour (`tts`,
+  `gpu`), which is why every older manifest still loads.
+- **Two surfaces per direction.** Speech out: `/v1/agent/speak`,
+  `/v1/audio/speech` (OpenAI), the PCM stream and the WebSocket. Speech in:
+  `/v1/agent/transcribe` (a confined local path) and `/v1/audio/transcriptions`
+  (OpenAI multipart, bearer-protected by the `/v1` guard). The same two are MCP
+  `transcribe()` and the `transcribe` CLI command.
+- **Dubbing is two-stage and has no translation model.** `dub prepare` transcribes,
+  extracts the bed and a speaker reference, and persists `project.json`;
+  the *agent* translates the lines in its own context; `dub render` speaks them into
+  their original slots, retimes each line up to `max_atempo`, and mixes. Bundling a
+  translator would need a translation model, a tokenizer and a 2 GB download to do
+  worse than the model already calling the tool.
 - **Five Qwen checkpoints, three modes.** `engine.yaml` declares five Qwen3-TTS 12Hz aliases —
   two `clone` (`1.7b-base`, `0.6b-base`), two `custom_voice` (`1.7b-custom`, `0.6b-custom`, nine
   `preset_speakers`, `supports_instruct` on the 1.7B only) and one `voice_design`
@@ -26,9 +48,13 @@ the GPU stays at 0 MB the rest of the time.
   running. See `src/agent_voice/ipc/protocol.py` and `src/agent_voice/ipc/transport.py` — do not
   change the wire format. `mode`, `speaker` and `instruct` are **optional** fields on
   `synthesize`/`stream_pcm`; omitting them is exactly v1 behaviour, and a worker that does not
-  understand them may ignore them.
-- **20 MCP tools** (12 core), gated into a `core` and a `full` surface (`AGENT_VOICE_TOOLSET`).
+  understand them may ignore them. `transcribe` is additive in the same way: a TTS worker answers
+  `BAD_REQUEST unknown method` and an ASR worker answers that to `synthesize`, so no framing
+  change and no version bump were needed.
+- **24 MCP tools** (16 core), gated into a `core` and a `full` surface (`AGENT_VOICE_TOOLSET`).
   The mutation tools that write and execute Python are hidden unless explicitly enabled.
+  `transcribe`, `dub_prepare`, `dub_render` and `start_dub_job` are core, not full-only:
+  speech in and dubbing are the feature, not an operator extra.
 - **`skills/agent-voice/SKILL.md` is the playbook.** It is the agent-facing guide, and the
   `/mcp` `guide` resource serves it. Change agent-facing behaviour there, not in prose scattered
   through the README.
@@ -51,11 +77,21 @@ AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""
 
 # end-to-end IPC v1 conformance against a live worker (~1 s, no GPU)
 .venv/bin/agent-voice engines test mock
+.venv/bin/agent-voice engines test mock_asr    # the ASR table: transcribe replaces synthesize
 .venv/bin/agent-voice engines test kokoro     # CPU engine, needs the downloaded weights
+.venv/bin/agent-voice engines test phonon     # CPU ASR engine, needs the downloaded weights
 
 # environment + client onboarding
 .venv/bin/agent-voice doctor
 .venv/bin/agent-voice mcp-config --client claude-code
+
+# speech in: in-process, no daemon, no GPU (16 kHz WAV extraction happens once)
+.venv/bin/agent-voice transcribe data/inbox/clip.wav --srt --words
+.venv/bin/agent-voice transcribe data/inbox/clip.wav --hotwords "CUDA,Manim" --model phonon-2.5
+
+# dubbing, two stages. The translation in the middle is YOUR job, not the daemon's.
+.venv/bin/agent-voice dub prepare data/inbox/episode.mp4     # -> dub_id + timed segments
+.venv/bin/agent-voice dub render <dub_id> segments.json --auto-clone-source
 
 # design a voice from a description, in-process, no daemon needed
 .venv/bin/agent-voice voices design narrator \
@@ -80,6 +116,15 @@ printing a pass/fail row per step and exiting non-zero on any failure. Use it af
 anything in the worker, the transport or the manager. It picks a clone model first; an engine
 with none (Kokoro) is exercised through its first `custom_voice` model's first preset speaker,
 with `mode` and `speaker` sent on the synthesize and stream steps.
+
+A `kind: asr` engine walks the sibling table — `spawn+connect → hello → load_model →
+transcribe → cancel → health → shutdown` — because it has no `synthesize` to exercise. The
+`transcribe` row sends a 1 s synthetic 16 kHz tone and passes on a well-formed reply (a list of
+`segments` and a string `text`), never on words: a tone has none, and demanding them would fail a
+healthy backend. The `cancel` row starts a **20 s** transcribe, waits until the worker itself
+reports a request in flight, then cancels — and passes on `{cancelled: false}` too, because a CPU
+decode can legitimately finish first. The detail string says which happened; never claim a cancel
+that did not occur.
 
 `pronunciations check <text-or-file>` is the read-only prediction of the rewrite pipeline
 (lexicon terms with hit counts, unknown ALL-CAPS acronyms, and — with `--spell-identifiers` —
@@ -112,23 +157,34 @@ command body. `--candidates 2..5` renders several takes to audition and saves no
 - **Agent clone paths are confined.** `AGENT_VOICE_ALLOW_ANY_PATH=false` (default): `clone_voice`
   over REST/MCP reads only `<DATA_DIR>/inbox/` unless `MCP_BASE_PATH` is set. A rejected path is
   `PATH_OUTSIDE_BASE` before any ffmpeg probe, and MCP and REST share one resolver. The CLI
-  `voices add` is a human operator path and remains unrestricted.
+  `voices add` is a human operator path and remains unrestricted. **Transcription reads through
+  the same resolver** (`resolve_media_path` → `resolve_ref_audio_path`), so `transcribe` and
+  `dub_prepare` cannot read a file a clone could not.
 - **Input caps are admission control.** `MAX_SCRIPT_BEATS=200`, `MAX_INSTRUCT_CHARS=1000`,
   `MAX_DESIGN_SAMPLE_CHARS=500` and `MAX_REF_TEXT_CHARS=2000` are checked before routing and
   before a worker is spawned, so an oversized request costs a round-trip and no GPU time.
   Oversized text is `413 TEXT_TOO_LONG`; an over-long beat list is `BAD_REQUEST`. Markup
   (128 tags, depth 4, 32 segments) and lexicon (500 per scope, 1,500 merged) caps are checked at
   the same point. A new cap belongs at admission too, never after the expensive part.
+  `MAX_TRANSCRIBE_SECONDS` (3600) is a cap on **work**, not on upload size: it is checked against
+  the ffprobe duration before any extraction, and an over-long clip is `BAD_REQUEST` naming the
+  cap. `MAX_DUB_SEGMENTS` (500) bounds one render and is checked before any synthesis.
 - **Lexicon caps are a regex bound.** A merged map is validated on load and again before
   `_compiled`, so a hand-edited file or a raw WS/OpenAI map cannot compile an unbounded
   alternation.
+- **The hotword cap is a decoder bound.** `MAX_HOTWORDS = 25` is a contract constant in
+  `schemas.py`, not an env knob: an unbounded bias list is unbounded decoder work, the same
+  reasoning that keeps the lexicon caps structural.
 - `REQUIRE_ENGINE_APPROVAL` defaults to `true` in code as well as in `.env.example`: an
   agent-authored plugin is staged under `engines/.pending/<id>/` until an operator promotes
   it with `agent-voice engines approve <id>`.
 - **Optional tools are WARNs, not FAILs.** A missing `espeak-ng` degrades Kokoro's
   out-of-dictionary words only, so `doctor` reports it as a WARN with the platform install
   command. A missing GPU is a WARN too; only a broken required tool (`ffmpeg`, `uv`, a bad port)
-  is a FAIL, and only a FAIL exits non-zero.
+  is a FAIL, and only a FAIL exits non-zero. The `asr` row (default ASR engine not installed) and
+  the `dub filters` row (this ffmpeg lacks `sidechaincompress`/`alimiter`) are both WARNs — the
+  first because a TTS-only box is a supported setup, the second because a dub still completes with
+  a plain mix.
 
 ## Error taxonomy
 
@@ -169,3 +225,12 @@ fastmcp) are legitimately present.
   `pronunciation_hash` is observability only.
 - Typer sub-commands must not import torch. Defer heavy imports into command bodies.
 - `pyproject.toml`'s core `dependencies` must never gain torch.
+- **`device: cpu` is a scheduling promise, not a label.** `_begin_job` must not acquire the GPU
+  slot for a `cpu` engine, and the VRAM-pressure reaper must never kill one. If a new code path
+  starts a worker, it inherits that rule from `_begin_job` — do not re-check the manifest in three
+  places and get two of them wrong.
+- **`kind` decides the method, never the caller.** Routing checks it in exactly two places —
+  `resolve_target` (refuses an ASR engine for speech) and `resolve_asr_target` (refuses a TTS
+  engine for transcription) — so a wrong-kind request is a clear `BAD_REQUEST`, not a worker crash.
+- All six engines are plugins. A core change that names one engine id (`kokoro`, `phonon`, …) is a
+  bug unless the id is a test fixture; capability questions go through the manifest.

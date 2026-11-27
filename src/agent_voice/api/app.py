@@ -79,11 +79,17 @@ ARTIFACT_MEDIA_TYPES: dict[str, str] = {
     ".opus": "audio/ogg",
     ".flac": "audio/flac",
     ".pcm": "application/octet-stream",
+    # A dub lands beside the audio artifacts, so GET /audio/<id> serves it too.
+    ".mp4": "video/mp4",
 }
 """Known artifact containers. A fixed extension list replaces v0.1's
 ``glob(f"{artifact_id}.*")``: a glob reads ``*`` and ``?`` in the id as pattern
 syntax, so ``/audio/*`` enumerated the artifacts directory and served an
-arbitrary file to an unauthenticated caller."""
+arbitrary file to an unauthenticated caller.
+
+Deliberately audio/video only: ``.json``/``.srt``/``.vtt`` are transcripts, and
+those are returned to the caller as paths rather than published to this endpoint.
+"""
 
 
 class AppContext:
@@ -316,6 +322,7 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
     # -- routes ----------------------------------------------------------
     from . import (
         routes_agent,
+        routes_asr,
         routes_bindings,
         routes_engines,
         routes_openai,
@@ -326,6 +333,7 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
     for module in (
         routes_openai,
         routes_agent,
+        routes_asr,
         routes_voices,
         routes_engines,
         routes_bindings,

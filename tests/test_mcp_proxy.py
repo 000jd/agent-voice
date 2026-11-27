@@ -107,6 +107,12 @@ EXPECTED_TOOLS = {
     "install_engine",
     "gpu_status",
     "unload_models",
+    # v0.5.0: speech in and dubbing are the feature, not an operator extra, so
+    # they are core rather than full-only.
+    "transcribe",
+    "dub_prepare",
+    "dub_render",
+    "start_dub_job",
 }
 
 
@@ -565,7 +571,12 @@ async def test_mutation_disabled_blocks_register_engine(tmp_path):
         # speak it" is the one path that needs neither a clip nor a download, and
         # delete_voice has been core since v0.2.1 so an agent can clean up a bad
         # clone without dropping to the CLI.
-        assert len(names) == 12
+        #
+        # 16 since v0.5.0: transcribe, dub_prepare, dub_render and start_dub_job.
+        # Speech *in* and dubbing are the release, not an operator extra, so they
+        # belong on the default surface — and a dubbing agent that had to ask an
+        # operator to flip AGENT_VOICE_TOOLSET first would not be agent-native.
+        assert len(names) == 16
         assert "delete_voice" in names
         assert "design_voice" in names
 
@@ -1000,11 +1011,17 @@ async def test_core_tool_schema_weight_stays_compact(tmp_path):
       back;
     * 16,054 after those selectors were exposed on the MCP tool signatures and
       their one-line Args descriptions were added.
+    * 20,398 with the four v0.5.0 ASR/dubbing tools (transcribe, dub_prepare,
+      dub_render, start_dub_job). They add 4,348 chars — 539 of description and
+      the rest input/output schemas — because a dubbing tool carries a segment
+      list, a ducking parameter and an overflow report. Speech in and dubbing are
+      core by design, so this is real weight the model pays, not something a
+      shorter docstring can buy back.
 
-    16,400 keeps a little headroom over the final v0.4.0 contract without
+    20,600 keeps a little headroom over the final v0.5.0 contract without
     pretending the payload shrank. The full 2,500-token target remains below the
     structural floor (including output schemas); the description budget above is
-    the part that can actually be trimmed.
+    the part that can actually be trimmed, and it still has 286 chars of slack.
     """
     async with mcp_client(tmp_path, ALLOW_AGENT_ENGINE_MUTATION="false") as (client, _app):
         tools = await client.list_tools()
@@ -1013,7 +1030,7 @@ async def test_core_tool_schema_weight_stays_compact(tmp_path):
             separators=(",", ":"),
             default=str,
         )
-        assert len(compact) <= 16_400, (
+        assert len(compact) <= 20_600, (
             f"core tools/list payload is {len(compact)} chars (~{len(compact) // 4} "
             "tokens); keep docstrings to 1-2 sentences and add detail to "
             "skills/agent-voice/SKILL.md"

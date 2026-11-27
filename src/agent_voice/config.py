@@ -20,6 +20,7 @@ from .pronunciations import (
     PROJECT_LEXICON_DIR,
     PRONUNCIATION_FILE,
 )
+from .schemas import MAX_HOTWORDS
 
 
 class Settings(BaseSettings):
@@ -37,6 +38,13 @@ class Settings(BaseSettings):
 
     # --- Defaults -------------------------------------------------------
     default_engine: str = Field(default="mock", alias="AGENT_VOICE_DEFAULT_ENGINE")
+    default_asr_engine: str = Field(default="phonon", alias="AGENT_VOICE_DEFAULT_ASR_ENGINE")
+    """Which ``kind: asr`` engine a transcription uses when none is named.
+
+    Deliberately independent of ``default_engine``: speech in and speech out are
+    different plugin families, and a CPU listener next to a GPU speaker is the
+    normal deployment.
+    """
     default_voice_id: str = Field(default="", alias="AGENT_VOICE_DEFAULT_VOICE_ID")
 
     # --- GPU lifecycle --------------------------------------------------
@@ -67,6 +75,16 @@ class Settings(BaseSettings):
     )
     max_ref_text_chars: int = Field(default=2000, ge=1, alias="MAX_REF_TEXT_CHARS")
     normalize_lufs: float = Field(default=-16.0, alias="NORMALIZE_LUFS")
+    max_transcribe_seconds: float = Field(
+        default=3600.0, gt=0, alias="MAX_TRANSCRIBE_SECONDS"
+    )
+    """Refuse media longer than this at admission, before ffmpeg or a worker.
+
+    An hour is a generous default for a podcast; it is a cap on *work*, not on
+    file size, so an oversized upload costs a probe and nothing else.
+    """
+    max_dub_segments: int = Field(default=500, ge=1, alias="MAX_DUB_SEGMENTS")
+    """Cap on translated lines in one dub_render, checked before synthesis."""
 
     # --- Streaming ------------------------------------------------------
     stream_queue_maxsize: int = Field(default=32, ge=1, alias="STREAM_QUEUE_MAXSIZE")
@@ -187,6 +205,15 @@ class Settings(BaseSettings):
         return self.data_dir / "jobs"
 
     @property
+    def dubs_dir(self) -> Path:
+        """Per-dub working directories: ``<data>/dubs/<dub_id>/``.
+
+        Holds the extracted 16 kHz ASR WAV, the 24 kHz stereo bed, the speaker
+        reference clip and ``project.json``. Deleted once a render succeeds.
+        """
+        return self.data_dir / "dubs"
+
+    @property
     def artifacts_dir(self) -> Path:
         if self.mcp_base_path:
             return Path(self.mcp_base_path).resolve() / "artifacts"
@@ -225,6 +252,15 @@ class Settings(BaseSettings):
         return MAX_MERGED_LEXICON_ENTRIES
 
     @property
+    def max_hotwords(self) -> int:
+        """Hotword cap offered to callers, read-only like the lexicon caps.
+
+        Structural rather than an env knob: it is the decoder's own bias-list
+        bound, so raising it means changing the contract deliberately.
+        """
+        return MAX_HOTWORDS
+
+    @property
     def daemon_lock_path(self) -> Path:
         return self.data_dir / "daemon.lock"
 
@@ -249,6 +285,7 @@ class Settings(BaseSettings):
             self.inbox_dir,
             self.cache_dir,
             self.jobs_dir,
+            self.dubs_dir,
             self.artifacts_dir,
             self.pronunciations_dir,
         ):

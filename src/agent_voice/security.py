@@ -25,6 +25,7 @@ __all__ = [
     "ensure_within_base",
     "is_loopback_client",
     "resolve_artifact_path",
+    "resolve_media_path",
     "resolve_ref_audio_path",
     "validate_slug",
 ]
@@ -78,7 +79,7 @@ def ensure_within_base(
 
 
 INBOX_REF_AUDIO_SUGGESTION = (
-    "Put the reference clip in {inbox} (the inbox), or set "
+    "Put the file in {inbox} (the inbox), or set "
     "AGENT_VOICE_ALLOW_ANY_PATH=true to allow any existing local path."
 )
 """The one wording REST and MCP both give when the inbox is the only allowed root."""
@@ -90,8 +91,10 @@ def resolve_ref_audio_path(
     inbox_dir: str | Path,
     mcp_base_path: str | Path = "",
     allow_any_path: bool = False,
+    field: str = "ref_audio_path",
+    suggestion: str = "",
 ) -> Path:
-    """Resolve a caller-supplied ``ref_audio_path`` under the one shared policy.
+    """Resolve a caller-supplied path under the one shared policy.
 
     Three branches, in priority order — the same on REST and over MCP, because an
     agent that can reach both must not be able to smuggle a path through the
@@ -105,32 +108,64 @@ def resolve_ref_audio_path(
        ambiguous — the daemon's cwd is not the caller's — so it is a
        ``BAD_REQUEST`` rather than a guess that could clone the wrong file.
 
+    ``field`` names the parameter in an error message and ``suggestion`` replaces
+    the inbox wording, so a transcription of a video does not tell the caller its
+    ``ref_audio_path`` is missing. The policy itself is shared: there is exactly
+    one place these three branches exist.
+
     The returned path is checked to be a regular file before any ffmpeg probe.
     """
+    inbox_hint = (suggestion or INBOX_REF_AUDIO_SUGGESTION).format(
+        inbox=inbox_dir, field=field
+    )
     if mcp_base_path:
-        candidate = ensure_within_base(raw_path, mcp_base_path)
-    elif not allow_any_path:
         candidate = ensure_within_base(
             raw_path,
-            inbox_dir,
-            suggestion=INBOX_REF_AUDIO_SUGGESTION.format(inbox=inbox_dir),
+            mcp_base_path,
+            suggestion=f"Move the file inside {mcp_base_path} or unset MCP_BASE_PATH.",
         )
+    elif not allow_any_path:
+        candidate = ensure_within_base(raw_path, inbox_dir, suggestion=inbox_hint)
     else:
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             raise AgentVoiceError(
                 ErrorCode.BAD_REQUEST,
-                f"relative ref_audio_path is ambiguous: {raw_path}",
+                f"relative {field} is ambiguous: {raw_path}",
                 "Pass an absolute path, or set MCP_BASE_PATH and use a relative one.",
             )
 
     if not candidate.is_file():
         raise AgentVoiceError(
             ErrorCode.BAD_REQUEST,
-            f"ref_audio_path not found: {raw_path}",
+            f"{field} not found: {raw_path}",
             "Check the path exists and is readable by the daemon.",
         )
     return candidate
+
+
+def resolve_media_path(
+    raw_path: str,
+    *,
+    inbox_dir: str | Path,
+    mcp_base_path: str | Path = "",
+    allow_any_path: bool = False,
+    field: str = "media_path",
+) -> Path:
+    """Resolve a caller-supplied ``media_path``/``audio_path`` under the same policy.
+
+    Transcription reads files exactly where cloning does, so this delegates to
+    :func:`resolve_ref_audio_path` rather than reimplementing the three branches.
+    ``field`` only changes the noun in an error message: a video that cannot be
+    found must not be reported as a missing reference clip.
+    """
+    return resolve_ref_audio_path(
+        raw_path,
+        inbox_dir=inbox_dir,
+        mcp_base_path=mcp_base_path,
+        allow_any_path=allow_any_path,
+        field=field,
+    )
 
 
 def resolve_artifact_path(

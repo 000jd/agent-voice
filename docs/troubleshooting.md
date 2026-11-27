@@ -172,6 +172,121 @@ Do not `pip install torch` inside that venv by hand. The engine's
 `[tool.uv.sources] torch = { index = "pytorch-cpu" }`; the exact lock is recorded in
 [phase0-kokoro-report.md](phase0-kokoro-report.md).
 
+## Phonon install fails (or is slow on the first call)
+
+**Symptoms.** `agent-voice engines install phonon` fails, or `engines test phonon`
+times out at `load_model`, or the first `transcribe` takes ~50 s.
+
+**Causes, in order of likelihood.**
+
+1. **A CUDA torch came in.** `fermion-research` needs `torch`, and installing it alone
+   resolves the CUDA wheel from PyPI (every `nvidia-*` package plus Triton, ~2 GB).
+   `engine install phonon` uses the pinned `pyproject.toml`, so this should not happen —
+   but if you installed by hand, check:
+
+   ```bash
+   engines/phonon/.venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+   # expected: 2.x.y+cpu False
+   ```
+
+   Fix by reinstalling through the project, never by hand-patching the venv.
+
+2. **The first `load_speech` is legitimately slow.** Measured on a Ryzen 7 5700X:
+   **50.1 s** for the first call (0.16 GB download, SHA-256 verification of every
+   packed member, then unpack to `~/.cache/fermion/speech/FermionResearch__Phonon-2.5/`),
+   and **1.05 s** on every later load. `load_model` has a 600 s budget for exactly this.
+   If a `transcribe` looks hung for under a minute on first use, it is not hung.
+
+3. **No wheel for this platform, or no network.** Pre-download the weights and install
+   from a cache. The error text from `uv` names the missing wheel or the failed URL —
+   read it rather than retrying; a genuinely unsupported platform will not start
+   working. `docs/phase0-asr-report.md` records the exact recipe that was verified.
+
+4. **`FERMION_CACHE_DIR` points somewhere unwritable.** The registry checks that
+   directory *and* `~/.cache/fermion` when deciding whether a model is downloaded, so a
+   redirected-but-empty cache reads as "not downloaded". Make it writable, or unset it.
+
+**Verify:**
+
+```bash
+uv run agent-voice models download phonon phonon-2.5
+uv run agent-voice engines test phonon      # 7/7 on the ASR table
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv   # empty, before and after
+```
+
+## `sidechaincompress` / `alimiter` missing (dubbing degrades)
+
+**Symptoms.** `agent-voice doctor` prints a `dub filters` row:
+
+```
+dub filters   WARN   missing: sidechaincompress
+              fix: dubbing with keep_original_bed=true will fall back to a plain mix
+```
+
+A dub still renders. The original audio bed is mixed with `amix` + gain instead of
+being ducked under the voice, so the source is audible throughout instead of
+stepping back when somebody speaks.
+
+**Cause.** A minimal or old ffmpeg build. These are standard filters in every modern
+build (Debian/Ubuntu `ffmpeg` since 4.x, Homebrew, the static builds from
+ffmpeg.org), but a trimmed distro package, a container image, or an ancient
+`ffmpeg` can lack them.
+
+**Check by hand:**
+
+```bash
+ffmpeg -hide_banner -filters | grep -E 'sidechaincompress|alimiter'
+```
+
+**Fix.**
+
+- Install a fuller ffmpeg: `sudo apt install ffmpeg` on Debian/Ubuntu,
+  `brew install ffmpeg` on macOS, or a static build from
+  <https://ffmpeg.org/download.html>. Make sure the binary the **daemon** sees is the
+  one you fixed — a systemd unit inherits its own `PATH`.
+- Or work around it: `dub render ... --no-bed` replaces the original audio entirely,
+  which needs no ducking filter and always works.
+
+Do not treat this as a FAIL: a dub that renders with a plain mix is correct, just less
+polished, and `doctor` exits 0 for it.
+
+## `PATH_OUTSIDE_BASE` on a transcription
+
+**Symptoms.**
+
+```json
+{
+  "error_code": "PATH_OUTSIDE_BASE",
+  "message": "path escapes MCP_BASE_PATH: /home/me/videos/talk.mp4",
+  "suggestion": "Put the file in /repo/data/inbox (the inbox), or set AGENT_VOICE_ALLOW_ANY_PATH=true to allow any existing local path."
+}
+```
+
+**Cause.** Transcription reads files through exactly the same resolver as
+`clone_voice` (`resolve_media_path` → `resolve_ref_audio_path`), so a path outside the
+confinement root is refused. That is deliberate: transcription would otherwise be a
+hole through the inbox boundary that cloning carefully enforces. The refusal happens
+**before** any ffmpeg work, so nothing was read.
+
+The base is, in order: `MCP_BASE_PATH` when set; otherwise `<DATA_DIR>/inbox/`;
+otherwise (with `AGENT_VOICE_ALLOW_ANY_PATH=true`) any existing absolute path.
+
+**Fix**, in order of least surprise:
+
+1. **Move the file into the inbox** — `mv /home/me/videos/talk.mp4 data/inbox/` — and
+   re-run with `data/inbox/talk.mp4`. No configuration change, and it is what
+   `server_info().inbox_dir` is telling an agent to do.
+2. **`AGENT_VOICE_ALLOW_ANY_PATH=true`** for a trusted local agent that genuinely needs
+   arbitrary reads. Restart the daemon afterwards.
+3. **`MCP_BASE_PATH=/home/me/videos`** when the goal is a shared working directory. This
+   also relocates output artifacts to `<MCP_BASE_PATH>/artifacts`.
+4. **A symlink is not a workaround.** It is refused in every branch — resolved real
+   paths, including symlinked ancestors, are what get compared.
+
+The CLI `agent-voice transcribe <path>` goes through the same resolver on purpose: a
+command that works at a prompt works for an agent, and vice versa. If the CLI refuses
+your path, so would the agent.
+
 ## Markup is spoken aloud, or a line is rejected
 
 **Symptoms.** The audio says "bracket pause four hundred milliseconds" instead of
@@ -206,14 +321,17 @@ pausing, or a request fails with `400 BAD_REQUEST` mentioning `[pause]`.
 | `400 BAD_REQUEST` for an artifact id | The id contained path or glob syntax | Use the id exactly as returned |
 | `400 BAD_REQUEST` mentioning `[pause]` | A recognised markup tag with a value it cannot honour (`[pause abc]`, `[pause 99s]`) | Use `[pause]`, `[pause 500ms]` or `[pause 1.5s]` (0–10 s), or `markup=false` |
 | Markup tags are spoken aloud | The tag is not in the whitelist (`[pausex]`, `[div]`) or `markup=false` was sent | Check the spelling; tag names are case-insensitive; see [api.md](api.md#expressive-markup) |
-| `422 VOICE_REQUIRED` | No voice exists or was selected, and the engine cannot speak without one | Clone a voice (`voices add`), use `speaker=`, or `design_voice` |
-| `403 PATH_OUTSIDE_BASE` | An agent-supplied `ref_audio_path` escaped `MCP_BASE_PATH` or the inbox | Put the clip in `<DATA_DIR>/inbox/` (`server_info().inbox_dir`) or set `AGENT_VOICE_ALLOW_ANY_PATH=true` deliberately |
+| `422 VOICE_REQUIRED` | No voice exists or was selected, and the engine cannot speak without one | Clone a voice (`voices add`), use `speaker=`, or `design_voice`. The suggestion now names the inbox, e.g. `clone_voice(name='narrator', ref_audio_path='/repo/data/inbox/clip.wav', …)` — copy that path rather than inventing one |
+| `403 PATH_OUTSIDE_BASE` | A caller-supplied `ref_audio_path`, `transcription` `audio_path` or dub `media_path` escaped its confinement base — normally `<DATA_DIR>/inbox/`, or `MCP_BASE_PATH` when set — or was reached through a symlink | Move the file into `server_info().inbox_dir` and pass that path. If the shared directory is genuinely elsewhere, the operator can set `MCP_BASE_PATH` or `AGENT_VOICE_ALLOW_ANY_PATH=true`. See [the transcription variant below](#path_outside_base-on-a-transcription) |
+| `422 INVALID_REF_AUDIO` | The clip exists but could not be decoded as usable audio: corrupt, an unsupported container, or shorter than the 1 s minimum for a reference | Re-export it (`ffmpeg -i in -ac 1 -ar 24000 out.wav`) and use 3–10 s of clean speech. For `transcribe`, an unreadable file is a `BAD_REQUEST` carrying the ffprobe reason instead |
 | `403 AGENT_MUTATION_DISABLED` | Engine/model mutation is off, or the caller is not on loopback | Set `ALLOW_AGENT_ENGINE_MUTATION=true` **and** call from loopback, or make the change as the operator |
 | `409 WORKER_BUSY` | `unload` without `force` while a job runs, an engine switch while the active engine drains, or a minimum-residency window | Retry after the job, or `agent-voice unload --force` |
-| `409 ENGINE_NOT_INSTALLED` | The engine is discovered but its venv is missing | `agent-voice engines install <id>` |
+| `409 ENGINE_NOT_INSTALLED` | The engine is discovered but its venv is missing — including an ASR engine you asked for by name | `agent-voice engines install <id>`; for transcription that is usually `agent-voice engines install phonon` |
 | `422 MANIFEST_INVALID` | `engine.yaml` failed validation | Fix the manifest; the message names the field |
 | `429 BACKPRESSURE` | The global wait queue (`MAX_QUEUE_DEPTH`) is full, or a stream consumer stalled | Retry, raise `MAX_QUEUE_DEPTH` deliberately, or submit long work with `start_script_job` |
 | `413 TEXT_TOO_LONG` | `MAX_TEXT_CHARS`, `MAX_INSTRUCT_CHARS`, `MAX_DESIGN_SAMPLE_CHARS` or `MAX_REF_TEXT_CHARS` exceeded | Shorten the input or raise the cap |
+| `400 BAD_REQUEST` naming a media duration | The clip is longer than `MAX_TRANSCRIBE_SECONDS` (default 3600) | Split it, or raise `MAX_TRANSCRIBE_SECONDS` deliberately |
+| `422 BAD_REQUEST` naming 25 hotwords | `hotwords` exceeded `MAX_HOTWORDS` — a structural cap, not an env knob | Trim the list. Whitespace-only entries are already dropped for you |
 | `400 BAD_REQUEST` on a voice name | Name does not match `^[\w .\-]{1,64}$` | Use letters, digits, spaces, dots, hyphens, 1–64 chars |
 | `410 DAEMON_RESTARTED` | The job was pending/running when the daemon stopped; jobs cannot resume | Re-submit the script |
 | `503 CUDA_OOM` | The engine caught a real CUDA out-of-memory | Use a smaller alias (`0.6b-*`), free VRAM, or `unload(force=true)` first |

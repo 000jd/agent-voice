@@ -36,6 +36,7 @@ cp .env.example .env
 | Variable | Default | Effect |
 |---|---|---|
 | `AGENT_VOICE_DEFAULT_ENGINE` | `mock` in code, `qwen3_tts_fast` in `.env.example` | Engine used when a request names none |
+| `AGENT_VOICE_DEFAULT_ASR_ENGINE` | `phonon` | Which **`kind: asr`** engine a transcription uses when none is named. Deliberately independent of `AGENT_VOICE_DEFAULT_ENGINE`: speech in and speech out are different plugin families, and a CPU listener next to a GPU speaker is the normal deployment. If it is not installed, `doctor` warns (never fails) and `transcribe` answers `ENGINE_NOT_INSTALLED` |
 | `AGENT_VOICE_DEFAULT_VOICE_ID` | *(empty)* | Voice used when a request names none. When empty and exactly one voice is registered, that voice is the default |
 
 ## GPU lifecycle
@@ -65,6 +66,8 @@ enter this queue; they are answered before an engine slot is requested.
 | `MAX_INSTRUCT_CHARS` | `1000` | Cap on `instruct` for `speak`, a beat, or a voice design. Violation: `413 TEXT_TOO_LONG` |
 | `MAX_DESIGN_SAMPLE_CHARS` | `500` | Cap on `design_voice(sample_text=…)`. Violation: `413 TEXT_TOO_LONG` |
 | `MAX_REF_TEXT_CHARS` | `2000` | Cap on `clone_voice(ref_text=…)`. Violation: `413 TEXT_TOO_LONG` |
+| `MAX_TRANSCRIBE_SECONDS` | `3600` | Refuse media longer than this at admission, before ffmpeg extraction or a worker: a podcast-length cap on **work**, not on file size. Applies to `transcribe` and `dub_prepare`. Violation: `400 BAD_REQUEST` naming the cap |
+| `MAX_DUB_SEGMENTS` | `500` | Cap on translated lines in one `dub_render` / `dub/jobs`. Checked before any synthesis, so a runaway render is refused in milliseconds |
 | `NORMALIZE_LUFS` | `-16.0` | Integrated loudness target for rendered audio; allowed range `-40` to `-5` |
 
 `NORMALIZE_LUFS` applies to a **converted** single-utterance render (`mp3`, `opus`,
@@ -100,6 +103,11 @@ unbounded regex), so they are raised only by editing the contract deliberately.
 | Lexicon entries | 500 | each scope (global, project, voice, per-call) |
 | Lexicon entries, merged | 1,500 | global + project + voice + per-call |
 | Lexicon key/replacement | 200 chars each | every scope |
+| `hotwords` | 25 terms | each term at most 64 characters |
+
+`MAX_HOTWORDS` lives in `schemas.py` and is exposed as `settings.max_hotwords` for
+callers, but it is not an environment variable: an unbounded bias list is unbounded
+decoder work, the same reasoning that keeps the lexicon caps structural.
 
 Scopes live at `<DATA_DIR>/pronunciations.json` (global),
 `<DATA_DIR>/pronunciations/<project>.json` (project, validated slug) and
@@ -138,12 +146,37 @@ close frame. See [api.md](api.md#auth-and-hostorigin-rules).
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DATA_DIR` | `./data` | Root for `voices/`, `inbox/`, `cache/`, `jobs/`, `artifacts/`, `pronunciations/`, `bindings.json`, `pronunciations.json`, `daemon.lock`, `daemon.pid`, `daemon.log`, `mutations.log`. Resolved to an absolute path at load |
+| `DATA_DIR` | `./data` | Root for `voices/`, `inbox/`, `cache/`, `jobs/`, `dubs/`, `artifacts/`, `pronunciations/`, `bindings.json`, `pronunciations.json`, `daemon.lock`, `daemon.pid`, `daemon.log`, `mutations.log`. Resolved to an absolute path at load |
 | `ENGINES_DIR` | `./engines` | Where engine plugins are discovered. Resolved to an absolute path at load |
 
 Relative values are resolved against the daemon's working directory at startup,
 because workers are spawned with `cwd=<engine dir>` and a relative IPC socket path
 would otherwise resolve somewhere else.
+
+### `DATA_DIR` layout
+
+```text
+data/
+├── voices/<voice_id>/         reference clip, metadata, per-voice lexicon
+├── inbox/                     the confinement root for agent-supplied paths;
+│                              OpenAI transcription uploads land here and are deleted
+├── cache/                     deterministic synthesis cache (MAX_CACHE_GB)
+├── jobs/                      durable job records
+├── dubs/<dub_id>/             dubbing work dir: asr.wav (16 kHz), bed.wav (24 kHz stereo),
+│                              speaker_ref.wav, project.json. Removed after a successful
+│                              render; kept on failure so a retry can reuse it
+├── artifacts/                 rendered audio, video, transcripts, subtitles, .timing.json
+│                              (relocated to <MCP_BASE_PATH>/artifacts when that is set)
+├── pronunciations.json        global lexicon
+├── pronunciations/<project>.json
+├── bindings.json
+├── mutations.log
+└── daemon.{lock,pid,log}
+```
+
+`data/dubs/` is the only directory that grows and is not garbage-collected: a
+prepared-but-never-rendered dub is kept on purpose, so a translation session can span
+a restart. Delete `<DATA_DIR>/dubs/` to reclaim the space.
 
 ## Engine prerequisites
 
@@ -153,11 +186,13 @@ variable.
 
 | Prerequisite | Needed by | If missing |
 |---|---|---|
-| `ffmpeg` + `ffprobe` | every engine (reference canonicalisation, format conversion) | `FAIL` row — the daemon cannot produce non-WAV audio |
+| `ffmpeg` + `ffprobe` | every engine (reference canonicalisation, format conversion, 16 kHz ASR extraction, dubbing mux) | `FAIL` row — the daemon cannot produce non-WAV audio or transcribe anything |
+| `sidechaincompress`, `alimiter` filters | dubbing with `keep_original_bed=true` | `dub filters` `WARN` row. The dub still renders, with a plain `amix` instead of a ducked mix |
 | `espeak-ng` | `kokoro` (English out-of-dictionary fallback, non-English G2P) | `WARN` row with the platform install command; common English still speaks |
 | `en_core_web_sm` (spaCy) | `kokoro` English G2P | pinned as a direct dependency in `engines/kokoro/pyproject.toml`, so `engines install kokoro` brings it |
-| CPU-only `torch` | `kokoro` | pinned to the `pytorch-cpu` index in the engine's `pyproject.toml`; a CUDA wheel there would defeat the zero-VRAM guarantee |
-| NVIDIA driver + GPU | `qwen3_tts`, `qwen3_tts_fast` | `WARN` row ("mock/CPU only"); `kokoro` and `mock` still work |
+| CPU-only `torch` | `kokoro`, `phonon` | pinned to the `pytorch-cpu` index in each engine's `pyproject.toml`; a CUDA wheel there would defeat the zero-VRAM guarantee |
+| NVIDIA driver + GPU | `qwen3_tts`, `qwen3_tts_fast` | `WARN` row ("mock/CPU only"); `kokoro`, `phonon` and the mock engines still work |
+| A `kind: asr` engine of any sort | `transcribe`, `dub_prepare`, `dub_render` | `asr` `WARN` row naming `agent-voice engines install <AGENT_VOICE_DEFAULT_ASR_ENGINE>`; `server_info().asr_engines` is empty |
 
 ## MCP stdio shim
 

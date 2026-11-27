@@ -38,6 +38,9 @@ from .schemas import (
     BeatSpec,
     DesignVoiceRequest,
     DesignVoiceResult,
+    DubPrepareRequest,
+    DubRenderRequest,
+    DubSegmentSpec,
     EngineEntry,
     ErrorCode,
     ErrorResponse,
@@ -47,9 +50,10 @@ from .schemas import (
     ScriptResult,
     SpeakRequest,
     SynthesisResult,
+    TranscribeRequest,
     VoiceListResponse,
 )
-from .security import is_loopback_client, resolve_ref_audio_path
+from .security import is_loopback_client, resolve_media_path, resolve_ref_audio_path
 from .services.script_service import render_script
 from .services.voice_design_service import render_design
 from .settings_types import SettingsLike
@@ -257,6 +261,38 @@ def _next_steps(
     return steps
 
 
+def _asr_surface(entries: list[EngineEntry]) -> list[dict[str, Any]]:
+    """The ``kind: asr`` engines and what each can do, from manifests only.
+
+    Same rule as the preset-speaker list: a capability is advertised only when
+    the engine that would answer the call declares it, so ``transcribe()`` never
+    gets a ``hotwords`` list or a ``word_timestamps`` flag it cannot honour.
+    """
+    return [
+        {
+            "engine_id": entry.engine_id,
+            "installed": entry.installed,
+            "languages": entry.languages,
+            "word_timestamps": entry.word_timestamps,
+            "hotwords": entry.hotwords,
+        }
+        for entry in entries
+        if entry.kind == "asr"
+    ]
+
+
+def _dubbing_available(entries: list[EngineEntry]) -> bool:
+    """True only when both halves of a dub can actually run.
+
+    Dubbing is ASR plus TTS in one job, so an installed speaker with no
+    transcriber (or vice versa) is a dead end worth reporting before the caller
+    spends a transcription to discover it.
+    """
+    return any(e.installed and e.kind == "asr" for e in entries) and any(
+        e.installed and e.kind == "tts" for e in entries
+    )
+
+
 def _guide_text() -> str:
     """Read the agent guide, falling back to a short summary when it is absent.
 
@@ -295,7 +331,9 @@ def build_mcp_server(ctx) -> FastMCP:
         "it is free (no GPU wake) and tells you the version, whether any voice "
         "exists, which voices are registered and which engines are installed. "
         "Then call speak() for one utterance, speak_script() for multi-beat "
-        "content with timings. Tools return file paths, never audio blobs. "
+        "content with timings. Use transcribe() for speech recognition and the "
+        "dub_prepare()/dub_render() pair to dub a video into another language. "
+        "Tools return file paths, never audio blobs. "
         "Use gpu_status() to see what is resident and unload_models() to free "
         "VRAM when another GPU application needs it."
     )
@@ -338,10 +376,10 @@ def build_mcp_server(ctx) -> FastMCP:
     async def server_info() -> dict[str, Any]:
         """Call this first: a free, GPU-free snapshot of what this machine can do.
 
-        Read: version, default_engine, default_voice, voices_count, voices[],
-        inbox_dir, preset_speakers[], voice_design_available, installed_engines[],
-        engines[], gpu_status and next_steps[], which says what to fix when the
-        server is not ready to speak.
+        Read: version, default_engine, default_asr_engine, default_voice,
+        voices_count, voices[], inbox_dir, preset_speakers[],
+        voice_design_available, installed_engines[], engines[], asr_engines[],
+        dubbing_available, gpu_status and next_steps[].
         """
         from . import __version__
 
@@ -358,6 +396,7 @@ def build_mcp_server(ctx) -> FastMCP:
         return {
             "version": __version__,
             "default_engine": settings.default_engine,
+            "default_asr_engine": settings.default_asr_engine,
             "default_voice": default_voice,
             "voices_count": len(voices),
             "voices": [
@@ -388,6 +427,8 @@ def build_mcp_server(ctx) -> FastMCP:
                 }
                 for e in entries
             ],
+            "asr_engines": _asr_surface(entries),
+            "dubbing_available": _dubbing_available(entries),
             "gpu_status": await ctx.workers.gpu_status(),
         }
 
@@ -1029,6 +1070,263 @@ def build_mcp_server(ctx) -> FastMCP:
         except AgentVoiceError as exc:
             _raise_tool_error(exc)
 
+    # -- transcription and dubbing ---------------------------------------
+    @tool(annotations=idempotent)
+    async def transcribe(
+        audio_path: str,
+        language: str | None = None,
+        engine: str | None = None,
+        model: str | None = None,
+        hotwords: list[str] | None = None,
+        word_timestamps: bool = False,
+        export_srt: bool = False,
+    ) -> dict[str, Any]:
+        """Transcribe an audio or video file to timed segments.
+
+        Returns text, language, duration_sec, segments_count and a bounded segment
+        preview; the full transcript is at transcript_json_path.
+        """
+        from .api.routing import resolve_asr_target
+        from .services.transcribe_service import transcribe_media
+
+        try:
+            try:
+                # The frozen request model is the one validator of a hotword
+                # list; building it here means MCP cannot hand the decoder a
+                # longer list than /v1/agent/transcribe would accept.
+                payload = TranscribeRequest(
+                    audio_path=audio_path,
+                    language=language,
+                    engine=engine,
+                    model=model,
+                    hotwords=hotwords,
+                    word_timestamps=word_timestamps,
+                    export_srt=export_srt,
+                )
+            except ValueError as exc:
+                raise AgentVoiceError(
+                    ErrorCode.BAD_REQUEST,
+                    f"invalid transcribe request: {exc}",
+                    f"At most {settings.max_hotwords} hotwords, each under 64 "
+                    "characters.",
+                ) from exc
+            # The same confinement clone_voice uses, with a media noun: a video
+            # that cannot be found must not be reported as a missing clip.
+            media = resolve_media_path(
+                payload.audio_path,
+                inbox_dir=settings.inbox_dir,
+                mcp_base_path=settings.mcp_base_path,
+                allow_any_path=settings.allow_any_path,
+                field="audio_path",
+            )
+            target = resolve_asr_target(
+                settings=settings,
+                registry=ctx.registry,
+                engine=payload.engine,
+                model=payload.model,
+            )
+            result = await transcribe_media(
+                ctx,
+                audio_path=media,
+                target=target,
+                language=payload.language,
+                word_timestamps=payload.word_timestamps,
+                hotwords=payload.hotwords,
+                project=payload.project,
+                export_srt=payload.export_srt,
+                agent_id=_agent_id(),
+            )
+            return result.model_dump(mode="json")
+        except AgentVoiceError as exc:
+            _raise_tool_error(exc)
+
+    @tool(annotations=idempotent)
+    async def dub_prepare(
+        media_path: str,
+        source_language: str | None = None,
+        asr_engine: str | None = None,
+        asr_model: str | None = None,
+        hotwords: list[str] | None = None,
+        extract_speaker_ref: bool = True,
+        project: str | None = None,
+    ) -> dict[str, Any]:
+        """Stage a video for dubbing: transcribe it and extract a speaker reference.
+
+        Returns dub_id and timed segments; translate them, then call dub_render.
+        """
+        from .services.dub_service import prepare_dub
+
+        try:
+            try:
+                payload = DubPrepareRequest(
+                    media_path=media_path,
+                    source_language=source_language,
+                    asr_engine=asr_engine,
+                    asr_model=asr_model,
+                    hotwords=hotwords,
+                    extract_speaker_ref=extract_speaker_ref,
+                    project=project,
+                )
+            except ValueError as exc:
+                # An over-cap hotword list or a bad project slug is a caller
+                # mistake; it must surface as the canonical JSON error body
+                # rather than an unstructured tool exception.
+                raise AgentVoiceError(
+                    ErrorCode.BAD_REQUEST,
+                    f"invalid dub prepare request: {exc}",
+                    f"At most {settings.max_hotwords} hotwords, each under 64 "
+                    "characters; project must be a lowercase slug.",
+                ) from exc
+            # Refuse a path escape before any ffmpeg probe or worker wake. The
+            # service confines the same path under the same policy; this only
+            # refuses it earlier, so the two cannot disagree.
+            resolve_media_path(
+                payload.media_path,
+                inbox_dir=settings.inbox_dir,
+                mcp_base_path=settings.mcp_base_path,
+                allow_any_path=settings.allow_any_path,
+                field="media_path",
+            )
+            return (await prepare_dub(ctx, payload)).model_dump(mode="json")
+        except AgentVoiceError as exc:
+            _raise_tool_error(exc)
+
+    @tool(annotations=idempotent)
+    async def dub_render(
+        dub_id: str,
+        segments: list[dict[str, Any]],
+        voice: str | None = None,
+        speaker: str | None = None,
+        auto_clone_source: bool = False,
+        engine: str | None = None,
+        model: str | None = None,
+        quality: QualityTier = "high",
+        keep_original_bed: bool = True,
+        bed_duck_db: float = -18.0,
+        max_atempo: float = 1.35,
+        export_srt: bool = True,
+        burn_subtitles: bool = False,
+        project: str | None = None,
+    ) -> dict[str, Any]:
+        """Synthesize translated lines onto the timeline and mux the dubbed MP4.
+
+        Read overflow_warnings: those lines still overran even at max_atempo.
+        """
+        from .services.dub_service import render_dub
+
+        try:
+            try:
+                payload = DubRenderRequest(
+                    dub_id=dub_id,
+                    segments=[DubSegmentSpec(**segment) for segment in segments],
+                    voice=voice,
+                    speaker=speaker,
+                    auto_clone_source=auto_clone_source,
+                    engine=engine,
+                    model=model,
+                    quality=quality,
+                    keep_original_bed=keep_original_bed,
+                    bed_duck_db=bed_duck_db,
+                    max_atempo=max_atempo,
+                    export_srt=export_srt,
+                    burn_subtitles=burn_subtitles,
+                    project=project,
+                )
+            except ValueError as exc:
+                raise AgentVoiceError(
+                    ErrorCode.BAD_REQUEST,
+                    f"invalid dub render request: {exc}",
+                    "Each segment needs index, start_sec, end_sec and text; "
+                    "bed_duck_db is -40..0 and max_atempo is 1.0..2.0.",
+                ) from exc
+            return (await render_dub(ctx, payload)).model_dump(mode="json")
+        except AgentVoiceError as exc:
+            _raise_tool_error(exc)
+
+    @tool(annotations=ToolAnnotations(idempotent_hint=True, destructive_hint=False))
+    async def start_dub_job(
+        dub_id: str,
+        segments: list[dict[str, Any]],
+        voice: str | None = None,
+        speaker: str | None = None,
+        auto_clone_source: bool = False,
+        engine: str | None = None,
+        model: str | None = None,
+        quality: QualityTier = "high",
+        keep_original_bed: bool = True,
+        bed_duck_db: float = -18.0,
+        max_atempo: float = 1.35,
+        export_srt: bool = True,
+        burn_subtitles: bool = False,
+        project: str | None = None,
+    ) -> dict[str, Any]:
+        """Start dub_render as a background job; poll it with get_job(job_id)."""
+        from .services.dub_service import render_dub
+
+        try:
+            try:
+                payload = DubRenderRequest(
+                    dub_id=dub_id,
+                    segments=[DubSegmentSpec(**segment) for segment in segments],
+                    voice=voice,
+                    speaker=speaker,
+                    auto_clone_source=auto_clone_source,
+                    engine=engine,
+                    model=model,
+                    quality=quality,
+                    keep_original_bed=keep_original_bed,
+                    bed_duck_db=bed_duck_db,
+                    max_atempo=max_atempo,
+                    export_srt=export_srt,
+                    burn_subtitles=burn_subtitles,
+                    project=project,
+                )
+            except ValueError as exc:
+                raise AgentVoiceError(
+                    ErrorCode.BAD_REQUEST,
+                    f"invalid dub render request: {exc}",
+                    "Each segment needs index, start_sec, end_sec and text; "
+                    "bed_duck_db is -40..0 and max_atempo is 1.0..2.0.",
+                ) from exc
+            job = ctx.jobs.create("dub")
+            # No agent id is captured here, unlike start_script_job: render_dub
+            # takes no caller identity (dubbing does not participate in voice
+            # bindings), so there is nothing request-scoped to carry over.
+            async def runner() -> None:
+                ctx.jobs.mark_running(job.job_id)
+                try:
+                    # Progress per translated line, not per job: a hundred-line
+                    # dub that jumps 0.01 -> 1.0 tells a polling agent nothing.
+                    result = await render_dub(
+                        ctx,
+                        payload,
+                        on_progress=lambda done, total, message: ctx.jobs.update(
+                            job.job_id,
+                            progress=(done / total if total else 1.0),
+                            message=message,
+                        ),
+                    )
+                    ctx.jobs.succeeded(job.job_id, result.model_dump(mode="json"))
+                except AgentVoiceError as exc:
+                    ctx.jobs.failed(job.job_id, exc.to_response())
+                except asyncio.CancelledError:
+                    ctx.jobs.update(job.job_id, status="cancelled")
+                    raise
+                except Exception as exc:
+                    ctx.jobs.failed(
+                        job.job_id,
+                        ErrorResponse(
+                            error_code=ErrorCode.INTERNAL_ERROR,
+                            message=str(exc),
+                            suggestion="Check the daemon logs for a traceback.",
+                        ),
+                    )
+
+            ctx.jobs.register_task(job.job_id, asyncio.create_task(runner()))
+            return {"job_id": job.job_id, "kind": "dub"}
+        except AgentVoiceError as exc:
+            _raise_tool_error(exc)
+
     # -- resources ------------------------------------------------------
     @mcp.resource("agent-voice://voices", name="voices", mime_type="application/json")
     async def voices_resource() -> str:
@@ -1064,6 +1362,31 @@ def build_mcp_server(ctx) -> FastMCP:
             "end_sec / duration_sec are the timings to cut visuals against, "
             "srt_path and vtt_path hold subtitles, and timing_json_path is the same "
             "data on disk. Report those paths; never inline audio.\n"
+        )
+
+    @mcp.prompt(name="dub_video")
+    def dub_video(media_path: str, target_language: str) -> str:
+        """Dub a video into another language, start to finish."""
+        return (
+            f"Dub {media_path} into {target_language}.\n"
+            "1. Call server_info() first. It is free and tells you "
+            "dubbing_available, default_asr_engine and asr_engines.\n"
+            f"2. Call dub_prepare(media_path='{media_path}') to transcribe the "
+            "source and extract a speaker reference. Read dub_id and segments[] "
+            "(index, start_sec, end_sec, text).\n"
+            f"3. Translate every segment into {target_language}, then TIGHTEN each "
+            "line until it fits end_sec - start_sec: drop filler words and prefer "
+            "shorter synonyms. Keep index, start_sec and end_sec exactly as "
+            "returned; those are the slots on the source timeline.\n"
+            "4. Call dub_render(dub_id=..., segments=[{index, start_sec, end_sec, "
+            "text}], auto_clone_source=True) so the dub keeps the original "
+            "speaker's timbre. For a long file use start_dub_job(...) instead and "
+            "poll get_job(job_id).\n"
+            "5. Read overflow_warnings[]. Those lines still overran their slot at "
+            "max_atempo. Shorten only those segments' text and render again with "
+            "the same dub_id; the unchanged lines come back cached.\n"
+            "6. Report file_path (the dubbed MP4), srt_path and vtt_path. Call "
+            "unload_models() when you are done. Never inline video or audio bytes.\n"
         )
 
     return mcp

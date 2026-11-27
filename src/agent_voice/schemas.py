@@ -83,6 +83,29 @@ QualityTier = Literal["high", "fast"]
 ModelMode = Literal["clone", "custom_voice", "voice_design"]
 """What a checkpoint can do: clone a reference, speak preset timbres, or design a voice."""
 
+EngineKind = Literal["tts", "asr"]
+"""Which family a plugin belongs to.
+
+``tts`` speaks (``synthesize``/``stream_pcm``), ``asr`` listens (``transcribe``).
+The default is ``tts`` on every manifest field, so an engine directory that never
+mentions the key keeps behaving exactly as it did before v0.5.
+"""
+
+EngineDevice = Literal["gpu", "cpu"]
+"""Where a worker's compute runs, for scheduling rather than routing.
+
+``gpu`` engines compete for the single GPU owner slot (``MAX_ACTIVE_ENGINES``);
+``cpu`` engines do not, so a CPU transcription can run while a GPU render is
+resident instead of evicting it.
+"""
+
+MAX_HOTWORDS = 25
+"""Ceiling on ``hotwords`` — the decoder's own vocabulary-bias bound.
+
+A contract constant, not an env knob: an unbounded word list is unbounded decoder
+work, the same reasoning that keeps the lexicon caps structural.
+"""
+
 
 class ErrorCode(StrEnum):
     """Single error taxonomy shared by IPC, REST and MCP."""
@@ -207,6 +230,12 @@ class EngineCapabilities(BaseModel):
     custom_voice: bool = False
     instruct_control: bool = False
     languages: list[str] = Field(default_factory=list)
+    word_timestamps: bool = False
+    """``transcribe`` returns per-word ``start_sec``/``end_sec`` when asked."""
+    hotwords: bool = False
+    """The engine accepts a ``hotwords`` list and biases its decoder toward it."""
+    multilingual: bool = False
+    """One checkpoint covers several languages rather than one fixed language."""
 
 
 class EngineManifest(BaseModel):
@@ -222,6 +251,10 @@ class EngineManifest(BaseModel):
     protocol_version: int = PROTOCOL_VERSION
     venv_python: str | None = None
     """Relative path to the engine venv interpreter. None => core sys.executable."""
+    kind: EngineKind = "tts"
+    """``tts`` speaks, ``asr`` transcribes. Default keeps v0.4 manifests valid."""
+    device: EngineDevice = "gpu"
+    """``cpu`` engines are exempt from the single-GPU-owner slot."""
     capabilities: EngineCapabilities = Field(default_factory=EngineCapabilities)
     models: list[ModelSpec] = Field(default_factory=list)
 
@@ -245,6 +278,8 @@ class ModelEntry(BaseModel):
     mode: ModelMode = "clone"
     supports_instruct: bool = False
     preset_speakers: list[str] = Field(default_factory=list)
+    kind: EngineKind = "tts"
+    """Inherited from the engine manifest so list_models() can be filtered."""
 
 
 class EngineEntry(BaseModel):
@@ -261,6 +296,12 @@ class EngineEntry(BaseModel):
     custom_voice: bool = False
     voice_design: bool = False
     instruct_control: bool = False
+    kind: EngineKind = "tts"
+    device: EngineDevice = "gpu"
+    word_timestamps: bool = False
+    hotwords: bool = False
+    multilingual: bool = False
+    languages: list[str] = Field(default_factory=list)
     models: list[ModelEntry] = Field(default_factory=list)
     why_unavailable: str | None = None
 
@@ -566,6 +607,214 @@ class ScriptResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Transcription (kind: asr)
+# ---------------------------------------------------------------------------
+
+
+class TranscribeWord(BaseModel):
+    word: str
+    start_sec: float
+    end_sec: float
+
+
+class TranscribeSegment(BaseModel):
+    """One timed span of speech, as ASR engines and dubbing both use it."""
+
+    index: int
+    start_sec: float
+    end_sec: float
+    text: str
+    words: list[TranscribeWord] = Field(default_factory=list)
+    """Only populated when the request asked for word timestamps."""
+
+
+def validate_hotwords(value: list[str] | None) -> list[str] | None:
+    """Cap and sanitise a hotword list before it reaches a decoder.
+
+    Whitespace-only entries are dropped rather than rejected: a caller splitting a
+    comma-separated prompt will produce them, and they carry no meaning.
+    """
+    if value is None:
+        return None
+    cleaned = [term.strip() for term in value if term and term.strip()]
+    if len(cleaned) > MAX_HOTWORDS:
+        raise ValueError(
+            f"at most {MAX_HOTWORDS} hotwords are accepted (got {len(cleaned)})"
+        )
+    for term in cleaned:
+        if len(term) > 64:
+            raise ValueError(f"hotword is longer than 64 characters: {term[:20]}...")
+    return cleaned
+
+
+class TranscribeRequest(BaseModel):
+    """A local-path transcription. Used by /v1/agent/transcribe and transcribe()."""
+
+    audio_path: str
+    engine: str | None = None
+    model: str | None = None
+    language: str | None = None
+    """None or "auto" lets the engine detect it. A fixed-language checkpoint
+    ignores this rather than guessing."""
+    hotwords: list[str] | None = None
+    word_timestamps: bool = False
+    export_srt: bool = False
+    project: str | None = None
+    """Named scoped-lexicon project whose terms are offered as hotwords."""
+
+    @field_validator("hotwords")
+    @classmethod
+    def _hotwords(cls, value: list[str] | None) -> list[str] | None:
+        return validate_hotwords(value)
+
+    @field_validator("project")
+    @classmethod
+    def _project(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_slug(value)
+        return value
+
+
+class TranscribeResult(BaseModel):
+    text: str
+    language: str = ""
+    """What the engine reported. Empty or "auto" when it cannot say."""
+    duration_sec: float
+    segments_count: int
+    segments: list[TranscribeSegment] = Field(default_factory=list)
+    """A bounded preview. The full list is in ``transcript_json_path``."""
+    engine_id: str
+    model_alias: str
+    backend_name: str = ""
+    backend_version: str = ""
+    elapsed_ms: int = 0
+    realtime_multiple: float | None = None
+    """audio_sec / wall_sec: 20.0 means 20x faster than real time."""
+    truncated: bool = False
+    """The backend flagged a decode window that ran out of token budget."""
+    segments_omitted: int = 0
+    """How many segments were dropped from the inline preview."""
+    transcript_json_path: str | None = None
+    srt_path: str | None = None
+    vtt_path: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Dubbing (two-stage: prepare here, translate in the agent, render here)
+# ---------------------------------------------------------------------------
+
+
+class DubSegmentSpec(BaseModel):
+    """One translated line, placed at the source segment's slot."""
+
+    index: int
+    start_sec: float
+    end_sec: float
+    text: str
+    voice: str | None = None
+    speaker: str | None = None
+    instruct: str = ""
+    engine: str | None = None
+    model: str | None = None
+    take: int | None = Field(default=None, ge=1)
+
+
+class DubPrepareRequest(BaseModel):
+    media_path: str
+    source_language: str | None = None
+    asr_engine: str | None = None
+    asr_model: str | None = None
+    hotwords: list[str] | None = None
+    extract_speaker_ref: bool = True
+    project: str | None = None
+
+    @field_validator("hotwords")
+    @classmethod
+    def _hotwords(cls, value: list[str] | None) -> list[str] | None:
+        return validate_hotwords(value)
+
+    @field_validator("project")
+    @classmethod
+    def _project(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_slug(value)
+        return value
+
+
+class DubPrepareResult(BaseModel):
+    dub_id: str
+    media_path: str
+    duration_sec: float
+    source_language: str = ""
+    speaker_ref_path: str | None = None
+    speaker_ref_text: str = ""
+    segments: list[TranscribeSegment] = Field(default_factory=list)
+    engine_id: str
+    model_alias: str
+    project_json_path: str
+
+
+class DubOverflow(BaseModel):
+    """A line whose audio still overran its slot at the maximum tempo."""
+
+    index: int
+    slot_sec: float
+    audio_sec: float
+    atempo: float
+
+
+class DubRenderRequest(BaseModel):
+    dub_id: str
+    segments: list[DubSegmentSpec]
+    voice: str | None = None
+    speaker: str | None = None
+    auto_clone_source: bool = False
+    """Clone the source speaker from speaker_ref.wav, reusing a voice already
+    saved under ``dub-<dub_id>`` instead of registering a duplicate."""
+    engine: str | None = None
+    model: str | None = None
+    quality: QualityTier = "high"
+    keep_original_bed: bool = True
+    bed_duck_db: float = Field(default=-18.0, ge=-40.0, le=0.0)
+    max_atempo: float = Field(default=1.35, ge=1.0, le=2.0)
+    """Hard ceiling on speed-up. A line that still overflows is reported, never
+    truncated."""
+    export_srt: bool = True
+    burn_subtitles: bool = False
+    project: str | None = None
+
+    @field_validator("project")
+    @classmethod
+    def _project(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_slug(value)
+        return value
+
+
+class DubRenderResult(BaseModel):
+    dub_id: str
+    file_path: str
+    duration_sec: float
+    video_stream_copied: bool
+    """True when the video was remuxed without re-encoding."""
+    bed_ducked: bool = False
+    """True when the original bed was mixed under the voice with a real
+    sidechain duck. False means no bed was available, the ffmpeg build lacks
+    ``sidechaincompress``/``alimiter``, or ``keep_original_bed`` was false."""
+    segments_count: int
+    cached_segments: int = 0
+    """How many lines came from the synthesis cache. Re-rendering after editing
+    one line should report all the others here."""
+    overflow_warnings: list[DubOverflow] = Field(default_factory=list)
+    srt_path: str | None = None
+    vtt_path: str | None = None
+    timing_json_path: str | None = None
+    engine_id: str = ""
+    model_alias: str = ""
+    elapsed_ms: int = 0
+
+
+# ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
 
@@ -574,7 +823,7 @@ JobStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 
 class Job(BaseModel):
     job_id: str
-    kind: Literal["script", "download_model", "install_engine"]
+    kind: Literal["script", "download_model", "install_engine", "dub"]
     status: JobStatus = "pending"
     progress: float = 0.0
     message: str = ""

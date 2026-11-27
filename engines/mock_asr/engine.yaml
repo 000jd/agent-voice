@@ -1,0 +1,31 @@
+engine_id: mock_asr
+display_name: Mock ASR (timed synthetic transcript, no dependencies)
+backend_name: mock-asr
+backend_version: "1"
+protocol_version: 1
+venv_python: null
+kind: asr
+device: cpu
+
+capabilities:
+  streaming: false
+  pcm_native: false
+  voice_clone: false
+  custom_voice: false
+  voice_design: false
+  instruct_control: false
+  # The synthetic transcript carries per-word start/end times, so the whole
+  # subtitle/timing surface is testable without a real decoder.
+  word_timestamps: true
+  # Hotwords are echoed into the transcript, which is what lets a test prove the
+  # bias list survived routing without a model to bias.
+  hotwords: true
+  multilingual: false
+  languages: [English]
+
+models:
+  - alias: mock-asr-parity
+    hf_repo: local/mock-asr-parity
+    quality_tier: fast
+    est_vram_gb: 0.0
+    default: true

@@ -1,0 +1,46 @@
+engine_id: phonon
+display_name: Phonon (Fermion Research, CPU)
+backend_name: fermion-research
+backend_version: "0.2.15"
+protocol_version: 1
+venv_python: .venv/bin/python
+kind: asr
+device: cpu
+
+# CPU-only by construction, exactly like Kokoro: the engine venv installs torch
+# from the explicit pytorch-cpu index, so no CUDA wheel (and no nvidia-* /
+# triton) can ever be present, and the worker empties CUDA_VISIBLE_DEVICES plus
+# sets FERMION_DEVICE=cpu before importing anything. Every model therefore
+# declares est_vram_gb: 0.0 — transcription runs on the CPU while a GPU TTS
+# engine keeps the GPU owner slot, which is what `device: cpu` in this manifest
+# tells the worker manager. Phonon 2.5 is one multilingual checkpoint that
+# auto-detects the spoken language (there is no per-request language switch on
+# 2.5); the -en alias is the English-only build and Phonon 2 is the smaller,
+# faster generation.
+
+capabilities:
+  streaming: false
+  pcm_native: false
+  voice_clone: false
+  custom_voice: false
+  voice_design: false
+  instruct_control: false
+  word_timestamps: true
+  hotwords: true
+  multilingual: true
+  languages: [en, es, fr, de, it, pt, nl, pl, ru, uk, ro, cs, sk, bg, hr, sv, da, fi, et, lv, lt, hu, sl, mt, el]
+
+models:
+  - alias: phonon-2.5
+    hf_repo: FermionResearch/Phonon-2.5
+    quality_tier: high
+    est_vram_gb: 0.0
+    default: true
+  - alias: phonon-2.5-en
+    hf_repo: FermionResearch/Phonon-2.5-English
+    quality_tier: high
+    est_vram_gb: 0.0
+  - alias: phonon-2
+    hf_repo: FermionResearch/Phonon-2
+    quality_tier: fast
+    est_vram_gb: 0.0

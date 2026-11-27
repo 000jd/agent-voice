@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-voice"
-version = "0.4.0"
+version = "0.5.0"
 description = "Headless, UI-free, multi-engine voice cloning and speech synthesis server for AI agents"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -23,6 +23,9 @@ keywords = [
     "qwen3-tts",
     "kokoro",
     "cpu-tts",
+    "asr",
+    "speech-to-text",
+    "phonon",
     "cuda",
 ]
 classifiers = [

@@ -95,6 +95,7 @@ def _auto_voice(
     *,
     record: EngineRecord,
     voices: VoiceStore,
+    settings: SettingsLike,
 ) -> tuple[str | None, str, bool]:
     """Pick a voice when the caller, binding and server default all left it unset.
 
@@ -123,8 +124,10 @@ def _auto_voice(
     raise AgentVoiceError(
         ErrorCode.VOICE_REQUIRED,
         f"no voice selected and engine '{record.engine_id}' can only clone",
-        "No voices registered. Call clone_voice(name='narrator', "
-        "ref_audio_path='<3-10s wav/mp4>', ref_text='...') first.",
+        f"No voices registered. Call clone_voice(name='narrator', "
+        f"ref_audio_path='{settings.inbox_dir}/clip.wav', ref_text='...') first — "
+        "the clip must be inside the inbox unless MCP_BASE_PATH or "
+        "AGENT_VOICE_ALLOW_ANY_PATH is set.",
     )
 
 
@@ -328,6 +331,14 @@ def resolve_target(
     record = registry.require_installed(
         engine_id, allow_agent_mutation=settings.allow_agent_engine_mutation
     )
+    if record.manifest.kind != "tts":
+        speaking = ", ".join(e.engine_id for e in registry.list_entries(kind="tts"))
+        raise AgentVoiceError(
+            ErrorCode.BAD_REQUEST,
+            f"engine '{engine_id}' is an asr engine and cannot speak",
+            "Use transcribe(audio_path=...) for speech recognition, or pick a tts "
+            f"engine. Speaking engines: {speaking or '(none installed)'}.",
+        )
     known_aliases = {spec.alias for spec in record.manifest.models}
 
     if alias is not None and alias not in known_aliases:
@@ -450,7 +461,9 @@ def resolve_target(
                 )
 
         if resolved_voice_id is None:
-            resolved_voice_id, ref_text, x_vector_only = _auto_voice(record=record, voices=voices)
+            resolved_voice_id, ref_text, x_vector_only = _auto_voice(
+                record=record, voices=voices, settings=settings
+            )
 
     return ResolvedTarget(
         voice_id=resolved_voice_id,
@@ -462,6 +475,81 @@ def resolve_target(
         speaker=resolved_speaker,
         instruct=resolved_instruct,
     )
+
+
+@dataclass(frozen=True)
+class AsrTarget:
+    """Where a transcription runs: one asr engine and one of its aliases."""
+
+    engine_id: str
+    model_alias: str
+
+
+def resolve_asr_target(
+    *,
+    settings: SettingsLike,
+    registry: EngineRegistry,
+    engine: str | None = None,
+    model: str | None = None,
+    quality: QualityTier = "high",
+) -> AsrTarget:
+    """Pick the ASR engine/model for a request.
+
+    Precedence is the TTS one — an explicit model selector, then an explicit
+    engine, then the server default — but kept in a separate function on purpose.
+    :func:`resolve_target` is voice-centric: running a transcription through it
+    would make a clip with no registered voice fail with ``VOICE_REQUIRED``, which
+    is exactly the wrong answer for "what did this person say".
+    """
+    engine_from_model, alias_from_model = parse_model_selector(model)
+
+    engine_id = engine or engine_from_model
+    if engine_id is None and alias_from_model is not None:
+        # A bare alias is a legitimate way to name a model; find its engine rather
+        # than falling back to the default and reporting a confusing mismatch.
+        engine_id = registry.resolve_engine_for_model(alias_from_model)
+        if engine_id is None:
+            raise AgentVoiceError(
+                ErrorCode.MODEL_NOT_FOUND,
+                f"no engine declares a model '{alias_from_model}'",
+                f"Known ASR aliases: "
+                f"{[m.alias for m in registry.list_models(kind='asr')] or '(none)'}.",
+            )
+    if engine_id is None:
+        engine_id = settings.default_asr_engine
+
+    record = registry.require_installed(
+        engine_id, allow_agent_mutation=settings.allow_agent_engine_mutation
+    )
+    if record.manifest.kind != "asr":
+        available = registry.asr_engine_ids()
+        raise AgentVoiceError(
+            ErrorCode.BAD_REQUEST,
+            f"engine '{engine_id}' is a {record.manifest.kind} engine and cannot transcribe",
+            f"Pick a kind: asr engine: {', '.join(available) or '(none installed)'}, "
+            "or set AGENT_VOICE_DEFAULT_ASR_ENGINE.",
+        )
+
+    if alias_from_model is not None:
+        known = {spec.alias for spec in record.manifest.models}
+        if alias_from_model not in known:
+            other = registry.resolve_engine_for_model(alias_from_model)
+            if other and other != engine_id:
+                raise AgentVoiceError(
+                    ErrorCode.MODEL_NOT_FOUND,
+                    f"model '{alias_from_model}' belongs to engine '{other}', not '{engine_id}'",
+                    f"Use model='{other}:{alias_from_model}' or engine='{other}'.",
+                )
+            raise AgentVoiceError(
+                ErrorCode.MODEL_NOT_FOUND,
+                f"engine '{engine_id}' has no model '{alias_from_model}'",
+                f"Known aliases: {sorted(known)}",
+            )
+        alias = alias_from_model
+    else:
+        alias = registry.default_asr_model_alias(engine_id, quality=quality)
+
+    return AsrTarget(engine_id=engine_id, model_alias=alias)
 
 
 def describe_error(exc: AgentVoiceError) -> dict[str, Any]:

@@ -24,6 +24,8 @@ backend_name: kokoro              # PyPI distribution name, used in the cache ke
 backend_version: "0.9.4"          # the pinned version; must match what is installed
 protocol_version: 1
 venv_python: .venv/bin/python     # relative to this dir; null => core interpreter
+kind: tts                         # tts speaks (synthesize), asr listens (transcribe); default tts
+device: gpu                       # gpu competes for the single GPU slot; cpu never does; default gpu
 
 capabilities:
   streaming: false                # true only if PCM arrives *during* decode
@@ -52,6 +54,17 @@ Two fields are load-bearing:
   here rather than discovered from `hello`. If they lie, stale audio gets reused.
 - **`venv_python: null`** means "run me in the core daemon's interpreter". Only
   valid for engines with zero extra dependencies (see `engines/mock`).
+
+Two more decide *scheduling*, not routing:
+
+- **`kind`** — `tts` (default) or `asr`. It picks the IPC method the daemon calls
+  (`synthesize`/`stream_pcm` versus `transcribe`) and the conformance table
+  `engines test` walks. Defaulting to `tts` is what keeps every v0.4 manifest valid.
+- **`device`** — `gpu` (default) or `cpu`. A `cpu` engine is **exempt from the
+  single-GPU-owner slot**: a transcription no longer evicts a resident TTS model,
+  and a CPU worker is never killed by the VRAM-pressure reaper. Declare it honestly;
+  a `cpu` engine that then grabs a CUDA context wastes the promise, and a `gpu`
+  engine that does not would hold the slot for nothing.
 
 ### `mode`: what each checkpoint can do
 
@@ -136,17 +149,22 @@ while not shutdown:
 
 | method | request | response |
 |---|---|---|
-| `hello` | `{id}` | `{protocol_version, engine_id, backend_name, backend_version, capabilities, loaded_models, gpu_vram_mb, pid}` |
+| `hello` | `{id}` | `{protocol_version, engine_id, backend_name, backend_version, capabilities, loaded_models, gpu_vram_mb, pid}` (`+ kind: "asr"` on an ASR worker) |
 | `load_model` | `{model_alias}` | `{model_alias, loaded_models}` |
 | `unload_model` | `{model_alias}` | `{model_alias, loaded_models}` |
 | `synthesize` | `{model_alias, text, ref_wav_path, ref_text, x_vector_only_mode, prompt_cache_path, wav_path, language, seed, speed, mode?, speaker?, instruct?}` | `{wav_path, sample_rate, duration_sec, model_alias, backend_name, backend_version}` |
 | `stream_pcm` | same + `stream_id` | `PCM_CHUNK*`, then `{stream_id, done: true, duration_sec, streaming_mode}` |
+| `transcribe` | `{model_alias, audio_path, language, word_timestamps, hotwords}` | `{model_alias, backend_name, backend_version, language, duration_sec, text, truncated, segments: [{index, start_sec, end_sec, text, words?}]}` |
 | `cancel` | `{target_request_id}` | `{target_request_id, cancelled}` |
 | `health` | `{id}` | `{ok, loaded_models, gpu_vram_mb, in_flight}` |
 | `shutdown` | `{id}` | `{ok}` |
 
 Errors are JSON replies: `{id, error_code, message, suggestion}`. Use
 `CUDA_OOM` **only** when you actually caught an OOM — the parent trusts you.
+
+Both families answer every method: a TTS worker replies `BAD_REQUEST unknown
+method` to `transcribe`, and an ASR worker answers `synthesize`/`stream_pcm` the
+same way. That is what keeps one dispatch table honest without a version bump.
 
 ### The optional `mode` / `speaker` / `instruct` fields
 
@@ -330,10 +348,215 @@ anti-thrash scheduler keeps them sequential.
 
 ---
 
-## 6. Checklist
+## 6. Adding an ASR engine
+
+An ASR engine is the same plugin shape with `kind: asr`. It listens instead of
+speaking: the daemon calls `transcribe`, never `synthesize`/`stream_pcm`, and
+`engines test` walks a different fourth step.
+
+```yaml
+kind: asr
+device: cpu
+```
+
+- **`kind: asr`** routes the whole family: `resolve_asr_target` picks it,
+  `engines test` uses the `transcribe` table, and a `synthesize` request aimed at
+  it is refused with a suggestion naming the TTS engines rather than a crash.
+- **`device: cpu`** is what makes the zero-VRAM claim structural. A `cpu` engine
+  **never takes the GPU owner slot**: `_begin_job` skips `_acquire_gpu` for it, so
+  a transcription runs while a TTS model is resident instead of evicting it, and
+  the VRAM-pressure reaper leaves it alone. `phonon` and `kokoro` both declare
+  `cpu`; `qwen3_tts*` and `mock` are the `gpu`/default cases.
+
+Declare both honestly and nothing in the core daemon needs editing. Two ASR
+engines ship today: `engines/phonon/` (real, `device: cpu`) and
+`engines/mock_asr/` (dependency-free, the reference for the shape).
+
+### The `transcribe` request and response
+
+Copied from `src/agent_voice/ipc/protocol.py`, which is the frozen contract:
+
+```text
+transcribe   req  {"id": str, "method": "transcribe", "model_alias": str,
+                   "audio_path": str, "language": str|None,
+                   "word_timestamps": bool, "hotwords": [str]}
+             resp {"id": str, "model_alias": str, "backend_name": str,
+                   "backend_version": str, "language": str,
+                   "duration_sec": float, "text": str, "truncated": bool,
+                   "segments": [{"index": int, "start_sec": float,
+                                 "end_sec": float, "text": str,
+                                 "words": [{"word": str, "start_sec": float,
+                                            "end_sec": float}]}]}
+```
+
+- `audio_path` is a **16 kHz mono WAV** the parent already extracted with ffmpeg.
+  Do not assume the original container, and do not shell out to decode it: the
+  expensive conversion has already happened, once, outside the worker.
+- **`word_timestamps`** — populate each segment's `words` **only** when it is
+  true. A caller that did not ask still gets valid audio-level timing from
+  `start_sec`/`end_sec`; making it pay for per-word decode is wasted work.
+- **`hotwords`** — a decoder *bias* list, capped at **25** entries
+  (`MAX_HOTWORDS`) with each term at most 64 characters, validated by the parent
+  before the request is sent. Bias only: a term that is not in the audio must not
+  appear in the transcript, or the feature is fabrication rather than recognition.
+- `language` — `null` means "detect it". A fixed-language checkpoint should
+  ignore the hint (and say what it is) rather than attempt a language it cannot
+  accept. Report the language you actually used, or `"auto"` when the backend
+  gives you nothing; never invent one.
+- `segments` **may be `[]`** for silence-only audio, and `truncated: true` means
+  the decode window ran out of token budget — say so rather than silently
+  returning half a transcript.
+
+### Segment grouping: the three rules
+
+The parent relies on one specific shape, so state it and follow it. A segment
+closes at whichever comes **first**:
+
+1. **Sentence punctuation** — `.`, `!`, `?` (and the equivalent closing quote or
+   bracket after it).
+2. **A pause `>= 0.8 s`** between consecutive words (`next.start - prev.end`).
+3. **A 7 s cap** — a long unpunctuated run is still split, so no single segment
+   becomes unreadable in a subtitle track or unusable as a dubbing slot.
+
+`engines/phonon/worker.py::group_words_into_segments` is the reference
+implementation of exactly these three rules; copy its logic (or import the idea)
+rather than inventing a fourth rule. If the backend hands you its own `segments`,
+you may use them — but they must honour the same three properties, because
+subtitles and dubbing both assume a segment is a natural, bounded span.
+
+### Worked example: `engines/faster_whisper/`
+
+A real CPU ASR engine needs three files and **zero edits** to the core daemon —
+no registry change, no manager change, no route change.
+
+```text
+engines/faster_whisper/
+├── engine.yaml
+├── pyproject.toml
+└── worker.py
+```
+
+`engine.yaml`:
+
+```yaml
+engine_id: faster_whisper
+display_name: Faster-Whisper (CTranslate2, CPU)
+backend_name: faster-whisper
+backend_version: "1.0.3"
+protocol_version: 1
+venv_python: .venv/bin/python
+kind: asr
+device: cpu
+capabilities:
+  {streaming: false, pcm_native: false, voice_clone: false,
+   word_timestamps: true, hotwords: true, multilingual: true,
+   languages: [en, es, fr, de, it, pt, nl, ru, zh, ja]}
+models:
+  - {alias: whisper-small,  hf_repo: Systran/faster-whisper-small,
+     quality_tier: fast, est_vram_gb: 0.0}
+  - {alias: whisper-medium, hf_repo: Systran/faster-whisper-medium,
+     quality_tier: high, est_vram_gb: 0.0, default: true}
+```
+
+Two aliases, one per quality tier: the router picks `high` unless a caller asks
+for `quality="fast"`, and exactly one carries `default: true`.
+
+`pyproject.toml` — the CPU-torch index pattern, so the engine can never see a
+GPU device even on a GPU box:
+
+```toml
+[project]
+name = "agent-voice-engine-faster-whisper"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "faster-whisper==1.0.3",
+  "torch==2.15.0",          # ctranslate2 needs the runtime; pin it directly
+  "numpy>=1.26",
+  "soundfile>=0.12",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.uv]
+package = false
+```
+
+`torch` is a **direct** dependency with an explicit CPU index on purpose: as a
+transitive dependency it resolves the CUDA wheel, drags in every `nvidia-*`
+package and Triton, and the "0 MB VRAM" promise becomes a hope. See
+[`docs/phase0-asr-report.md`](../docs/phase0-asr-report.md) for the measured
+version of this on Phonon.
+
+`worker.py`, the load and transcribe handlers (the rest is the reader thread,
+parent-death guards and dispatch table from `engines/mock/worker.py`):
+
+```python
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""      # before any CUDA-capable import
+
+_models: dict[str, object] = {}
+
+def handle_load(msg):
+    from faster_whisper import WhisperModel       # heavy import inside the handler
+    alias = msg["model_alias"]
+    if alias not in _models:
+        _models[alias] = WhisperModel(alias, device="cpu", compute_type="int8")
+    reply({"id": msg["id"], "model_alias": alias, "loaded_models": sorted(_models)})
+
+def handle_transcribe(msg):
+    model = _models[msg["model_alias"]]
+    segments, info = model.transcribe(
+        msg["audio_path"],
+        language=msg.get("language") or None,
+        word_timestamps=bool(msg.get("word_timestamps")),
+        hotwords=msg.get("hotwords") or None,
+        vad_filter=True,
+    )
+    out = [
+        {"index": i, "start_sec": seg.start, "end_sec": seg.end, "text": seg.text.strip(),
+         "words": [{"word": w.word, "start_sec": w.start, "end_sec": w.end}
+                   for w in (seg.words or [])]}          # only when asked for
+        for i, seg in enumerate(segments)
+    ]
+    reply({"id": msg["id"], "model_alias": msg["model_alias"], "backend_name": "faster-whisper",
+           "backend_version": "1.0.3", "language": info.language or "auto",
+           "duration_sec": info.duration, "text": " ".join(s["text"] for s in out),
+           "truncated": False, "segments": out})
+```
+
+**Zero core daemon edits.** Discovery, install, routing, the REST/MCP surfaces,
+dubbing, the idle reaper and `engines test` all work from the manifest alone.
+
+### ASR checklist rows
+
+In addition to the general checklist in §7:
+
+- [ ] `kind: asr` in `engine.yaml`, and `device` declared honestly (`cpu` for a
+      CPU engine, so it is exempt from the GPU slot)
+- [ ] `hello` reports `"kind": "asr"` and accurate `capabilities`
+      (`word_timestamps`, `hotwords`, `multilingual`, `languages`)
+- [ ] Word timings are returned **only** when `word_timestamps` is true
+- [ ] `hotwords` is a bias list, capped at 25, and never fabricates words
+- [ ] Segments group on sentence punctuation, a `>= 0.8 s` pause and a 7 s cap
+- [ ] `language` reports what was used, or `"auto"` — never a guess
+- [ ] `cancel` is honoured mid-decode, and `{cancelled: false}` when it lost the race
+- [ ] `agent-voice engines test <id>` reaches 7/7 on the `transcribe` table
+
+---
+
+## 7. Checklist
 
 - [ ] Directory name equals `engine_id`, both are slugs
 - [ ] `backend_version` matches the pinned distribution exactly
+- [ ] `kind` and `device` are declared (`kind: asr` for a transcription engine,
+      `device: cpu` for one that claims no VRAM)
 - [ ] `worker.py` reads a dedicated thread; `synthesize` runs off it
 - [ ] Parent-death guards present (`PR_SET_PDEATHSIG` + ppid poll)
 - [ ] Cancel is honoured mid-generation, not only between requests

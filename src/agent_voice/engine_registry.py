@@ -29,6 +29,7 @@ from filelock import FileLock
 from .schemas import (
     AgentVoiceError,
     EngineEntry,
+    EngineKind,
     EngineManifest,
     ErrorCode,
     ModelEntry,
@@ -50,6 +51,8 @@ _ALLOWED_MANIFEST_KEYS = {
     "backend_version",
     "protocol_version",
     "venv_python",
+    "kind",
+    "device",
     "capabilities",
     "models",
 }
@@ -152,6 +155,68 @@ def hf_model_downloaded(hf_repo: str) -> bool:
             except OSError:
                 continue
     return False
+
+
+def _fermion_cache_roots() -> list[Path]:
+    """Directories where a Fermion/Phonon model may have been unpacked.
+
+    ``FERMION_CACHE_DIR`` replaces the default ``~/.cache/fermion`` entirely, so
+    both are checked: an operator who redirected the cache must not be told their
+    downloaded model is missing.
+    """
+    roots: list[Path] = []
+    override = os.environ.get("FERMION_CACHE_DIR", "").strip()
+    if override:
+        roots.append(Path(override).expanduser())
+    roots.append(Path.home() / ".cache" / "fermion")
+    return roots
+
+
+def fermion_model_downloaded(hf_repo: str) -> bool:
+    """True when Fermion unpacked ``hf_repo`` into its own cache.
+
+    Phonon does not use plain ``.safetensors`` weights in the HF cache: it
+    downloads a packed archive and unpacks it to
+    ``<cache>/speech/<Org__Repo>/<dir>/``. Checking that directory *and* the HF
+    cache's packed forms (``.fsq`` / ``*.tar.zst``) covers a machine that is
+    mid-install as well as one that finished, without inventing a "downloaded"
+    verdict from a bare ``refs/main`` pointer.
+    """
+    org, _, name = hf_repo.partition("/")
+    if not org or not name:
+        return False
+    directory = f"{org}__{name}"
+
+    for root in _fermion_cache_roots():
+        speech = root / "speech" / directory
+        if speech.is_dir() and any(speech.iterdir()):
+            return True
+
+    hf_root = _hf_cache_path(hf_repo)
+    snapshots = hf_root / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    for revision in snapshots.iterdir():
+        if not revision.is_dir():
+            continue
+        for entry in revision.iterdir():
+            if entry.suffix in {".fsq", ".zst"} and entry.is_file():
+                return True
+    return False
+
+
+def weights_downloaded(spec: ModelSpec, manifest: EngineManifest) -> bool:
+    """Whether this model's weights are already on disk, by backend family.
+
+    Kept as one function so a new plugin does not have to teach the registry its
+    own cache layout: a ``local/`` repo is always available, Fermion-backed ASR
+    uses its own unpacked cache, and everything else is the HF hub cache.
+    """
+    if spec.hf_repo.startswith("local/"):
+        return True
+    if manifest.backend_name.startswith("fermion"):
+        return fermion_model_downloaded(spec.hf_repo)
+    return hf_model_downloaded(spec.hf_repo)
 
 
 def _dist_version(interpreter: Path, distribution: str) -> str | None:
@@ -283,11 +348,12 @@ class EngineRegistry:
                 quality_tier=spec.quality_tier,
                 est_vram_gb=spec.est_vram_gb,
                 is_default=spec.default,
-                downloaded_locally=hf_model_downloaded(spec.hf_repo),
+                downloaded_locally=weights_downloaded(spec, manifest),
                 loaded=False,
                 mode=spec.mode,
                 supports_instruct=spec.supports_instruct,
                 preset_speakers=list(spec.preset_speakers),
+                kind=manifest.kind,
             )
             for spec in manifest.models
         ]
@@ -329,11 +395,18 @@ class EngineRegistry:
             )
         return record
 
-    def list_entries(self, *, loaded: dict[str, list[str]] | None = None) -> list[EngineEntry]:
+    def list_entries(
+        self,
+        *,
+        loaded: dict[str, list[str]] | None = None,
+        kind: EngineKind | None = None,
+    ) -> list[EngineEntry]:
         loaded = loaded or {}
         entries: list[EngineEntry] = []
         for engine_id in self.ids():
             record = self._records[engine_id]
+            if kind is not None and record.manifest.kind != kind:
+                continue
             loaded_models = set(loaded.get(engine_id, []))
             entries.append(
                 EngineEntry(
@@ -352,6 +425,12 @@ class EngineRegistry:
                     custom_voice=bool(record.manifest.capabilities.custom_voice),
                     voice_design=bool(record.manifest.capabilities.voice_design),
                     instruct_control=bool(record.manifest.capabilities.instruct_control),
+                    kind=record.manifest.kind,
+                    device=record.manifest.device,
+                    word_timestamps=bool(record.manifest.capabilities.word_timestamps),
+                    hotwords=bool(record.manifest.capabilities.hotwords),
+                    multilingual=bool(record.manifest.capabilities.multilingual),
+                    languages=list(record.manifest.capabilities.languages),
                     models=[
                         model.model_copy(update={"loaded": model.alias in loaded_models})
                         for model in record.models
@@ -361,13 +440,26 @@ class EngineRegistry:
             )
         return entries
 
-    def list_models(self, engine_id: str | None = None) -> list[ModelEntry]:
+    def list_models(
+        self, engine_id: str | None = None, *, kind: EngineKind | None = None
+    ) -> list[ModelEntry]:
         models: list[ModelEntry] = []
         for current in self.ids():
             if engine_id is not None and current != engine_id:
                 continue
-            models.extend(self._records[current].models)
+            record = self._records[current]
+            if kind is not None and record.manifest.kind != kind:
+                continue
+            models.extend(record.models)
         return models
+
+    def asr_engine_ids(self) -> list[str]:
+        """Every discovered ``kind: asr`` engine, installed or not."""
+        return [
+            engine_id
+            for engine_id in self.ids()
+            if self._records[engine_id].manifest.kind == "asr"
+        ]
 
     def default_model_alias(
         self, engine_id: str, quality: str = "high", mode: ModelMode | None = None
@@ -395,6 +487,35 @@ class EngineRegistry:
             if model.default:
                 return model.alias
         return candidates[0].alias
+
+    def default_asr_model_alias(self, engine_id: str, quality: str = "high") -> str:
+        """Pick the ASR alias for an engine, preferring the requested tier.
+
+        ASR has no ``mode`` to filter on, so this is :meth:`default_model_alias`
+        with a ``kind`` guard: asking a TTS engine for a transcription alias is a
+        caller mistake that should say so, not return a voice model.
+        """
+        record = self.get(engine_id)
+        if record.manifest.kind != "asr":
+            raise AgentVoiceError(
+                ErrorCode.MODEL_NOT_FOUND,
+                f"engine '{engine_id}' is a {record.manifest.kind} engine, not asr",
+                f"ASR engines: {', '.join(self.asr_engine_ids()) or '(none installed)'}.",
+            )
+        models = record.manifest.models
+        if not models:
+            raise AgentVoiceError(
+                ErrorCode.MODEL_NOT_FOUND,
+                f"engine '{engine_id}' declares no transcription model",
+                "Fix engine.yaml or register a model with register_model().",
+            )
+        for model in models:
+            if model.quality_tier == quality:
+                return model.alias
+        for model in models:
+            if model.default:
+                return model.alias
+        return models[0].alias
 
     def model_spec(self, engine_id: str, alias: str) -> ModelSpec:
         record = self.get(engine_id)

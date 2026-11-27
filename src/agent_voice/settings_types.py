@@ -16,6 +16,7 @@ class SettingsLike(Protocol):
     port: int
     api_key: str
     default_engine: str
+    default_asr_engine: str
     default_voice_id: str
     model_idle_ttl_seconds: float
     max_active_engines: int
@@ -33,6 +34,8 @@ class SettingsLike(Protocol):
     max_design_sample_chars: int
     max_ref_text_chars: int
     normalize_lufs: float
+    max_transcribe_seconds: float
+    max_dub_segments: int
     stream_queue_maxsize: int
     stream_queue_timeout_seconds: float
     allow_agent_engine_mutation: bool
@@ -57,6 +60,9 @@ class SettingsLike(Protocol):
     def jobs_dir(self) -> Path: ...
 
     @property
+    def dubs_dir(self) -> Path: ...
+
+    @property
     def artifacts_dir(self) -> Path: ...
 
     @property
@@ -73,6 +79,9 @@ class SettingsLike(Protocol):
 
     @property
     def max_merged_lexicon_entries(self) -> int: ...
+
+    @property
+    def max_hotwords(self) -> int: ...
 
     @property
     def daemon_lock_path(self) -> Path: ...

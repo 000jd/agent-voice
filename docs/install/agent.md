@@ -210,17 +210,25 @@ client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed-unless-
 client.audio.speech.create(model="tts-1", voice="nova", input="Hello.").write_to_file("out.wav")
 ```
 
-## CPU-only install (Kokoro)
+## CPU-only install (Kokoro + Phonon)
 
-An agent host without a GPU can still speak: Kokoro-82M runs on the CPU with
-**0 MB of VRAM** and native 24 kHz output.
+An agent host without a GPU can still **speak and listen**: Kokoro-82M produces
+speech and Phonon-2.5 transcribes, both on the CPU with **0 MB of VRAM**.
 
 ```bash
+# speak
 uv run agent-voice engines install kokoro
 uv run agent-voice models download kokoro kokoro-82m   # 363 MB, once
-uv run agent-voice doctor                              # espeak-ng row + weights
 uv run agent-voice engines test kokoro                 # 7/7 IPC v1 conformance
-AGENT_VOICE_DEFAULT_ENGINE=kokoro uv run agent-voice serve
+
+# listen
+uv run agent-voice engines install phonon
+uv run agent-voice models download phonon phonon-2.5   # 156 MB, once
+uv run agent-voice engines test phonon                 # 7/7 on the ASR table
+
+uv run agent-voice doctor                              # espeak-ng + asr rows + weights
+AGENT_VOICE_DEFAULT_ENGINE=kokoro AGENT_VOICE_DEFAULT_ASR_ENGINE=phonon \
+  uv run agent-voice serve
 ```
 
 As soon as the Kokoro engine ships in `engines/`, `doctor` grows an `espeak-ng`
@@ -228,6 +236,11 @@ row: `PASS` when the binary is on `PATH`, `WARN` with the platform install comma
 when it is not — common English still speaks, so it never fails the run. Install it
 with `sudo apt install espeak-ng` (Debian/Ubuntu) or `brew install espeak-ng`
 (macOS).
+
+It also gains an `asr` row — the configured ASR engine plus its model aliases, or a
+`WARN` naming `agent-voice engines install phonon` — and a `dub filters` row for
+`sidechaincompress`/`alimiter`. All of them are WARNs: a TTS-only host and an ffmpeg
+with a plain mixer are both supported setups.
 
 The eight preset voices — `af_heart`, `af_bella`, `af_sarah`, `am_adam`,
 `am_michael`, `bf_emma`, `bm_george`, `bm_lewis` — need no reference clip, so
@@ -240,6 +253,25 @@ speak("Nightly build finished.", speaker="af_heart")
 An OpenAI-shaped client keeps working unchanged: its six builtin names map to
 Kokoro presets (`alloy` → `af_heart`, `nova` → `af_bella`, …), and every response
 carries `x-agent-voice-speaker`.
+
+### `inbox_dir` covers transcription input too
+
+`server_info().inbox_dir` is not only where a reference clip has to live. It is the
+confinement root for **every** path an agent supplies:
+
+- `clone_voice(ref_audio_path=…)` — a 3–10 s reference clip;
+- `transcribe(audio_path=…)` — any audio or video file to read;
+- `dub_prepare(media_path=…)` — the video to re-voice.
+
+So an operator who wants an agent to summarise a folder of recordings needs to put
+those recordings (or a staging copy) under `<DATA_DIR>/inbox/`, or set
+`MCP_BASE_PATH` to the shared directory. `AGENT_VOICE_ALLOW_ANY_PATH=true` is the
+broad escape hatch and should be reserved for a trusted local agent. Without one of
+those, the agent gets `403 PATH_OUTSIDE_BASE` before any ffmpeg work — nothing is
+read, and the fix is to move the file, not to retry.
+
+The CLI `agent-voice transcribe <path>` deliberately uses the same resolver, so a
+command that works at a prompt also works for an agent.
 
 ## Autostart
 

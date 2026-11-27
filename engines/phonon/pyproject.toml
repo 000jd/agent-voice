@@ -1,0 +1,50 @@
+[project]
+name = "agent-voice-engine-phonon"
+version = "0.1.0"
+description = "Phonon (Fermion Research) CPU-only ASR backend for agent-voice"
+requires-python = ">=3.12,<3.13"
+
+# CPU-only, deliberately — identical reasoning to engines/kokoro/pyproject.toml.
+#
+# torch must be a DIRECT dependency with an explicit CPU index. Listing it only
+# as fermion-research's transitive dependency makes uv resolve the CUDA wheel
+# from PyPI, which drags in every nvidia-* package plus triton (~3 GB) for a
+# model that never touches the GPU. With the pin below `uv sync` installs
+# torch==2.15.0+cpu and nothing else from the accelerator stack.
+#
+# soundfile is a direct dependency for the same reason it is in Kokoro: the
+# worker reads the incoming 16 kHz mono WAV's duration through it, and a hard
+# dependency here means the fallback path in `_duration_sec` is the exception
+# rather than the rule. huggingface-hub is pinned directly so a model unpack can
+# be rehearsed without pulling the hub client in through a transitive chain.
+dependencies = [
+  "fermion-research==0.2.15",
+  "torch==2.15.0",
+  "numpy>=1.26",
+  "soundfile>=0.12",
+  "huggingface-hub>=0.26",
+]
+
+[tool.uv]
+# No build backend: this is a virtual project (worker.py is run, not installed),
+# so `uv sync` only materialises .venv.
+package = false
+
+# Fermion's Intel-macOS split pins torch to 2.2.x (`>=2.2,<2.3`), which cannot
+# coexist with the CPU `torch==2.15.0` pin below. uv resolves universally by
+# default, so without this list `uv sync` fails on Linux before it ever reaches
+# the host. Phonon is supported on Linux, Windows and Apple silicon; Intel macOS
+# is excluded explicitly rather than shipped a lockfile that cannot install.
+environments = [
+  "sys_platform == 'linux'",
+  "sys_platform == 'win32'",
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]

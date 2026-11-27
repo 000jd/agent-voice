@@ -3,14 +3,15 @@
 `agent-voice` speaks four interfaces over one loopback socket:
 
 - **REST** — `/v1/*` JSON endpoints and `/audio/{artifact_id}` artifacts.
-- **OpenAI-compatible** — `POST /v1/audio/speech`, drop-in for an OpenAI SDK client.
+- **OpenAI-compatible** — `POST /v1/audio/speech` and `POST /v1/audio/transcriptions`,
+  drop-in for an OpenAI SDK client.
 - **Streaming** — chunked PCM over `POST /v1/audio/speech/pcm-stream`, and a
   barge-in WebSocket at `/v1/audio/ws`.
 - **MCP** — Streamable HTTP mounted at `/mcp/`, plus a stdio shim
   (`agent-voice mcp`) for clients that cannot speak HTTP.
 
 The wire contract lives in `src/agent_voice/schemas.py` and is treated as frozen:
-fields are added, never silently repurposed. This document describes v0.4.0.
+fields are added, never silently repurposed. This document describes v0.5.0.
 
 Default base URL: `http://127.0.0.1:8000`. Interactive schema: `/docs`, `/redoc`
 and `/openapi.json`.
@@ -104,7 +105,12 @@ A request-body validation failure is a `422` whose `error_code` is also
 |---|---|---|
 | `GET` | `/health` | Liveness, version, protocol version, `torch_loaded` (open, no auth) |
 | `POST` | `/v1/audio/speech` | OpenAI-compatible synthesis, returns audio bytes |
+| `POST` | `/v1/audio/transcriptions` | OpenAI-compatible transcription (multipart), returns JSON/text/SRT/VTT |
 | `POST` | `/v1/agent/speak` | Agent synthesis, returns `SynthesisResult` JSON |
+| `POST` | `/v1/agent/transcribe` | Agent transcription of a confined local path, returns `TranscribeResult` |
+| `POST` | `/v1/agent/dub/prepare` | Dub stage 1: transcribe, extract bed + speaker reference |
+| `POST` | `/v1/agent/dub/render` | Dub stage 2: speak translated lines into their slots |
+| `POST` | `/v1/agent/dub/jobs` | Same body as `dub/render`, renders in the background as a job |
 | `POST` | `/v1/audio/speech/pcm-stream` | Chunked 24 kHz mono int16 LE PCM |
 | `WS` | `/v1/audio/ws` | Bidirectional PCM with barge-in and `cancel` |
 | `POST` | `/v1/voices` | Clone a reference clip (`?overwrite=true` to replace) |
@@ -132,7 +138,7 @@ A request-body validation failure is a `422` whose `error_code` is also
 ### `GET /health`
 
 ```json
-{"status": "ok", "version": "0.4.0", "protocol_version": 1, "torch_loaded": false}
+{"status": "ok", "version": "0.5.0", "protocol_version": 1, "torch_loaded": false}
 ```
 
 `torch_loaded` is reported by looking for `torch` in the core daemon's
@@ -207,6 +213,173 @@ curl -s -X POST localhost:8000/v1/agent/speak \
   -d '{"text":"Good evening.","speaker":"Serena","format":"wav"}'
 ```
 
+### Transcription
+
+Recognition is the `kind: asr` half of the server. Phonon-2.5 runs on the **CPU**
+(0 MB VRAM, 25 languages) and never takes the GPU owner slot, so a transcription
+can run while a TTS model is resident instead of evicting it.
+
+There are two doors, and they differ in how the audio arrives:
+
+#### `POST /v1/audio/transcriptions` (OpenAI-compatible, multipart)
+
+```bash
+curl -s -X POST localhost:8000/v1/audio/transcriptions \
+  -F file=@clip.wav -F model=phonon-2.5 -F response_format=json
+```
+
+| Form field | Type | Default | Notes |
+|---|---|---|---|
+| `file` | upload | required | Streamed to `<inbox>/upload-<uuid8><suffix>` 1 MB at a time, and deleted in a `finally` — an upload is not a voice |
+| `model` | string | `"phonon-2.5"` | An ASR alias, `engine:alias`, or a bare engine id. Resolution uses `resolve_asr_target` |
+| `language` | string | null | `null` lets the backend detect it |
+| `prompt` | string | null | **Read as hotwords**, not context: comma-split when a comma is present, else whitespace-split, then capped at 25 terms and 64 characters each. That is the mapping Phonon documents |
+| `response_format` | string | `"json"` | `json`, `text`, `srt`, `vtt`, `verbose_json` |
+| `temperature` | float | null | Accepted and **ignored**: sampling is not exposed by the ASR engines, and rejecting it would break real clients |
+
+Responses:
+
+| `response_format` | Body |
+|---|---|
+| `json` | OpenAI's shape: `text`, `language`, `duration`, `segments[]`, `segments_count`, `transcript_json_path` |
+| `verbose_json` | The full `TranscribeResult`, including `engine_id`, `model_alias`, `realtime_multiple`, `truncated` and the sidecar paths |
+| `text` | `PlainTextResponse` — the transcript and nothing else |
+| `srt` / `vtt` | The sidecar body, with `application/x-subrip` / `text/vtt` |
+
+An unknown `response_format` is `400 BAD_REQUEST` naming the five accepted values.
+
+**This route is bearer-protected by the `/v1` guard.** With `AGENT_VOICE_API_KEY`
+set it needs `Authorization: Bearer <key>` like every other `/v1` path — it is an
+OpenAI-shaped route, not an unauthenticated one.
+
+The only junk-drawer field is the suffix: a client filename contributes at most a
+7-character extension (`../../cron.d/x` becomes a generated `upload-<uuid>.x`) so
+the caller never chooses where bytes land.
+
+#### `POST /v1/agent/transcribe` (JSON, confined local path)
+
+Body is `TranscribeRequest`:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `audio_path` | string | required | Local audio **or video**. Confined exactly like a reference clip (see [path confinement](#path-confinement)) |
+| `engine` / `model` | string | null | Omit for `AGENT_VOICE_DEFAULT_ASR_ENGINE` and its default alias |
+| `language` | string | null | `null` or `"auto"` to detect. A fixed-language checkpoint ignores the hint |
+| `hotwords` | string[] | null | Decoder bias list. **Capped at 25**, each term ≤ 64 characters; whitespace-only entries are dropped. Over the cap is `422`/`BAD_REQUEST` |
+| `word_timestamps` | bool | `false` | Populate `segments[].words[]` with per-word `start_sec`/`end_sec` |
+| `export_srt` | bool | `false` | Also write `.srt` and `.vtt` beside the transcript |
+| `project` | string | null | A scoped-lexicon project whose terms are offered as hotwords |
+
+Returns `TranscribeResult`:
+
+| Field | Meaning |
+|---|---|
+| `text` | The whole transcript |
+| `language` | What the engine reported, `""`/`"auto"` when it cannot say. Never invented |
+| `duration_sec` | Source media length, from ffprobe |
+| `segments_count` | The real number of segments |
+| `segments[]` | A bounded preview (`TRANSCRIPT_INLINE_SEGMENTS = 40`): `index`, `start_sec`, `end_sec`, `text`, `words[]` only when asked |
+| `segments_omitted` | How many the preview dropped. `> 0` means read `transcript_json_path` |
+| `truncated` | The backend ran out of decode budget — do not trust the tail |
+| `engine_id` / `model_alias` / `backend_name` / `backend_version` | What produced it |
+| `elapsed_ms` / `realtime_multiple` | Wall cost, and `duration_sec / wall_sec` (`44.8` = 45 s of audio per second of CPU) |
+| `transcript_json_path` / `srt_path` / `vtt_path` | Absolute sidecar paths |
+
+Segments are grouped on **sentence punctuation**, a **pause ≥ 0.8 s** and a **7 s
+cap**, whichever comes first. `segments: []` with `text: ""` is a legitimate answer
+for silence-only audio; it is not an error.
+
+#### Caps
+
+| Cap | Default | Applies to | Violation |
+|---|---|---|---|
+| `MAX_TRANSCRIBE_SECONDS` | `3600` | `transcribe`, `dub_prepare` | `400 BAD_REQUEST` naming the cap. Checked against the ffprobe duration **before** any extraction |
+| `MAX_HOTWORDS` | `25` (structural) | `hotwords` on every entry point | `422`/`BAD_REQUEST`. Each term also ≤ 64 characters |
+| `MAX_DUB_SEGMENTS` | `500` | `dub_render` | `400 BAD_REQUEST`, checked before any synthesis |
+
+There is no upload size cap: an upload is streamed 1 MB at a time to a temporary
+inbox file, and the *duration* cap decides whether the work is accepted. An
+oversized file therefore costs one ffprobe and nothing else.
+
+Non-audio input (`has_audio == false`) and unreadable media are `400 BAD_REQUEST`
+with the ffprobe reason in `message`, never a 500.
+
+### Dubbing
+
+Dubbing is **two stages with the translation in between**, and that middle step is
+the caller's. There is no bundled translation model on purpose: the caller is an
+LLM, and a second multi-gigabyte model would translate worse than the model already
+holding the conversation.
+
+#### `POST /v1/agent/dub/prepare` — stage 1
+
+Body is `DubPrepareRequest`:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `media_path` | string | required | Confined like every other caller path |
+| `source_language` | string | null | Hint; `null` auto-detects |
+| `asr_engine` / `asr_model` | string | null | Omit for the configured ASR default |
+| `hotwords` | string[] | null | Capped at 25, as above |
+| `extract_speaker_ref` | bool | `true` | Extract a clean 5–10 s reference window for `auto_clone_source` |
+| `project` | string | null | Scoped-lexicon project |
+
+Returns `DubPrepareResult`: `dub_id`, `media_path`, `duration_sec`,
+`source_language`, `speaker_ref_path` (null when no clean window exists),
+`speaker_ref_text`, the timed `segments[]`, `engine_id`, `model_alias` and
+`project_json_path`.
+
+The working directory is `<DATA_DIR>/dubs/<dub_id>/`, holding `asr.wav` (16 kHz
+mono), `bed.wav` (24 kHz stereo), `speaker_ref.wav` and `project.json`.
+
+#### `POST /v1/agent/dub/render` — stage 2
+
+Body is `DubRenderRequest`:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `dub_id` | string | required | From `prepare` |
+| `segments` | array | required | `DubSegmentSpec[]`: `index`, `start_sec`, `end_sec`, `text`, plus optional per-line `voice`, `speaker`, `instruct`, `engine`, `model`, `take` |
+| `voice` / `speaker` | string | null | How the lines are voiced. Passing both is an error |
+| `auto_clone_source` | bool | `false` | Clone the prepared speaker reference. Reuses a voice already saved as `dub-<dub_id>` instead of duplicating it |
+| `engine` / `model` / `quality` | — | — | TTS target selection |
+| `keep_original_bed` | bool | `true` | Duck the source audio under the voice instead of replacing it |
+| `bed_duck_db` | float | `-18.0` | `-40..0`. Scales the `sidechaincompress` threshold, so it is a real parameter |
+| `max_atempo` | float | `1.35` | `1.0..2.0`. **Hard ceiling**: a line that still overruns is reported, never truncated |
+| `export_srt` | bool | `true` | Subtitles come from the **translated** text |
+| `burn_subtitles` | bool | `false` | `true` re-encodes with `libx264`; `false` copies the video stream |
+| `project` | string | null | Scoped lexicon for the spoken lines |
+
+Returns `DubRenderResult`: `dub_id`, `file_path` (the dubbed `.mp4`, named
+`<artifacts>/dub_<dub_id>.mp4`), `duration_sec`, `video_stream_copied`,
+`bed_ducked`, `segments_count`, `cached_segments`, `overflow_warnings[]`,
+`srt_path`, `vtt_path`, `timing_json_path`, `engine_id`, `model_alias`,
+`elapsed_ms`.
+
+`overflow_warnings[]` entries are `{index, slot_sec, audio_sec, atempo}`. Shorten
+the named line and re-render: the unchanged lines come back as `cached_segments`, so
+a one-line fix costs one line.
+
+`keep_original_bed=true` needs an ffmpeg with `sidechaincompress` and `alimiter`.
+Without them the mix degrades to `amix` + gain — still a valid dub — and
+`agent-voice doctor` reports a `dub filters` WARN. A missing filter never fails a
+render.
+
+#### `POST /v1/agent/dub/jobs` — the same render as a job
+
+Identical body. Returns `{"job_id": "...", "kind": "dub"}` immediately and renders
+in the background; poll `GET /v1/jobs/{job_id}` (whose `kind` is now `dub` as well as
+`script`/`download_model`/`install_engine`).
+
+### The `.timing.json` sidecar for dubs
+
+A dub render writes `<artifact>.timing.json` from the **translated** segments, so a
+downstream tool can place captions or effects on the dubbed timeline without
+re-probing the file. It carries the whole `DubRenderResult` (`dub_id`, `file_path`,
+`duration_sec`, `video_stream_copied`, `bed_ducked`, `segments_count`,
+`cached_segments`, `overflow_warnings[]`) plus `segments[]`: the translated
+`index`/`start_sec`/`end_sec`/`text` that was actually spoken.
+
 ### `POST /v1/audio/speech/pcm-stream`
 
 The same routing as `speak`, but the body is raw 24 kHz mono int16 LE PCM as it
@@ -243,11 +416,23 @@ Query: `?overwrite=true` replaces an existing voice with the same name when its
 audio differs. Without it, a retry with byte-identical audio returns the existing
 voice (idempotent) and a differing clip is rejected.
 
-**Path confinement.** With `MCP_BASE_PATH` set, the path must resolve inside it.
-Otherwise, unless `AGENT_VOICE_ALLOW_ANY_PATH=true`, it must resolve inside
-`<DATA_DIR>/inbox/`; an escape is `403 PATH_OUTSIDE_BASE` before any ffmpeg work.
-With `AGENT_VOICE_ALLOW_ANY_PATH=true` an existing absolute path anywhere on the
-machine is accepted. The CLI `agent-voice voices add` bypasses this route and is
+#### Path confinement
+
+One policy covers every caller-supplied path — `clone_voice`'s `ref_audio_path`,
+transcription's `audio_path`, dubbing's `media_path`:
+
+1. **`MCP_BASE_PATH` set** → the path must resolve inside it (a relative path resolves
+   against it). An escape is `403 PATH_OUTSIDE_BASE`.
+2. **Otherwise, unless `AGENT_VOICE_ALLOW_ANY_PATH=true`** → it must resolve inside
+   `<DATA_DIR>/inbox/`, the directory `server_info()["inbox_dir"]` reports. An escape is
+   `403 PATH_OUTSIDE_BASE` **before** any ffmpeg work, and the suggestion names the inbox.
+3. **Otherwise** → any existing **absolute** path. A relative one stays `400 BAD_REQUEST`,
+   because the daemon's cwd is not the caller's and guessing could read the wrong file.
+
+A symlink is refused in every branch, and the resolved real path (including symlinked
+ancestors) is what is compared. REST and MCP call the same function —
+`resolve_media_path` delegates to `resolve_ref_audio_path` — so the two surfaces cannot
+drift. The CLI `agent-voice voices add` is an operator command, bypasses this route and is
 always unrestricted.
 
 `GET /v1/voices` — `{"voices": [VoiceMetadata, …]}`, where `VoiceMetadata` is
@@ -293,7 +478,7 @@ tells you whether it is present.
   background, reporting per-beat progress.
 
 `GET /v1/jobs/{job_id}` returns a `Job`: `job_id`, `kind`
-(`script`/`download_model`/`install_engine`), `status`
+(`script`/`download_model`/`install_engine`/`dub`), `status`
 (`pending`/`running`/`succeeded`/`failed`/`cancelled`), `progress`, `message`,
 `created_at`, `updated_at`, `result`, `error`. A job left pending or running by a
 daemon restart is reconciled to failed with `DAEMON_RESTARTED` — it can never
@@ -314,12 +499,15 @@ VRAM immediately.
 
 `GET /v1/engines` — `{"engines": [EngineEntry]}`, each with `engine_id`,
 `display_name`, `backend_name`, `backend_version`, `installed`, `venv_python`,
-capability flags (`streaming`, `pcm_native`, `custom_voice`, `voice_design`,
-`instruct_control`), `models` and `why_unavailable`.
+`kind` (`tts`/`asr`), `device` (`gpu`/`cpu`), capability flags (`streaming`,
+`pcm_native`, `custom_voice`, `voice_design`, `instruct_control`, plus the ASR flags
+`word_timestamps`, `hotwords`, `multilingual` and `languages`), `models` and
+`why_unavailable`.
 
 `GET /v1/models` — `{"models": [ModelEntry]}` with `engine_id`, `alias`,
 `hf_repo`, `quality_tier`, `est_vram_gb`, `is_default`, `downloaded_locally`,
-`loaded`, `mode`, `supports_instruct`, `preset_speakers`.
+`loaded`, `mode`, `supports_instruct`, `preset_speakers`, and `kind` (inherited from
+the engine, so `?kind=asr` style filtering is possible client-side).
 
 Engine/model mutation (`POST /v1/engines`, `POST /v1/engines/{id}/install`,
 `POST /v1/models`, `POST /v1/models/{engine}/{alias}/download`) requires
@@ -353,7 +541,7 @@ covered by the same guard, so a key protects `/mcp/*` too.
 Bidirectional: the client sends JSON control messages, the server sends binary
 PCM frames (24 kHz mono int16 LE) interleaved with JSON events.
 
-Handshake requirements (v0.4.0): a loopback `Host`, no foreign `Origin`, and — if
+Handshake requirements (v0.5.0): a loopback `Host`, no foreign `Origin`, and — if
 `AGENT_VOICE_API_KEY` is set — a valid credential via `Authorization: Bearer …` or
 `Sec-WebSocket-Protocol: bearer, <key>`.
 
@@ -414,11 +602,11 @@ needed, then proxies to the Streamable HTTP endpoint. That keeps a stdio-only
 client from spawning a second GPU owner. Direct HTTP clients can mount
 `http://127.0.0.1:8000/mcp/` instead.
 
-20 tools, split into a `core` and a `full` surface by `AGENT_VOICE_TOOLSET`:
+24 tools, split into a `core` (16) and a `full` surface by `AGENT_VOICE_TOOLSET`:
 
 | Tool | Surface | Purpose |
 |---|---|---|
-| `server_info` | core | **Call first.** Free snapshot — version, defaults, voices, engines, `inbox_dir`, GPU state |
+| `server_info` | core | **Call first.** Free snapshot — version, defaults, voices, engines, `inbox_dir`, `asr_engines`, `dubbing_available`, GPU state |
 | `speak` | core | One utterance → file path. `voice`, `speaker` or `instruct`, `markup`, `spell_identifiers`, `paragraph_gap_ms`, `project`, per-call `pronunciations` |
 | `speak_script` | core | Multi-beat script with exact timings plus SRT/VTT |
 | `start_script_job` | core | Start the same render in the background, return a `job_id` |
@@ -428,11 +616,15 @@ client from spawning a second GPU owner. Direct HTTP clients can mount
 | `design_voice` | core | Invent a voice from a description; optionally save as a clone |
 | `list_voices` | core | List registered voices |
 | `delete_voice` | core | Delete a voice |
+| `transcribe` | core | Transcribe a local audio/video file → `TranscribeResult` |
+| `dub_prepare` | core | Dub stage 1: transcribe, extract bed + speaker reference |
+| `dub_render` | core | Dub stage 2: speak translated lines into their slots |
+| `start_dub_job` | core | The same render in the background, return a `job_id` |
 | `gpu_status` | core | Resident models, VRAM, queue depth, in-flight |
 | `unload_models` | core | Free VRAM; `force=true` cancels running jobs |
 | `set_agent_binding` | full | Bind a voice/engine/model to the calling agent |
 | `list_agent_bindings` | full | List bindings |
-| `list_engines` | full | Engine discovery and install state |
+| `list_engines` | full | Engine discovery, `kind`/`device` and install state |
 | `list_models` | full | Model aliases, modes, speakers, download state |
 | `download_model` | full | Start a weights download job |
 | `register_model` | full | Add a model alias to an engine manifest |
@@ -444,14 +636,20 @@ client from spawning a second GPU owner. Direct HTTP clients can mount
 | Value | Tools exposed |
 |---|---|
 | `auto` (default) | `core`, plus the management tools when mutation is enabled |
-| `core` | Synthesis, voice clone/design/list/delete, GPU status. No engine/model management |
+| `core` | 16: synthesis, transcription, dubbing, voice clone/design/list/delete, GPU status. No engine/model management |
 | `full` | Everything, so the per-call loopback + mutation guard answers with an actionable error |
+
+Transcription and dubbing are **core**, not full-only: reading audio and re-voicing a
+video are the product, not an operator extra.
 
 Resources and prompts:
 
 - `agent-voice://voices` — the voice list as JSON.
 - `agent-voice://guide` — this repository's `skills/agent-voice/SKILL.md`.
 - `narrate_video` prompt — a starting brief for a narrated video pipeline.
+- `dub_video(media_path, target_language)` prompt — the full dubbing loop: prepare,
+  translate and tighten each line to its slot, render with `auto_clone_source`,
+  retry only the over-long lines, report the paths, unload.
 
 A tool failure is an MCP `isError=true` result whose text is the same
 `{error_code, message, suggestion}` JSON, so a client can tell success from
@@ -465,18 +663,23 @@ questions that otherwise cost a failed synthesis round-trip:
 
 ```json
 {
-  "version": "0.4.0",
+  "version": "0.5.0",
   "default_engine": "qwen3_tts_fast",
+  "default_asr_engine": "phonon",
   "default_voice": "a1b2c3d4e5f6",
   "voices_count": 1,
   "voices": [{"voice_id": "a1b2c3d4e5f6", "name": "narrator", "duration_sec": 6.4}],
-  "installed_engines": ["qwen3_tts_fast"],
+  "installed_engines": ["phonon", "qwen3_tts_fast"],
   "inbox_dir": "/repo/data/inbox",
   "preset_speakers": ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ryan",
                       "Aiden", "Ono_Anna", "Sohee"],
   "voice_design_available": true,
   "engines": [{"engine_id": "qwen3_tts_fast", "installed": true, "streaming": true,
                "why_unavailable": null}],
+  "asr_engines": [{"engine_id": "phonon", "installed": true,
+                   "word_timestamps": true, "hotwords": true,
+                   "languages": ["en", "es", "fr"]}],
+  "dubbing_available": true,
   "gpu_status": {"active_engine": null, "loaded_models": [], "vram_used_mb": 631},
   "next_steps": []
 }
@@ -485,12 +688,17 @@ questions that otherwise cost a failed synthesis round-trip:
 | Field | Read it as |
 |---|---|
 | `voices_count` | `0` means you must clone a voice before a clone-only checkpoint can speak |
-| `inbox_dir` | Where an agent-supplied `ref_audio_path` must live unless `MCP_BASE_PATH` is set |
+| `default_asr_engine` | Which `kind: asr` engine a transcription uses when none is named. Independent of `default_engine` |
+| `inbox_dir` | Where an agent-supplied `ref_audio_path`, `audio_path` or `media_path` must live unless `MCP_BASE_PATH` is set |
 | `preset_speakers` | Names `speak(speaker=…)` accepts on the default engine *right now*; empty means only a clone or a design can produce audio |
 | `voice_design_available` | Whether `design_voice()` can run without another download |
 | `installed_engines` | Engines that can actually run; `engines[].why_unavailable` explains the rest |
+| `asr_engines` | The transcription engines, each with its capabilities and languages. **Empty means there is no speech recognition on this host** — do not call `transcribe` |
+| `dubbing_available` | `true` only when a TTS engine *and* an ASR engine are usable, so a dub can complete |
 | `next_steps` | Advisory list of suggested next actions, added in v0.3.3: empty when the default engine is installed, weights are cached and at least one voice or preset speaker is available; otherwise short copy-pasteable actions such as "Run `agent-voice engines install qwen3_tts_fast`." or "Put a 3-10 s reference clip in `<inbox_dir>` and call `clone_voice()`, or call `design_voice()`." It is advice, never an error — tool calls still enforce their own rules |
 
+`engines[]` entries also carry `kind` (`tts`/`asr`) and `device` (`gpu`/`cpu`), so an
+agent can tell which engine speaks, which listens, and which one will not touch VRAM.
 Speaker lists for another engine come from `list_models(engine_id)`; pass
 `engine=` to `speak`/`speak_script` to use it.
 
@@ -559,6 +767,8 @@ GPU time is spent.
 | `MAX_INSTRUCT_CHARS` | 1000 | `instruct` on `speak`, a beat, or `design_voice` | `413 TEXT_TOO_LONG` |
 | `MAX_DESIGN_SAMPLE_CHARS` | 500 | `design_voice(sample_text=…)` | `413 TEXT_TOO_LONG` |
 | `MAX_REF_TEXT_CHARS` | 2000 | `clone_voice(ref_text=…)` | `413 TEXT_TOO_LONG` |
+| `MAX_TRANSCRIBE_SECONDS` | 3600 | media length on `transcribe` / `dub_prepare` | `400 BAD_REQUEST` naming the cap |
+| `MAX_DUB_SEGMENTS` | 500 | lines in one `dub_render` / `dub/jobs` | `400 BAD_REQUEST` |
 
 They sit alongside `MAX_TEXT_CHARS` (one utterance, default 20000) and
 `CHUNK_CHARS` (default 400 — how a long text is split, not rejected). A rejected
@@ -566,9 +776,16 @@ request creates no cache entry and leaves no scratch directory, so retrying it
 unchanged fails identically. Shorten the input, split a long script, or raise the
 cap deliberately.
 
+`MAX_TRANSCRIBE_SECONDS` bounds **work**, not upload size: an hour is a generous
+podcast, and an over-long clip costs one ffprobe and nothing else. `MAX_DUB_SEGMENTS`
+is checked before any synthesis, so a 5,000-line render is refused in milliseconds
+rather than after 400 GPU renders.
+
 Two more sets of limits are structural rather than configurable, and just as
 admission-time: **markup** allows 128 tags, nesting depth 4 and 32 segments per
-utterance, and the **lexicon** allows 500 entries per scope with 1,500 merged.
+utterance, the **lexicon** allows 500 entries per scope with 1,500 merged, and
+**`hotwords`** allows 25 terms of at most 64 characters each. All three bound a
+regex or a decoder, so they are raised by editing the contract, not by an env var.
 
 ## Expressive markup
 

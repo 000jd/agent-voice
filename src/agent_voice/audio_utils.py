@@ -582,3 +582,593 @@ def rms_normalise_ratio(block: np.ndarray, target_db: float = -20.0) -> float:
 
 def silence(duration_sec: float, *, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     return np.zeros(max(0, int(math.ceil(duration_sec * sample_rate))), dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Media inspection and extraction (v0.5: transcription and dubbing)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MediaInfo:
+    """What ffprobe can say about a file before we decode a single frame."""
+
+    path: Path
+    duration_sec: float
+    has_audio: bool
+    has_video: bool
+    sample_rate: int
+    channels: int
+
+
+def probe_media(path: Path) -> MediaInfo:
+    """Stream layout plus duration, for admission before any work happens.
+
+    Both v0.5 surfaces have to answer "is there anything to listen to, and how
+    long is it" *before* they spawn a worker or decode an hour of video: a caller
+    who hands us a silent screen recording or a three-hour lecture must get a
+    fast, specific refusal instead of a wasted ASR run.
+
+    A probe that cannot read the container is reported as ``INVALID_REF_AUDIO``
+    (the existing code for "this media cannot be decoded"), because the fix is
+    the same one the clone path asks for: supply something ffmpeg understands.
+    """
+    _require_ffmpeg()
+    result = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    if result.returncode != 0:
+        raise AgentVoiceError(
+            ErrorCode.INVALID_REF_AUDIO,
+            f"could not probe {Path(path).name}: {_ffmpeg_error_tail(result.stderr)}",
+            "Provide a file ffmpeg can demux (mp4, mkv, mov, wav, mp3, ...). If the "
+            "file is fine, check that ffmpeg/ffprobe are installed and on PATH.",
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AgentVoiceError(
+            ErrorCode.INVALID_REF_AUDIO,
+            f"could not parse ffprobe output for {Path(path).name}: {exc}",
+            "Provide a file ffmpeg can demux; a truncated or non-media file is the "
+            "usual cause.",
+        ) from exc
+
+    streams = payload.get("streams") or []
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+
+    duration = 0.0
+    try:
+        duration = float((payload.get("format") or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        # Some containers carry the duration only on the stream (a raw segment, an
+        # mpeg-ts off an encoder). The longest stream is the honest answer.
+        for stream in streams:
+            try:
+                duration = max(duration, float(stream.get("duration") or 0.0))
+            except (TypeError, ValueError):
+                continue
+
+    def _int(value: object) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return MediaInfo(
+        path=Path(path),
+        duration_sec=duration,
+        has_audio=audio is not None,
+        has_video=video is not None,
+        sample_rate=_int((audio or {}).get("sample_rate")),
+        channels=_int((audio or {}).get("channels")),
+    )
+
+
+def extract_asr_wav(source: Path, destination: Path) -> float:
+    """Decode ``source`` to the 16 kHz mono 16-bit WAV an ASR backend expects.
+
+    Phonon's front end is fixed at 16 kHz mono, and resampling here means the
+    worker never has to depend on the exact container it was handed. Always
+    converting (rather than checking the source format first) is one decode pass
+    and removes a whole class of "the source happened to be 44.1 kHz stereo"
+    bug, at a cost that is negligible next to the transcription itself.
+
+    Returns the extracted duration in seconds.
+    """
+    _require_ffmpeg()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = _run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-sample_fmt",
+            "s16",
+            str(destination),
+        ],
+        timeout=600.0,
+    )
+    if result.returncode != 0:
+        raise AgentVoiceError(
+            ErrorCode.INVALID_REF_AUDIO,
+            f"could not extract audio from {Path(source).name}: "
+            f"{_ffmpeg_error_tail(result.stderr)}",
+            "Provide a file with a decodable audio stream.",
+        )
+    return probe_duration(destination)
+
+
+def extract_bed(source: Path, destination: Path) -> float:
+    """Decode ``source``'s audio to a 24 kHz stereo 16-bit WAV bed.
+
+    The bed is resampled exactly once, here, so the later sidechain mix never
+    resamples per line: ffmpeg would otherwise re-convert the bed for every
+    ``amix``/``sidechaincompress`` invocation, and the dub's only audio quality
+    decision would be made as a side effect of the filter graph.
+    """
+    _require_ffmpeg()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = _run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-ac",
+            "2",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-sample_fmt",
+            "s16",
+            str(destination),
+        ],
+        timeout=600.0,
+    )
+    if result.returncode != 0:
+        raise AgentVoiceError(
+            ErrorCode.INVALID_REF_AUDIO,
+            f"could not extract the original bed from {Path(source).name}: "
+            f"{_ffmpeg_error_tail(result.stderr)}",
+            "Provide a file with a decodable audio stream.",
+        )
+    return probe_duration(destination)
+
+
+def slice_clip(
+    source: Path,
+    destination: Path,
+    *,
+    start_sec: float,
+    duration_sec: float,
+) -> float:
+    """Cut ``duration_sec`` out of ``source`` starting at ``start_sec``.
+
+    Input-seek (``-ss`` before ``-i``) rather than output-seek: the speaker
+    reference is sliced out of a file that can be an hour long, and decoding up to
+    the offset to throw it away is the difference between an instant cut and a
+    real-time wait.
+
+    The cut keeps the source's sample format on purpose — it is a cut, not a
+    conversion; :func:`canonicalise_ref_audio` is the one place that decides the
+    final reference format.
+    """
+    _require_ffmpeg()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result = _run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-ss",
+            f"{max(0.0, start_sec):.3f}",
+            "-t",
+            f"{max(0.0, duration_sec):.3f}",
+            "-i",
+            str(source),
+            str(destination),
+        ],
+        timeout=600.0,
+    )
+    if result.returncode != 0:
+        raise AgentVoiceError(
+            ErrorCode.INVALID_REF_AUDIO,
+            f"could not slice {Path(source).name}: {_ffmpeg_error_tail(result.stderr)}",
+            "Check the source is decodable and the window is inside its duration.",
+        )
+    return probe_duration(destination)
+
+
+def _atempo_stages(ratio: float) -> list[str]:
+    """Chain ``atempo`` stages so one filter instance never sees an extreme value.
+
+    ffmpeg's ``atempo`` accepts [0.5, 2.0] per instance, so a bigger ratio is
+    expressed as repeated 2.0 stages and the residual. This mirrors
+    :func:`fit_segment`'s algorithm; dubbing bounds its ratio by ``max_atempo``
+    (<= 2.0) so a single stage is normally enough, but the loop is written to hold
+    for the general case rather than assuming that bound.
+    """
+    stages: list[str] = []
+    remaining = ratio
+    while remaining > 2.0:
+        stages.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        stages.append("atempo=0.5")
+        remaining /= 0.5
+    stages.append(f"atempo={remaining:.6f}")
+    return stages
+
+
+def atempo_to_duration(
+    source: Path,
+    destination: Path,
+    *,
+    target_sec: float,
+    max_atempo: float = 1.35,
+) -> tuple[float, bool]:
+    """Speed ``source`` up (if needed) to fit ``target_sec``.
+
+    Returns ``(atempo_used, still_overflows)``. A line shorter than its slot is
+    re-encoded unchanged (``atempo`` 1.0): dubbing must never *slow* a line down
+    to fill the slot, because a stretched line sounds like a different take and
+    the gap after it is what the picture is timed against anyway.
+
+    When the required ratio exceeds ``max_atempo`` the ceiling is applied and
+    ``still_overflows`` is True, so the caller can report the line instead of
+    truncating it — clipped audio is worse than a slightly long line, and the
+    caller can only fix what it is told about.
+
+    Output is 24 kHz mono PCM s16: the mix stage takes exactly that.
+    """
+    current = probe_duration(source)
+    if target_sec <= 0:
+        # No room at all. Reporting an overflow is the only truthful answer; there
+        # is no ratio that fits a zero-length slot.
+        atempo_used, still_overflows = 1.0, True
+    else:
+        ratio = current / target_sec
+        if ratio <= 1.0:
+            atempo_used, still_overflows = 1.0, False
+        elif ratio > max_atempo:
+            atempo_used, still_overflows = float(max_atempo), True
+        else:
+            atempo_used, still_overflows = ratio, False
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    argv = ["ffmpeg", "-nostdin", "-y", "-i", str(source)]
+    if atempo_used != 1.0:
+        argv += ["-af", ",".join(_atempo_stages(atempo_used))]
+    argv += [
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-sample_fmt",
+        "s16",
+        str(destination),
+    ]
+    result = _run(argv)
+    if result.returncode != 0:
+        raise AgentVoiceError(
+            ErrorCode.INTERNAL_ERROR,
+            f"could not fit {Path(source).name} to {target_sec:.3f}s: "
+            f"{_ffmpeg_error_tail(result.stderr)}",
+            "Check ffmpeg atempo availability.",
+        )
+    return atempo_used, still_overflows
+
+
+def place_on_timeline(
+    clips: list[tuple[float, Path]],
+    destination: Path,
+    *,
+    duration_sec: float,
+    sample_rate: int = SAMPLE_RATE,
+) -> Path:
+    """Mix timed clips into one buffer of exactly ``duration_sec``.
+
+    Dubbing is a placement problem, not a stitching problem: every line belongs at
+    the source segment's start time, and two lines must be able to overlap without
+    one being dropped. Adding into a preallocated buffer gives that for free, and
+    an all-zero buffer of the media's length means a line that never got rendered
+    is heard as silence in its slot rather than shifting everything after it.
+
+    Overlapping lines sum, so the result is peak-limited to :data:`PEAK_CEILING`
+    afterwards (scaled down only — never amplified, which would make a quiet dub
+    clip after the limiter).
+    """
+    import soundfile as sf
+
+    total_frames = max(1, int(math.ceil(max(0.0, duration_sec) * sample_rate)))
+    buffer = np.zeros(total_frames, dtype=np.float32)
+
+    for start_sec, clip in clips:
+        data, clip_rate = sf.read(clip, dtype="float32", always_2d=False)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if clip_rate != sample_rate:
+            # Lines arrive at SAMPLE_RATE, but a stray rate would otherwise be
+            # placed at the wrong tempo *and* the wrong length. Silent mis-timing is
+            # the one failure mode this helper exists to rule out.
+            stretched = int(round(len(data) * sample_rate / clip_rate))
+            positions = np.linspace(0.0, float(len(data)), num=max(1, stretched), endpoint=False)
+            data = np.interp(
+                positions,
+                np.arange(len(data), dtype=np.float64),
+                data.astype(np.float64),
+            ).astype(np.float32)
+
+        offset = int(round(start_sec * sample_rate))
+        if offset < 0:
+            # Defensive: admission rejects a negative start, but a partial clip is
+            # better than placing the whole line at zero.
+            data = data[-offset:]
+            offset = 0
+        if offset >= total_frames:
+            # A clip that starts past the end of the media contributes nothing. It
+            # is skipped rather than raising: the caller validated its slots against
+            # the media duration already.
+            continue
+        end = min(total_frames, offset + len(data))
+        buffer[offset:end] += data[: end - offset]
+
+    peak = float(np.max(np.abs(buffer))) if buffer.size else 0.0
+    if peak > PEAK_CEILING:
+        buffer = buffer * np.float32(PEAK_CEILING / peak)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(destination, buffer, sample_rate, subtype="PCM_16")
+    return destination
+
+
+def mix_bed_with_voice(
+    bed: Path,
+    voice: Path,
+    destination: Path,
+    *,
+    duck_db: float = -18.0,
+    fallback: bool = True,
+) -> tuple[Path, bool]:
+    """Mix the dubbed voice over the original bed, ducking it under the speech.
+
+    Returns ``(destination, ducked)``. Sidechain compression is what makes a dub
+    listenable: music and effects stay present between lines but drop out from
+    under the dialogue, instead of forcing the caller to choose between a
+    buried voice and a background that is gone.
+
+    ``duck_db`` is the sidechain threshold, converted from dB to the linear
+    amplitude ffmpeg's ``threshold`` takes — so the knob actually moves the
+    ducking rather than merely decorating the call.
+
+    A score built without ``sidechaincompress`` (an older ffmpeg, or a build with
+    the filter compiled out) still gets a usable dub: the plain ``amix`` fallback
+    is returned with ``ducked=False`` so the caller knows the bed is at full level.
+    """
+    _require_ffmpeg()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    threshold = 10 ** (duck_db / 20.0)
+    ducked_filter = (
+        "[1:a]asplit=2[v1][sc];"
+        f"[0:a][sc]sidechaincompress=threshold={threshold:.6f}:ratio=8:"
+        "attack=20:release=300[bed];"
+        "[bed][v1]amix=inputs=2:duration=first:dropout_transition=0,"
+        "alimiter=limit=0.97[a]"
+    )
+    result = _run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(bed),
+            "-i",
+            str(voice),
+            "-filter_complex",
+            ducked_filter,
+            "-map",
+            "[a]",
+            "-ac",
+            "2",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-sample_fmt",
+            "s16",
+            str(destination),
+        ],
+        timeout=600.0,
+    )
+    if result.returncode == 0:
+        return destination, True
+    if not fallback:
+        raise AgentVoiceError(
+            ErrorCode.INTERNAL_ERROR,
+            f"bed/voice mix failed: {_ffmpeg_error_tail(result.stderr)}",
+            "Check that this ffmpeg build provides sidechaincompress, amix and "
+            "alimiter; retry with fallback enabled for a plain mix.",
+        )
+
+    plain_filter = (
+        "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0,"
+        "alimiter=limit=0.97[a]"
+    )
+    result = _run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(bed),
+            "-i",
+            str(voice),
+            "-filter_complex",
+            plain_filter,
+            "-map",
+            "[a]",
+            "-ac",
+            "2",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-sample_fmt",
+            "s16",
+            str(destination),
+        ],
+        timeout=600.0,
+    )
+    if result.returncode != 0:
+        raise AgentVoiceError(
+            ErrorCode.INTERNAL_ERROR,
+            f"bed/voice mix failed: {_ffmpeg_error_tail(result.stderr)}",
+            "Check that this ffmpeg build provides amix and alimiter.",
+        )
+    return destination, False
+
+
+def _escape_filter_path(path: Path) -> str:
+    """Escape a path for use as an ffmpeg filter *option value*.
+
+    A filtergraph has two parsers between the argument and the filename: the graph
+    parser (``, ; [ ]`` delimit filters and pads) and the option parser (``:``
+    separates options, ``'`` quotes). A path containing any of them — a Windows
+    drive letter, a title with a comma — would otherwise split the graph and make
+    ffmpeg fail with a message about a filter that was never asked for. The
+    backslash must be escaped first so the escapes added below survive.
+    """
+    text = str(Path(path).expanduser().resolve())
+    for char in ("\\", ":", "'", ",", "[", "]"):
+        text = text.replace(char, "\\" + char)
+    return text
+
+
+def mux_video(
+    media: Path,
+    audio: Path,
+    destination: Path,
+    *,
+    srt: Path | None = None,
+    burn_subtitles: bool = False,
+) -> bool:
+    """Put ``audio`` into ``media``'s container, returning whether video was copied.
+
+    The non-burn path remuxes the video stream untouched (``-c:v copy``): a dub
+    changes the audio, and re-encoding picture nobody asked to change is a quality
+    loss and a large CPU bill for no benefit.
+
+    The burn path re-encodes, which is unavoidable when subtitles become pixels,
+    and it fails loudly: a caller who asked for burned-in subtitles and silently
+    got a clean video would ship a wrong deliverable. ``+faststart`` is set on both
+    so the result streams from the first byte instead of waiting for a full
+    download.
+
+    The video map is ``0:v:0?`` (optional) on purpose. Dubbing accepts any media
+    with an audio stream — a podcast or a phone recording is a legitimate source —
+    and a required ``0:v:0`` would fail the whole render at the last step, after
+    every line had already been paid for. An audio-only source therefore yields an
+    audio-only MP4, which is the honest deliverable, and the return value still
+    reports whether a video stream was actually copied.
+    """
+    _require_ffmpeg()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    has_video = probe_media(media).has_video
+
+    if burn_subtitles:
+        if srt is None:
+            raise AgentVoiceError(
+                ErrorCode.BAD_REQUEST,
+                "burn_subtitles was requested but no subtitle file was produced",
+                "Provide segment text (subtitles are built from the translated "
+                "lines), or set burn_subtitles=false to deliver a separate .srt.",
+            )
+        if not has_video:
+            raise AgentVoiceError(
+                ErrorCode.BAD_REQUEST,
+                "burn_subtitles needs a video stream, and the source has none",
+                "Set burn_subtitles=false: the .srt/.vtt sidecar carries the same "
+                "cues for an audio-only dub.",
+            )
+        argv = [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(media),
+            "-i",
+            str(audio),
+            "-map",
+            "0:v:0?",
+            "-map",
+            "1:a:0",
+            "-vf",
+            f"subtitles={_escape_filter_path(srt)}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(destination),
+        ]
+    else:
+        argv = [
+            "ffmpeg",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(media),
+            "-i",
+            str(audio),
+            "-map",
+            "0:v:0?",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(destination),
+        ]
+
+    result = _run(argv, timeout=900.0)
+    if result.returncode != 0:
+        raise AgentVoiceError(
+            ErrorCode.INTERNAL_ERROR,
+            f"could not mux the dub into {Path(destination).name}: "
+            f"{_ffmpeg_error_tail(result.stderr)}",
+            "Check that the source media is decodable and that this ffmpeg build "
+            "provides the aac encoder"
+            + (" and the subtitles filter." if burn_subtitles else "."),
+        )
+    return has_video and not burn_subtitles

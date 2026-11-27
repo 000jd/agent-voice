@@ -42,6 +42,7 @@ Method = Literal[
     "unload_model",
     "synthesize",
     "stream_pcm",
+    "transcribe",
     "cancel",
     "health",
     "shutdown",
@@ -111,6 +112,9 @@ class FrameWriter(Protocol):
 #                    "backend_name": str, "backend_version": str,
 #                    "capabilities": {"streaming": bool, "pcm_native": bool},
 #                    "loaded_models": [str], "gpu_vram_mb": int, "pid": int}
+#                   ASR workers additionally report "kind": "asr". Optional:
+#                   the parent reads the manifest, never the handshake, so an
+#                   older worker that omits it is still conformant.
 #
 # load_model   req  {"id": str, "method": "load_model", "model_alias": str}
 #              resp {"id": str, "model_alias": str, "loaded_models": [str]}
@@ -133,6 +137,22 @@ class FrameWriter(Protocol):
 #              resp PCM_CHUNK* then
 #                   {"id": str, "stream_id": str, "done": true,
 #                    "duration_sec": float, "streaming_mode": "native"|"emulated"}
+#
+# transcribe   req  {"id": str, "method": "transcribe", "model_alias": str,
+#                    "audio_path": str, "language": str|None,
+#                    "word_timestamps": bool, "hotwords": [str]}
+#                    Added in v0.5 for kind: asr engines. Additive and optional:
+#                    a TTS worker answers BAD_REQUEST "unknown method", and an ASR
+#                    worker answers that to synthesize. Framing is unchanged.
+#              resp {"id": str, "model_alias": str, "backend_name": str,
+#                    "backend_version": str, "language": str,
+#                    "duration_sec": float, "text": str, "truncated": bool,
+#                    "segments": [{"index": int, "start_sec": float,
+#                                  "end_sec": float, "text": str,
+#                                  "words": [{"word": str, "start_sec": float,
+#                                             "end_sec": float}]}]}
+#                    "words" is present only when word_timestamps was true;
+#                    "segments" may be [] for silence-only audio.
 #
 # cancel       req  {"id": str, "method": "cancel", "target_request_id": str}
 #              resp {"id": str, "target_request_id": str, "cancelled": bool}

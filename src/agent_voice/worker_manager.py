@@ -437,7 +437,11 @@ class WorkerManager:
         if handle is not None:
             await self._kill_worker(engine_id, reason="dead")
         handle = await self._spawn_worker(record)
-        if self._active_engine is None:
+        # Only a GPU engine can own the GPU slot. Claiming it here for a CPU
+        # engine (Kokoro, Phonon, mock_asr) would make `active_engine` name a
+        # worker that holds no VRAM — and the next GPU request would then evict
+        # that perfectly healthy CPU worker as an "engine switch".
+        if record.manifest.device == "gpu" and self._active_engine is None:
             self._active_engine = engine_id
             self._active_since = self.clock.now()
         return handle
@@ -667,7 +671,13 @@ class WorkerManager:
 
         self._dequeue(job)
         try:
-            await self._acquire_gpu(engine_id)
+            # Only a GPU engine competes for the single GPU-owner slot. A CPU
+            # engine (Kokoro, Phonon, the mock ASR) must never take, block on or
+            # evict that slot: doing so would make a transcription signal "the
+            # GPU is busy" and could unload a resident GPU render for no reason.
+            record = self.registry.get(engine_id)
+            if record.manifest.device == "gpu":
+                await self._acquire_gpu(engine_id)
             handle = await self.ensure_worker(engine_id)
             await self._ensure_model_loaded(handle, model_alias)
         except BaseException:
@@ -1117,6 +1127,76 @@ class WorkerManager:
     def _elapsed_ms(self, started: float) -> int:
         return max(0, int(round((self.clock.monotonic() - started) * 1000)))
 
+    async def transcribe(
+        self,
+        *,
+        engine_id: str,
+        model_alias: str,
+        audio_path: Path,
+        language: str | None = None,
+        word_timestamps: bool = False,
+        hotwords: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Transcribe one local file. Returns the worker's raw reply.
+
+        **No cache, deliberately.** A synthesis is expensive and its output is an
+        artifact worth keeping; a transcript is cheap to recompute and the audio
+        it describes is already on disk, so caching it would add a second store
+        to invalidate whenever the file is re-recorded, the alias is re-pointed,
+        or the hotword list changes. Re-reading the audio is the more honest
+        performance profile, and it keeps exactly one cache in the daemon.
+
+        The reply is returned unmapped: the service layer turns it into a
+        ``TranscribeResult`` because that is where SRT/VTT export and the
+        inline-preview bound live, and neither belongs in the worker lifecycle.
+
+        Concurrency is the same as one synthesis: this holds the engine's lock
+        for the single RPC, so two decodes never share one model, and a CPU
+        engine does not touch the GPU owner slot (see ``_begin_job``).
+        """
+        async with self._worker_slot(
+            engine_id=engine_id, model_alias=model_alias, kind="transcribe"
+        ) as handle:
+            request_id = uuid.uuid4().hex
+            handle.in_flight.add(request_id)
+            handle.last_used_at = self.clock.now()
+            try:
+                reply = await handle.connection.request(
+                    {
+                        "id": request_id,
+                        "method": "transcribe",
+                        "model_alias": model_alias,
+                        "audio_path": str(audio_path),
+                        "language": language,
+                        "word_timestamps": word_timestamps,
+                        "hotwords": hotwords or [],
+                    },
+                    timeout=3600.0,
+                )
+            except (ConnectionError, OSError) as exc:
+                await self._handle_worker_death(handle, exc)
+                raise
+            finally:
+                handle.in_flight.discard(request_id)
+                handle.last_used_at = self.clock.now()
+
+            # Stamp on completion as well as on start: a long decode must not
+            # look stale to the LRU while it is the one being used.
+            handle.model_last_used[model_alias] = self.clock.now()
+
+            # A worker that answered an error is a *successful* RPC, so this is
+            # not the death path above: unwrap it into the shared taxonomy the
+            # same way synthesize does, so the caller sees CUDA_OOM/JOB_CANCELLED/
+            # MODEL_NOT_FOUND rather than a dict with an error_code in it.
+            if reply.get("error_code"):
+                raise AgentVoiceError(
+                    ErrorCode(reply["error_code"]),
+                    reply.get("message", "transcription failed"),
+                    reply.get("suggestion", ""),
+                )
+
+        return reply
+
     async def stream(
         self,
         *,
@@ -1515,9 +1595,15 @@ class WorkerManager:
         if self.settings.enable_vram_pressure_yield and not self.in_flight_count():
             free = self.vram.free_gb()
             if free is not None and free < self.settings.min_free_vram_gb:
-                for engine_id in list(self._workers):
+                for engine_id, handle in list(self._workers.items()):
+                    # Only GPU workers hold VRAM, so only they can give any back.
+                    # Killing a CPU worker because a game wants memory would throw
+                    # away a warm transcription model and free not one byte.
+                    if handle.record.manifest.device != "gpu":
+                        continue
                     await self._kill_worker(engine_id, reason="vram pressure")
-                self._active_engine = None
+                    if self._active_engine == engine_id:
+                        self._active_engine = None
 
     # -- helpers --------------------------------------------------------
     @staticmethod
@@ -1616,7 +1702,16 @@ class WorkerManager:
     async def gpu_status(self) -> dict[str, Any]:
         loaded = self.loaded_models()
         return {
+            # `active_engine` keeps its original meaning: the GPU owner. CPU
+            # workers are reported separately in `cpu_engines` so a caller can see
+            # a resident Phonon/Kokoro worker without mistaking it for one that
+            # holds VRAM.
             "active_engine": self._active_engine,
+            "cpu_engines": [
+                engine_id
+                for engine_id, handle in self._workers.items()
+                if handle.alive and handle.record.manifest.device == "cpu"
+            ],
             "loaded_models": [f"{k}:{m}" for k, v in loaded.items() for m in v],
             "workers": {
                 engine_id: ("alive" if handle.alive else "dead")

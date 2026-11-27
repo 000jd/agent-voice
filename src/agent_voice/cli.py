@@ -40,6 +40,10 @@ cache_app = typer.Typer(help="Inspect and clear the synthesis cache.", no_args_i
 pronunciations_app = typer.Typer(
     help="Manage the persistent pronunciation lexicon.", no_args_is_help=True
 )
+dub_app = typer.Typer(
+    help="Two-stage video dubbing: prepare here, translate in the agent, render here.",
+    no_args_is_help=True,
+)
 
 app.add_typer(engines_app, name="engines")
 app.add_typer(models_app, name="models")
@@ -47,6 +51,7 @@ app.add_typer(voices_app, name="voices")
 app.add_typer(bindings_app, name="bindings")
 app.add_typer(cache_app, name="cache")
 app.add_typer(pronunciations_app, name="pronunciations")
+app.add_typer(dub_app, name="dub")
 
 
 def _print(payload) -> None:
@@ -196,6 +201,404 @@ def unload(
         raise typer.Exit(code=1)
     response.raise_for_status()
     _print(response.json())
+
+
+# ---------------------------------------------------------------------------
+# transcribe
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def transcribe(
+    audio_or_video: Path = typer.Argument(
+        ...,
+        metavar="AUDIO_OR_VIDEO",
+        help="File to transcribe; confined to the inbox on an agent-shaped host.",
+    ),
+    engine: str | None = typer.Option(
+        None, "--engine", help="ASR engine id (default: AGENT_VOICE_DEFAULT_ASR_ENGINE)."
+    ),
+    model: str | None = typer.Option(
+        None, "--model", help="ASR model alias, e.g. phonon-2.5, or engine:alias."
+    ),
+    language: str | None = typer.Option(
+        None, "--language", help="Language hint; omit to let the backend detect it."
+    ),
+    hotwords: str = typer.Option(
+        "",
+        "--hotwords",
+        help="Comma-separated bias terms ('CUDA,Manim'), at most 25.",
+    ),
+    words: bool = typer.Option(
+        False, "--words", help="Include per-word start/end timestamps in segments."
+    ),
+    srt: bool = typer.Option(
+        False, "--srt", help="Also write .srt and .vtt sidecars next to the transcript."
+    ),
+    project: str | None = typer.Option(
+        None, "--project", help="Scoped-lexicon project whose terms become hotwords."
+    ),
+) -> None:
+    """Transcribe a local audio or video file, in-process, with no daemon.
+
+    Runs the same service the REST/MCP surfaces call, so the result is identical:
+    a `TranscribeResult` on stdout plus a one-line summary. The path goes through
+    `resolve_media_path`, the same inbox/MCP_BASE_PATH resolver an agent hits, so a
+    run that works here works there.
+    """
+    import asyncio
+
+    from .api.app import AppContext
+    from .api.routing import resolve_asr_target
+    from .schemas import AgentVoiceError, TranscribeRequest
+    from .security import resolve_media_path
+    from .services.transcribe_service import transcribe_media
+
+    settings = get_settings()
+    hotword_list = [term.strip() for term in hotwords.split(",") if term.strip()]
+    try:
+        # `absolute()` (not `resolve()`) so the operator's shell-relative path is
+        # anchored where they typed it before the resolver judges confinement.
+        # A relative path handed straight to `resolve_media_path` would be read
+        # against the inbox base, which is right for an agent but surprising at a
+        # prompt: `agent-voice transcribe data/inbox/clip.wav` must just work.
+        media = resolve_media_path(
+            str(Path(audio_or_video).expanduser().absolute()),
+            inbox_dir=settings.inbox_dir,
+            mcp_base_path=settings.mcp_base_path,
+            allow_any_path=settings.allow_any_path,
+        )
+        ctx = AppContext(settings)
+        target = resolve_asr_target(
+            settings=settings, registry=ctx.registry, engine=engine, model=model
+        )
+        # The schema is the admission gate: it validates the hotword cap and the
+        # project slug before any ffmpeg or worker work happens.
+        payload = TranscribeRequest(
+            audio_path=str(media),
+            engine=target.engine_id,
+            model=target.model_alias,
+            language=language,
+            hotwords=hotword_list or None,
+            word_timestamps=words,
+            export_srt=srt,
+            project=project,
+        )
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        # A pydantic validation error from the request schema, one line only.
+        typer.secho(f"BAD_REQUEST: {_one_line(exc)}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    async def run():
+        await ctx.workers.start()
+        try:
+            return await transcribe_media(
+                ctx,
+                audio_path=media,
+                target=target,
+                language=payload.language,
+                word_timestamps=payload.word_timestamps,
+                hotwords=payload.hotwords,
+                project=payload.project,
+                export_srt=payload.export_srt,
+                agent_id=None,
+            )
+        finally:
+            await ctx.workers.stop()
+
+    try:
+        result = asyncio.run(run())
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt:
+        typer.secho("interrupted", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=130) from None
+
+    _print(result.model_dump(mode="json"))
+    speed = (
+        f", {result.realtime_multiple:.1f}x realtime"
+        if result.realtime_multiple
+        else ""
+    )
+    typer.secho(
+        f"{result.segments_count} segments, {result.duration_sec:.1f} s audio"
+        f"{speed} -> {result.transcript_json_path or result.engine_id}",
+        fg=typer.colors.GREEN,
+    )
+
+
+# ---------------------------------------------------------------------------
+# dub
+# ---------------------------------------------------------------------------
+
+
+def _load_dub_segments(path: Path) -> list:
+    """Parse a translated-lines file: a bare JSON array or `{"segments": [...]}`.
+
+    Both shapes show up in practice: an agent that just translated the list writes
+    the array, while an agent that round-trips `prepare`'s result writes the
+    object. Accepting both avoids a pointless edit step on either side.
+    """
+    from .schemas import AgentVoiceError, DubSegmentSpec, ErrorCode
+
+    try:
+        raw = json.loads(path.read_text("utf-8"))
+    except OSError as exc:
+        raise AgentVoiceError(
+            ErrorCode.BAD_REQUEST,
+            f"cannot read segments file: {path} ({_one_line(exc)})",
+            "Pass a path to a JSON file you can read.",
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise AgentVoiceError(
+            ErrorCode.BAD_REQUEST,
+            f"segments file is not valid JSON: {exc}",
+            'Write a JSON array of segments, or an object with a "segments" key.',
+        ) from exc
+
+    if isinstance(raw, dict):
+        raw = raw.get("segments")
+    if not isinstance(raw, list) or not raw:
+        raise AgentVoiceError(
+            ErrorCode.BAD_REQUEST,
+            f"segments file must contain a non-empty list: {path}",
+            'Write a JSON array of {index, start_sec, end_sec, text}, or an object '
+            'with a "segments" key holding one.',
+        )
+    try:
+        return [DubSegmentSpec(**entry) for entry in raw]
+    except (TypeError, ValueError) as exc:
+        raise AgentVoiceError(
+            ErrorCode.BAD_REQUEST,
+            f"segments file has an invalid entry: {_one_line(exc)}",
+            "Each segment needs index, start_sec, end_sec and text; the rest is optional.",
+        ) from exc
+
+
+@dub_app.command("prepare")
+def dub_prepare(
+    media: Path = typer.Argument(..., metavar="MEDIA", help="Source video or audio to dub."),
+    asr_engine: str | None = typer.Option(
+        None, "--asr-engine", help="ASR engine id (default: the configured ASR engine)."
+    ),
+    asr_model: str | None = typer.Option(
+        None, "--asr-model", help="ASR model alias, or engine:alias."
+    ),
+    language: str | None = typer.Option(
+        None, "--language", help="Source-language hint; omit to auto-detect."
+    ),
+    hotwords: str = typer.Option(
+        "", "--hotwords", help="Comma-separated bias terms ('CUDA,Manim'), at most 25."
+    ),
+    speaker_ref: bool = typer.Option(
+        True,
+        "--speaker-ref/--no-speaker-ref",
+        help="Extract a speaker reference clip, so a render can clone the source voice.",
+    ),
+    project: str | None = typer.Option(
+        None, "--project", help="Scoped-lexicon project whose terms become hotwords."
+    ),
+) -> None:
+    """Stage 1 of dubbing: transcribe, extract the bed and a speaker reference.
+
+    Writes `<DATA_DIR>/dubs/<dub_id>/project.json` and returns the timed source
+    segments. Translation happens in *your* context — there is no bundled
+    translation model — then `dub render` speaks the translated lines.
+    """
+    import asyncio
+
+    from .api.app import AppContext
+    from .schemas import AgentVoiceError, DubPrepareRequest
+    from .security import resolve_media_path
+    from .services.dub_service import prepare_dub
+
+    settings = get_settings()
+    hotword_list = [term.strip() for term in hotwords.split(",") if term.strip()]
+    try:
+        # Anchored the same way as `transcribe`: a CLI path is relative to the
+        # operator's cwd, while the resolver's own base is the inbox.
+        media_path = resolve_media_path(
+            str(Path(media).expanduser().absolute()),
+            inbox_dir=settings.inbox_dir,
+            mcp_base_path=settings.mcp_base_path,
+            allow_any_path=settings.allow_any_path,
+        )
+        payload = DubPrepareRequest(
+            media_path=str(media_path),
+            source_language=language,
+            asr_engine=asr_engine,
+            asr_model=asr_model,
+            hotwords=hotword_list or None,
+            extract_speaker_ref=speaker_ref,
+            project=project,
+        )
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.secho(f"BAD_REQUEST: {_one_line(exc)}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    ctx = AppContext(settings)
+
+    async def run():
+        await ctx.workers.start()
+        try:
+            return await prepare_dub(ctx, payload)
+        finally:
+            await ctx.workers.stop()
+
+    try:
+        result = asyncio.run(run())
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt:
+        typer.secho("interrupted", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=130) from None
+
+    _print(result.model_dump(mode="json"))
+    typer.secho(
+        f"dub {result.dub_id}: {len(result.segments)} segments, "
+        f"speaker ref {result.speaker_ref_path or '(none)'}",
+        fg=typer.colors.GREEN,
+    )
+
+
+@dub_app.command("render")
+def dub_render(
+    dub_id: str = typer.Argument(..., metavar="DUB_ID", help="The id `dub prepare` returned."),
+    segments_json: Path = typer.Argument(
+        ...,
+        metavar="SEGMENTS_JSON",
+        help='Translated lines: a JSON array, or an object with a "segments" key.',
+    ),
+    voice: str | None = typer.Option(
+        None, "--voice", help="Registered voice id or name to speak the lines."
+    ),
+    speaker: str | None = typer.Option(
+        None, "--speaker", help="Preset timbre instead of a cloned voice."
+    ),
+    auto_clone_source: bool = typer.Option(
+        False,
+        "--auto-clone-source",
+        help="Clone the source speaker from the prepared reference clip.",
+    ),
+    engine: str | None = typer.Option(None, "--engine", help="TTS engine id."),
+    model: str | None = typer.Option(None, "--model", help="TTS model alias."),
+    quality: Literal["high", "fast"] = typer.Option(
+        "high", "--quality", help="high | fast, when --model is left unset."
+    ),
+    keep_bed: bool = typer.Option(
+        True,
+        "--bed/--no-bed",
+        help="Keep the original audio bed, ducked under the voice (default), or replace it.",
+    ),
+    bed_duck_db: float = typer.Option(
+        -18.0, "--bed-duck-db", min=-40.0, max=0.0, help="Duck depth for the original bed."
+    ),
+    max_atempo: float = typer.Option(
+        1.35,
+        "--max-atempo",
+        min=1.0,
+        max=2.0,
+        help="Hard ceiling on speed-up; an over-long line is reported, never cut.",
+    ),
+    srt: bool = typer.Option(
+        True, "--srt/--no-srt", help="Write .srt and .vtt from the translated segments."
+    ),
+    burn_subtitles: bool = typer.Option(
+        False, "--burn-subtitles", help="Burn the subtitles into the video (re-encodes)."
+    ),
+    project: str | None = typer.Option(
+        None, "--project", help="Scoped-lexicon project for the spoken lines."
+    ),
+) -> None:
+    """Stage 2 of dubbing: speak the translated lines into their original slots.
+
+    Each line is synthesised through the ordinary voice path (cache, markup,
+    lexicon), retimed into its slot up to `--max-atempo`, placed on a timeline and
+    mixed with the original bed. A line that still overruns is reported in
+    `overflow_warnings` — never truncated.
+    """
+    import asyncio
+
+    from .api.app import AppContext
+    from .schemas import AgentVoiceError, DubRenderRequest
+    from .services.dub_service import render_dub
+
+    settings = get_settings()
+    try:
+        segments = _load_dub_segments(segments_json)
+        payload = DubRenderRequest(
+            dub_id=dub_id,
+            segments=segments,
+            voice=voice,
+            speaker=speaker,
+            auto_clone_source=auto_clone_source,
+            engine=engine,
+            model=model,
+            quality=quality,
+            keep_original_bed=keep_bed,
+            bed_duck_db=bed_duck_db,
+            max_atempo=max_atempo,
+            export_srt=srt,
+            burn_subtitles=burn_subtitles,
+            project=project,
+        )
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.secho(f"BAD_REQUEST: {_one_line(exc)}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    ctx = AppContext(settings)
+
+    async def run():
+        await ctx.workers.start()
+        try:
+            return await render_dub(ctx, payload)
+        finally:
+            await ctx.workers.stop()
+
+    try:
+        result = asyncio.run(run())
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt:
+        typer.secho("interrupted", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=130) from None
+
+    _print(result.model_dump(mode="json"))
+    typer.secho(
+        f"dub {result.dub_id}: {result.segments_count} segments "
+        f"({result.cached_segments} cached) -> {result.file_path}",
+        fg=typer.colors.GREEN,
+    )
+    for warning in result.overflow_warnings:
+        typer.secho(
+            f"warning: segment {warning.index} is {warning.audio_sec:.2f} s in a "
+            f"{warning.slot_sec:.2f} s slot at {warning.atempo:.2f}x; shorten the line",
+            fg=typer.colors.YELLOW,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +1019,84 @@ def _espeak_check(entries) -> _Check | None:
     return _Check("espeak-ng", "PASS", f"{path} {version}" if version else path)
 
 
+def _asr_check(entries, settings) -> _Check:
+    """Is the configured default ASR engine actually installed?
+
+    A WARN, never a FAIL: speaking works fine with no ASR engine at all, and a
+    checkout that never transcribes should not fail `doctor`. When the engine *is*
+    there, name its aliases — that is the value a caller would otherwise get by
+    running `models list`.
+    """
+    engine_id = settings.default_asr_engine
+    installed = {entry.engine_id for entry in entries if entry.installed}
+    discovered = {entry.engine_id for entry in entries}
+
+    if engine_id not in installed:
+        if engine_id not in discovered:
+            detail = f"AGENT_VOICE_DEFAULT_ASR_ENGINE={engine_id} is not a discovered engine"
+        else:
+            detail = f"AGENT_VOICE_DEFAULT_ASR_ENGINE={engine_id} is not installed"
+        return _Check(
+            "asr",
+            "WARN",
+            detail,
+            f"agent-voice engines install {engine_id} (needed for transcribe/dubbing)",
+        )
+
+    aliases = [
+        model.alias
+        for entry in entries
+        if entry.engine_id == engine_id
+        for model in entry.models
+    ]
+    return _Check(
+        "asr",
+        "PASS",
+        f"{engine_id}: {', '.join(aliases) or '(no models declared)'}",
+    )
+
+
+def _dub_filters_check() -> _Check:
+    """Does this ffmpeg have the filters a ducked dubbing mix needs?
+
+    `sidechaincompress` + `alimiter` are what make `keep_original_bed=True` duck
+    the source under the voice instead of burying it. An older or minimal ffmpeg
+    build can lack them; dubbing still completes with a plain mix, so this is a
+    WARN. `ffmpeg` itself missing is already a FAIL on the ffmpeg row — this check
+    never duplicates it.
+    """
+    import shutil
+    import subprocess
+
+    binary = shutil.which("ffmpeg")
+    if binary is None:
+        # The ffmpeg row owns the failure. One root cause, one row.
+        return _Check("dub filters", "PASS", "skipped: ffmpeg row reports the problem")
+
+    # argv list, shell=False: no string ever reaches a shell.
+    argv = [binary, "-hide_banner", "-filters"]
+    try:
+        result = subprocess.run(argv, shell=False, capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _Check(
+            "dub filters",
+            "WARN",
+            f"ffmpeg -filters did not run: {_one_line(exc)}",
+            "dubbing with keep_original_bed=true will fall back to a plain mix",
+        )
+
+    listing = (result.stdout or b"").decode("utf-8", "replace")
+    missing = [name for name in ("sidechaincompress", "alimiter") if name not in listing]
+    if not missing:
+        return _Check("dub filters", "PASS", "sidechaincompress, alimiter")
+    return _Check(
+        "dub filters",
+        "WARN",
+        f"missing: {', '.join(missing)}",
+        "dubbing with keep_original_bed=true will fall back to a plain mix",
+    )
+
+
 @app.command()
 def doctor() -> None:
     """Check this machine and checkout: tools, GPU, port, engines, weights, config.
@@ -697,6 +1178,9 @@ def doctor() -> None:
         )
     else:
         checks.append(_Check("ffmpeg", "PASS", f"{ffmpeg} (ffprobe present)"))
+    # Directly after the ffmpeg row: it is a property of that same binary. Never a
+    # FAIL — without these two filters a ducked dub mix degrades to a plain one.
+    checks.append(_dub_filters_check())
 
     checks.append(_probe_gpu())
     # Engine-specific tool rows (`espeak-ng` for Kokoro) belong with the tool
@@ -721,6 +1205,10 @@ def doctor() -> None:
         checks.append(registry_error)
     else:
         checks.extend(_engine_checks(entries, settings.engines_dir, default_engine))
+        # After the engine rows and before the weights: an ASR engine is a separate
+        # plugin family from the speaking default, so its own row belongs next to
+        # the engines it is judged against. WARN only — a TTS-only box is fine.
+        checks.append(_asr_check(entries, settings))
         checks.extend(_model_checks(entries))
     checks.append(_inbox_check(settings))
     # Daemon health last: it is the only row that can legitimately be "in use".
@@ -946,6 +1434,24 @@ STEP_NAMES: tuple[str, ...] = (
     "health",
     "shutdown",
 )
+"""The TTS step table: what a `kind: tts` worker must pass."""
+
+ASR_STEP_NAMES: tuple[str, ...] = (
+    "spawn+connect",
+    "hello",
+    "load_model",
+    "transcribe",
+    "cancel",
+    "health",
+    "shutdown",
+)
+"""The ASR step table. Same length and the same tail as :data:`STEP_NAMES`.
+
+Deliberately a sibling tuple rather than a dict keyed by kind: the table shape is
+what makes two runs comparable, and one row differs between the two families —
+`synthesize` becomes `transcribe`. Kept in step with :data:`STEP_NAMES` by length
+so a future step added to one is visibly missing from the other.
+"""
 
 
 @dataclass
@@ -1022,6 +1528,25 @@ def engines_test(engine_id: str) -> None:
     typer.secho(f"{engine_id}: IPC v1 conformance passed", fg=typer.colors.GREEN)
 
 
+def _asr_probe_wav(path: Path, seconds: float) -> Path:
+    """Write a deterministic 16 kHz mono WAV for the ASR conformance steps.
+
+    Two sine partials rather than clean silence: a real ASR backend given pure
+    silence legitimately returns no segments at all, and a conformance step that
+    demands words from silence would fail a healthy worker. A tone is not speech,
+    so the step still only requires a well-formed reply, never a transcript.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    sr = 16_000
+    n = max(1, int(sr * seconds))
+    t = np.linspace(0.0, seconds, n, endpoint=False)
+    signal = 0.18 * np.sin(2 * np.pi * 180 * t) + 0.10 * np.sin(2 * np.pi * 640 * t)
+    sf.write(path, signal.astype(np.float32), sr, subtype="PCM_16")
+    return path
+
+
 def _reference_voice(voices) -> tuple[str, str, bool]:
     """Pick a reference voice: the configured default, else the first registered.
 
@@ -1080,19 +1605,32 @@ def _probe_voice(voices, tmpdir: Path):
     )
 
 
-def _skip_rest(steps: list[_Step], reason: str) -> list[_Step]:
-    """Mark every step not yet appended as SKIP, so the table keeps its shape."""
-    for name in STEP_NAMES[len(steps) :]:
+def _skip_rest(
+    steps: list[_Step], reason: str, *, names: tuple[str, ...] = STEP_NAMES
+) -> list[_Step]:
+    """Mark every step not yet appended as SKIP, so the table keeps its shape.
+
+    ``names`` is the table the run is filling in, passed in rather than read from
+    the module: a TTS run fills :data:`STEP_NAMES`, an ASR run :data:`ASR_STEP_NAMES`,
+    and reading one of them unconditionally would print the wrong row labels for
+    the other.
+    """
+    for name in names[len(steps) :]:
         steps.append(_Step(name, None, reason))
     return steps
 
 
 def _conformance_target(registry, engine_id: str) -> tuple[str, str | None, str]:
-    """Pick ``(mode, speaker, model_alias)`` for the conformance synthesize step.
+    """Pick ``(kind, speaker, model_alias)`` for the conformance compute step.
 
-    A clone model comes first: cloning is the v1 path every engine had to support
-    before v0.4.0, and CustomVoice/VoiceDesign aliases can share its quality tier,
-    so an unfiltered pick could load a checkpoint that cannot clone.
+    ``kind`` is a *step kind*, not a model mode: ``"transcribe"`` for an
+    ``kind: asr`` engine, otherwise the model mode to synthesise with
+    (``"clone"`` / ``"custom_voice"``). The ASR branch runs first and returns
+    immediately, because an ASR manifest has no ``mode`` to select on at all.
+
+    For TTS, a clone model comes first: cloning is the v1 path every engine had to
+    support before v0.4.0, and CustomVoice/VoiceDesign aliases can share its quality
+    tier, so an unfiltered pick could load a checkpoint that cannot clone.
 
     A preset-only engine has no clone alias at all — Kokoro declares
     ``voice_clone: false`` and a single ``custom_voice`` model — so it is
@@ -1102,6 +1640,11 @@ def _conformance_target(registry, engine_id: str) -> tuple[str, str | None, str]
     never pass its own conformance gate.
     """
     from .schemas import AgentVoiceError
+
+    if registry.get(engine_id).manifest.kind == "asr":
+        # No reference clip and no preset timbre on this path: a transcription
+        # needs an audio file and a model alias, both of which the step builds.
+        return "transcribe", None, registry.default_asr_model_alias(engine_id)
 
     try:
         alias = registry.default_model_alias(engine_id, mode="clone")
@@ -1118,8 +1661,233 @@ def _conformance_target(registry, engine_id: str) -> tuple[str, str | None, str]
         return "custom_voice", speaker, alias
 
 
+async def _conformance_tail(
+    *, handle, steps: list[_Step], names: tuple[str, ...]
+) -> list[_Step]:
+    """The `health` → `shutdown` tail, shared by both engine families.
+
+    Both kinds of worker multiplex the same JSON RPCs, so a health/shutdown check
+    that ran only for TTS would leave half the daemon's workers unverified.
+    """
+    import asyncio
+    import time
+    import uuid
+
+    # -- health -----------------------------------------------------
+    # The protocol's health RPC is what a manager uses to check a live
+    # worker, so a conformance run that never calls it is not exercising v1.
+    try:
+        reply = await handle.connection.request(
+            {"id": uuid.uuid4().hex, "method": "health"}, timeout=15.0
+        )
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        steps.append(_Step("health", False, f"no reply: {exc}"))
+        return _skip_rest(steps, "worker did not answer health", names=names)
+
+    health_ok = reply.get("error_code") is None and reply.get("ok") is True
+    if health_ok:
+        detail = (
+            f"ok=True loaded_models={reply.get('loaded_models')} "
+            f"in_flight={reply.get('in_flight')}"
+        )
+    else:
+        detail = f"{reply.get('error_code')}: {reply.get('message')}"
+    steps.append(_Step("health", health_ok, detail))
+
+    # -- shutdown ---------------------------------------------------
+    started = time.perf_counter()
+    try:
+        reply = await handle.connection.request(
+            {"id": uuid.uuid4().hex, "method": "shutdown"}, timeout=15.0
+        )
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        steps.append(_Step("shutdown", False, f"no acknowledgement: {exc}"))
+        return steps
+
+    acknowledged = reply.get("error_code") is None and reply.get("ok") is True
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline and handle.process.poll() is None:
+        await asyncio.sleep(0.05)
+    exit_code = handle.process.poll()
+    shipped = time.perf_counter() - started
+    if not acknowledged:
+        detail = f"{reply.get('error_code')}: {reply.get('message')}"
+    elif exit_code is None:
+        detail = "acknowledged, but the process is still alive after 15 s"
+    else:
+        detail = f"acknowledged, exited rc={exit_code} in {shipped:.2f} s"
+    steps.append(_Step("shutdown", bool(acknowledged and exit_code is not None), detail))
+    return steps
+
+
+async def _conformance_transcribe(
+    *, handle, workdir: Path, alias: str, steps: list[_Step]
+) -> bool:
+    """The ASR compute step. Returns False when the table should stop here.
+
+    A 1 s tone is deliberate: a real backend handed silence may legitimately emit
+    no segments, so demanding words would fail a healthy worker. What *is*
+    required is a well-formed reply — no `error_code`, `segments` a list, `text` a
+    string — because that is what the parent actually parses.
+    """
+    import time
+    import uuid
+
+    audio = _asr_probe_wav(workdir / "conformance-asr.wav", 1.0)
+    started = time.perf_counter()
+    try:
+        reply = await handle.connection.request(
+            {
+                "id": uuid.uuid4().hex,
+                "method": "transcribe",
+                "model_alias": alias,
+                "audio_path": str(audio),
+                "language": None,
+                "word_timestamps": True,
+                "hotwords": [],
+            },
+            timeout=1800.0,
+        )
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        steps.append(_Step("transcribe", False, f"IPC error: {exc}"))
+        return False
+
+    elapsed = time.perf_counter() - started
+    segments = reply.get("segments")
+    text = reply.get("text")
+    ok = (
+        reply.get("error_code") is None
+        and isinstance(segments, list)
+        and isinstance(text, str)
+    )
+    if reply.get("error_code") is not None:
+        detail = f"{reply.get('error_code')}: {reply.get('message')}"
+    elif not isinstance(segments, list):
+        detail = f"segments is {type(segments).__name__}, expected a list"
+    elif not isinstance(text, str):
+        detail = f"text is {type(text).__name__}, expected a string"
+    else:
+        detail = f"{len(segments)} segments, {len(text)} chars in {elapsed:.2f} s"
+    steps.append(_Step("transcribe", ok, detail))
+    return ok
+
+
+async def _conformance_asr_cancel(
+    *, handle, workdir: Path, alias: str, steps: list[_Step]
+) -> None:
+    """Exercise `cancel` against a transcribe that may still be decoding.
+
+    A CPU decode of a short clip can finish faster than the round trip, and
+    claiming a cancellation that did not happen would be a lie. So the step
+    passes on a **well-formed** `{cancelled: bool}` reply and records which of the
+    two things actually happened. The audio is long on purpose: it gives a real
+    backend something to still be working on when the cancel arrives.
+
+    The transcribe is issued from a background thread (`run_coroutine_threadsafe`
+    onto this loop) so the socket reader stays free to carry the `cancel`, exactly
+    as the manager issues its own requests.
+    """
+    import asyncio
+    import threading
+    import time
+    import uuid
+
+    long_audio = _asr_probe_wav(workdir / "conformance-asr-long.wav", 20.0)
+    request_id = uuid.uuid4().hex
+    loop = asyncio.get_running_loop()
+    submitted = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def worker() -> None:
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                handle.connection.request(
+                    {
+                        "id": request_id,
+                        "method": "transcribe",
+                        "model_alias": alias,
+                        "audio_path": str(long_audio),
+                        "language": None,
+                        "word_timestamps": False,
+                        "hotwords": [],
+                    },
+                    timeout=1800.0,
+                ),
+                loop,
+            )
+            submitted.set()
+            outcome["reply"] = future.result(timeout=1800.0)
+        except Exception as exc:  # noqa: BLE001 - reported, never raised into the table
+            submitted.set()
+            outcome["error"] = exc
+
+    handle.in_flight.add(request_id)
+    started = time.perf_counter()
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    await asyncio.to_thread(submitted.wait, 10.0)
+
+    # Wait until the worker itself says a request is in flight, rather than
+    # assuming it: `health` is the protocol's own answer to that question, and a
+    # cancel sent before the decode starts would prove nothing.
+    in_flight = False
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and thread.is_alive():
+        try:
+            probe = await handle.connection.request(
+                {"id": uuid.uuid4().hex, "method": "health"}, timeout=5.0
+            )
+        except (ConnectionError, TimeoutError, OSError):
+            break
+        if int(probe.get("in_flight") or 0) >= 1:
+            in_flight = True
+            break
+        await asyncio.sleep(0.02)
+
+    try:
+        reply = await handle.connection.request(
+            {
+                "id": uuid.uuid4().hex,
+                "method": "cancel",
+                "target_request_id": request_id,
+            },
+            timeout=10.0,
+        )
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        reply = {"error_code": "IPC_ERROR", "message": str(exc)}
+
+    cancelled = reply.get("cancelled")
+    ok = reply.get("error_code") is None and isinstance(cancelled, bool)
+    if reply.get("error_code") is not None:
+        detail = (
+            f"no cancel acknowledgement: {reply.get('error_code')} "
+            f"{reply.get('message', '')}"
+        ).strip()
+    elif not isinstance(cancelled, bool):
+        detail = f"cancelled is {type(cancelled).__name__}, expected a bool"
+    elif cancelled:
+        detail = f"worker acknowledged cancel after {time.perf_counter() - started:.2f} s"
+    elif in_flight:
+        detail = "transcribe finished before the cancel landed (cancelled=False)"
+    else:
+        detail = "transcribe finished before cancel landed (never in flight)"
+    steps.append(_Step("cancel", ok, detail))
+
+    # Let the background request settle before shutdown, so the last row is not
+    # racing a live decode on a socket that is about to close.
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(thread.join, 180.0)
+    handle.in_flight.discard(request_id)
+
+
 async def _run_conformance(*, record, registry, settings) -> list[_Step]:
-    """Drive one worker: spawn → hello → load → synthesize → cancel → shutdown."""
+    """Drive one worker: spawn → hello → load → synthesize|transcribe → cancel.
+
+    The table is chosen from the manifest's ``kind``: a ``tts`` engine fills
+    :data:`STEP_NAMES`, an ``asr`` engine :data:`ASR_STEP_NAMES`. Everything after
+    the compute step — cancel, health, shutdown — is shared, because it exercises
+    the same JSON multiplexing on either kind of worker.
+    """
     import asyncio
     import shutil
     import tempfile
@@ -1132,6 +1900,9 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
     from .worker_manager import WorkerManager
 
     engine_id = record.engine_id
+    # One table for the whole run: every _skip_rest call needs the labels of the
+    # rows that will never be appended, and a mixed table would mislabel them.
+    step_names = ASR_STEP_NAMES if record.manifest.kind == "asr" else STEP_NAMES
     steps: list[_Step] = []
     workdir = Path(tempfile.mkdtemp(prefix="agent-voice-conformance-"))
     voices = VoiceStore(settings.voices_dir, max_ref_text_chars=settings.max_ref_text_chars)
@@ -1166,7 +1937,7 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
                 )
             )
             steps.append(_Step("hello", False, f"{exc.error_code}: {exc.message}"))
-            return _skip_rest(steps, "not attempted")
+            return _skip_rest(steps, "not attempted", names=step_names)
         elapsed = time.perf_counter() - started
         steps.append(
             _Step("spawn+connect", True, f"pid {handle.process.pid}, ready in {elapsed:.2f} s")
@@ -1185,16 +1956,16 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
             )
         )
         if not hello_ok:
-            return _skip_rest(steps, "hello handshake invalid")
+            return _skip_rest(steps, "hello handshake invalid", names=step_names)
 
         # -- load_model -------------------------------------------------
-        # Clone first, preset timbres second: the target decides which mode and
-        # speaker the synthesize step sends, so it is resolved before any load.
+        # Clone first, preset timbres second: the target decides which step runs
+        # and what it sends, so it is resolved before any load.
         try:
-            mode, speaker, alias = _conformance_target(registry, engine_id)
+            kind, speaker, alias = _conformance_target(registry, engine_id)
         except AgentVoiceError as exc:
             steps.append(_Step("load_model", False, exc.message))
-            return _skip_rest(steps, "no model alias to load")
+            return _skip_rest(steps, "no model alias to load", names=step_names)
         try:
             reply = await handle.connection.request(
                 {"id": uuid.uuid4().hex, "method": "load_model", "model_alias": alias},
@@ -1202,23 +1973,41 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
             )
         except (ConnectionError, TimeoutError, OSError) as exc:
             steps.append(_Step("load_model", False, f"IPC error: {exc}"))
-            return _skip_rest(steps, "worker connection lost")
+            return _skip_rest(steps, "worker connection lost", names=step_names)
 
         load_ok = reply.get("error_code") is None and reply.get("model_alias") == alias
         detail = (
-            f"alias={alias} mode={mode} loaded_models={reply.get('loaded_models')}"
+            f"alias={alias} as={kind} loaded_models={reply.get('loaded_models')}"
             if reply.get("error_code") is None
             else f"{reply.get('error_code')}: {reply.get('message')}"
         )
         steps.append(_Step("load_model", load_ok, detail))
         if not load_ok:
-            return _skip_rest(steps, "model failed to load")
+            return _skip_rest(steps, "model failed to load", names=step_names)
+
+        # -- transcribe (asr) or synthesize (tts) ------------------------
+        # One row differs between the two families; the cancel/health/shutdown
+        # tail below is shared because it exercises the same JSON multiplexing.
+        if kind == "transcribe":
+            finished = await _conformance_transcribe(
+                handle=handle, workdir=workdir, alias=alias, steps=steps
+            )
+            if not finished:
+                return _skip_rest(
+                    steps, "cannot exercise cancel after a failed transcribe",
+                    names=step_names,
+                )
+            await _conformance_asr_cancel(
+                handle=handle, workdir=workdir, alias=alias, steps=steps
+            )
+            return await _conformance_tail(handle=handle, steps=steps, names=step_names)
 
         # -- synthesize -------------------------------------------------
         # A clone target speaks a reference clip; a preset target must not send
         # one (routing refuses voice + custom_voice), so it speaks its speaker.
+        # `kind` is the model mode here: only "transcribe" left the TTS path.
         ref_wav, ref_text, x_vector_only = "", "", False
-        if mode == "clone":
+        if kind == "clone":
             ref_wav, ref_text, x_vector_only = _reference_voice(voices)
             if not ref_wav and record.manifest.capabilities.voice_clone:
                 # A cloning engine cannot synthesise without a reference, so a
@@ -1244,7 +2033,7 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
                     "ref_wav_path": ref_wav,
                     "ref_text": ref_text,
                     "x_vector_only_mode": x_vector_only,
-                    "mode": mode,
+                    "mode": kind,
                     "speaker": speaker,
                     "prompt_cache_path": None,
                     "wav_path": str(wav_path),
@@ -1256,7 +2045,7 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
             )
         except (ConnectionError, TimeoutError, OSError) as exc:
             steps.append(_Step("synthesize", False, f"IPC error: {exc}"))
-            return _skip_rest(steps, "worker connection lost")
+            return _skip_rest(steps, "worker connection lost", names=step_names)
 
         synth_seconds = time.perf_counter() - started
         produced = Path(reply.get("wav_path") or wav_path)
@@ -1277,14 +2066,18 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
             detail = f"{duration:.2f} s of audio in {synth_seconds:.2f} s -> {produced.name}"
         steps.append(_Step("synthesize", synth_ok, detail))
         if not synth_ok:
-            return _skip_rest(steps, "cannot exercise cancel after a failed synthesis")
+            return _skip_rest(
+                steps,
+                "cannot exercise cancel after a failed synthesis",
+                names=step_names,
+            )
 
         # -- stream + cancel --------------------------------------------
         # A long text, so the cancel reliably lands while audio is still coming.
         stream_text = " ".join(["conformance"] * 60)
         try:
             voice_id = None
-            if mode == "clone" and ref_wav:
+            if kind == "clone" and ref_wav:
                 # Without a reference the cloning engines never decode at all, so
                 # the cancel below would acknowledge a stream that never started
                 # and prove nothing. Reuse whichever voice the synthesize step used.
@@ -1299,12 +2092,12 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
                 voice_id=voice_id,
                 ref_text=ref_text,
                 x_vector_only=x_vector_only,
-                mode=mode,
+                mode=kind,
                 speaker=speaker,
             )
         except (AgentVoiceError, ConnectionError, TimeoutError, OSError) as exc:
             steps.append(_Step("cancel", False, f"stream did not start: {exc}"))
-            return _skip_rest(steps, "stream did not start")
+            return _skip_rest(steps, "stream did not start", names=step_names)
 
         # Wait for real audio first: cancelling a stream that produced nothing
         # would prove nothing about a live decode.
@@ -1354,51 +2147,7 @@ async def _run_conformance(*, record, registry, settings) -> list[_Step]:
             with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
                 await asyncio.wait_for(asyncio.shield(task), timeout=30.0)
 
-        # -- health -----------------------------------------------------
-        # The protocol's health RPC is what a manager uses to check a live
-        # worker, so a conformance run that never calls it is not exercising v1.
-        try:
-            reply = await handle.connection.request(
-                {"id": uuid.uuid4().hex, "method": "health"}, timeout=15.0
-            )
-        except (ConnectionError, TimeoutError, OSError) as exc:
-            steps.append(_Step("health", False, f"no reply: {exc}"))
-            return _skip_rest(steps, "worker did not answer health")
-
-        health_ok = reply.get("error_code") is None and reply.get("ok") is True
-        if health_ok:
-            detail = (
-                f"ok=True loaded_models={reply.get('loaded_models')} "
-                f"in_flight={reply.get('in_flight')}"
-            )
-        else:
-            detail = f"{reply.get('error_code')}: {reply.get('message')}"
-        steps.append(_Step("health", health_ok, detail))
-
-        # -- shutdown ---------------------------------------------------
-        started = time.perf_counter()
-        try:
-            reply = await handle.connection.request(
-                {"id": uuid.uuid4().hex, "method": "shutdown"}, timeout=15.0
-            )
-        except (ConnectionError, TimeoutError, OSError) as exc:
-            steps.append(_Step("shutdown", False, f"no acknowledgement: {exc}"))
-            return steps
-
-        acknowledged = reply.get("error_code") is None and reply.get("ok") is True
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline and handle.process.poll() is None:
-            await asyncio.sleep(0.05)
-        exit_code = handle.process.poll()
-        shipped = time.perf_counter() - started
-        if not acknowledged:
-            detail = f"{reply.get('error_code')}: {reply.get('message')}"
-        elif exit_code is None:
-            detail = "acknowledged, but the process is still alive after 15 s"
-        else:
-            detail = f"acknowledged, exited rc={exit_code} in {shipped:.2f} s"
-        steps.append(_Step("shutdown", bool(acknowledged and exit_code is not None), detail))
-        return steps
+        return await _conformance_tail(handle=handle, steps=steps, names=step_names)
     finally:
         # The shutdown step already retired this worker. Re-issuing shutdown from
         # manager.stop() would write to a closed socket and leave an un-retrieved
@@ -1571,13 +2320,23 @@ def models_download(
     """Download a model into the Hugging Face cache."""
     from huggingface_hub import snapshot_download
 
-    from .engine_registry import EngineRegistry, hf_model_downloaded
+    from .engine_registry import EngineRegistry, weights_downloaded
 
     settings = get_settings()
     registry = EngineRegistry(settings.engines_dir)
     spec = registry.model_spec(engine_id, model_alias)
+    manifest = registry.get(engine_id).manifest
 
-    if hf_model_downloaded(spec.hf_repo):
+    if spec.hf_repo.startswith("local/"):
+        typer.secho(
+            f"{spec.hf_repo} ships with the engine; nothing to download",
+            fg=typer.colors.GREEN,
+        )
+        return
+    # Backend-aware on purpose: Phonon stores a packed .fsq archive that the
+    # plain HF cache probe does not recognise, so asking hf_model_downloaded()
+    # here would re-run snapshot_download on every invocation.
+    if weights_downloaded(spec, manifest):
         typer.secho(f"{spec.hf_repo} already present locally", fg=typer.colors.GREEN)
         return
 
