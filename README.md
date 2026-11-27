@@ -2,7 +2,7 @@
 
 # agent-voice
 
-**Headless, UI-free, multi-engine voice cloning, speech synthesis and transcription server for AI agents.**
+**Headless, local-first, multi-engine voice cloning, speech synthesis and transcription server for AI agents.** A static Svelte preview UI lives in [`frontend/`](frontend/); the daemon remains headless.
 
 [![Release](https://img.shields.io/badge/release-v0.6.0-blue)](CHANGELOG.md)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue)](pyproject.toml)
@@ -500,6 +500,27 @@ answer `transcribe`; `device: cpu` engines skip the GPU slot entirely. See
 [docs/engines.md](docs/engines.md) and
 [engines/ADDING_AN_ENGINE.md](engines/ADDING_AN_ENGINE.md).
 
+## Web UI (preview)
+
+A static Svelte 5 + SvelteKit 3 SPA lives in [`frontend/`](frontend/). It is a REST
+client of the same daemon, built for a future `/ui` mount. The daemon, CLI and MCP
+server stay headless, and Python users never need Node or Bun to install or run
+`agent-voice`.
+
+The scaffold has a dashboard that reads `/health` and `/v1/engines`; the other routes
+are explicit placeholders. The daemon does not serve `/ui` yet. Development only:
+
+```bash
+cd frontend
+nvm use                 # Node 24.22.3 (.nvmrc)
+bun install
+bun run dev             # http://127.0.0.1:5173/ui/ (proxies to :8000)
+```
+
+See [frontend/README.md](frontend/README.md) for the dev-key proxy rule, scripts and
+the static serving contract, and [docs/frontend/architecture.md](docs/frontend/architecture.md)
+for the future `/ui` mount and package-data plan.
+
 ## Security & consent
 
 - **Loopback by default.** The daemon binds `127.0.0.1`; a pure ASGI guard rejects
@@ -530,6 +551,7 @@ answer `transcribe`; `device: cpu` engines skip the GPU slot entirely. See
 | [docs/troubleshooting.md](docs/troubleshooting.md) | espeak-ng, Phonon install, `sidechaincompress`, spaCy model, CPU wheels, CUDA capture, tokenizer pin, ffmpeg, `doctor`, `PATH_OUTSIDE_BASE`, stale device variants, `AGENT_VOICE_HOME`, common errors |
 | [docs/install/one-command.md](docs/install/one-command.md) | The `curl \| sh` / `irm \| iex` installers, every flag, `agent-voice setup`, uninstall, where your data lives |
 | [docs/install/agent.md](docs/install/agent.md) | MCP client configs, HTTP MCP, LangChain/OpenAI, systemd and Windows autostart, home anchoring |
+| [docs/frontend/phase0-research.md](docs/frontend/phase0-research.md) · [docs/frontend/architecture.md](docs/frontend/architecture.md) | The frontend dependency/version research and measured probes · the static SPA, `/ui` serving contract, guard interaction and future package-data plan |
 | [docs/phase0-report.md](docs/phase0-report.md) / [phase0-kokoro-report.md](docs/phase0-kokoro-report.md) / [phase0-asr-report.md](docs/phase0-asr-report.md) / [phase0-devices-report.md](docs/phase0-devices-report.md) | Measured GPU performance, the Kokoro CPU spike, the Phonon ASR CPU spike, and the device-variant measurements behind the support matrix |
 | [CHANGELOG.md](CHANGELOG.md) | Release history, v0.1.0 → v0.6.0 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) | Dev setup and gates · supported versions and threat model |
@@ -545,6 +567,14 @@ uv sync --extra dev
 uv run ruff check . && uv run python -m pytest -v   # no GPU, no torch
 uv run agent-voice engines test mock                 # IPC v1 conformance
 uv run agent-voice pronunciations check "HTTPServer"  # lexicon/code preview
+```
+
+For the preview UI (Node 24.22.3 + Bun 1.4.5, development only):
+
+```bash
+cd frontend
+bun ci
+bun run check && bun run check:svelte5 && bun run lint && bun run test && bun run build
 ```
 
 CI runs the same gates on Python 3.12 with no GPU and no secrets; see

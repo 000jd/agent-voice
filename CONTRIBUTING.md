@@ -25,7 +25,8 @@ group. The core venv must never contain torch.
 | `src/agent_voice/` | Core daemon: FastAPI app, routes, MCP server, CLI, cache, voice/engine registry, worker manager, hardware detection and the setup planner |
 | `src/agent_voice/ipc/` | The frozen IPC v1 protocol and transport |
 | `engines/<id>/` | Engine plugins (`engine.yaml`, `worker.py`, optional `pyproject.toml`, `variants/<device>/`) |
-| `scripts/` | The one-command installers — `install.sh` (POSIX `sh`) and `install.ps1` (PowerShell) |
+| `scripts/` | The one-command installers — `install.sh` (POSIX `sh`) and `install.ps1` (PowerShell) — and the deterministic `export_openapi.py` frontend helper |
+| `frontend/` | Static Svelte 5 + SvelteKit 3 SPA preview; Node/Bun are development-only |
 | `tests/` | Mock-backed and contract tests; GPU tests are marked and skipped by default |
 | `docs/` | Reference documentation (the README is a landing page) |
 | `skills/agent-voice/SKILL.md` | Agent-facing playbook, also served as the `agent-voice://guide` resource |
@@ -66,6 +67,36 @@ Guidelines for tests:
   teardown wait on a timeout is a bug.
 - A new error path needs a test that asserts the `{error_code, message,
   suggestion}` body, not just the status code.
+
+### Frontend (preview)
+
+The SPA in `frontend/` is an independent static client. Node **24.22.3** and Bun
+**1.4.5** are development-only; `uv sync`, the daemon and the installers never need
+them. Read [`frontend/AGENTS.md`](frontend/AGENTS.md) before changing Svelte.
+
+```bash
+cd frontend
+nvm use
+bun ci
+bun run check && bun run check:svelte5 && bun run lint
+bun run test
+bun run build
+bun run check:api
+bunx playwright test          # needs: bunx playwright install --only-shell chromium
+bun audit --audit-level=high
+```
+
+- Svelte 5 runes + SvelteKit 3 only. No `svelte.config.js`, no `$lib`, no Svelte 4
+  syntax. Kit 3 config lives in `vite.config.ts`.
+- The UI is a REST client. Do not add a UI-only backend route, auth/login, CORS, a
+  tunnel, telemetry, or an external font/CDN. Tier-A settings stay read-only.
+- `openapi.json` and `src/lib/api/schema.d.ts` are generated and committed; run
+  `bun run gen:api`, never hand-edit them.
+- `frontend/build/` is not committed. The future UI-readiness release packages the
+  build as Python package data so a tagged install has no Node dependency.
+- `scripts/export_openapi.py` and `tests/test_frontend_openapi_export.py` are the only
+  approved Python-side frontend files. Do not change `src/agent_voice/`, `engines/`,
+  or the rest of `tests/` as part of a UI change.
 
 ### Mock engine conformance
 

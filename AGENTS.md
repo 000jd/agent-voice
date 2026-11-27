@@ -1,9 +1,10 @@
 # AGENTS.md
 
-`agent-voice` is a headless, UI-free speech server — synthesis, voice cloning, speech
+`agent-voice` is a headless speech server — synthesis, voice cloning, speech
 recognition and two-stage dubbing — that an AI agent drives over MCP or HTTP. The agent asks
 for speech or a transcript, gets back a file path or a PCM stream, and the GPU stays at 0 MB
-the rest of the time.
+the rest of the time. A static Svelte preview UI lives in `frontend/`; the daemon and the
+Python runtime stay headless and never require Node.
 
 ## Architecture, in seven bullets
 
@@ -167,6 +168,35 @@ an `AppContext`, `await ctx.workers.start()`, call the service, `await ctx.worke
 `asyncio.run`. No running daemon is involved, which is why every heavy import stays inside the
 command body. `--candidates 2..5` renders several takes to audition and saves none; re-run with
 `--take <n> --save-as-clone` (no `--seed`) to register the winner from the cache.
+
+## Frontend (`frontend/`)
+
+`frontend/AGENTS.md` is the playbook; read it before touching Svelte. The short rules:
+
+- Svelte 5 runes + SvelteKit 3 static SPA under `/ui`, TypeScript strict, Tailwind 4,
+  shadcn-svelte/Bits UI. No `svelte.config.js` (Kit 3 config is in `vite.config.ts`),
+  no `$lib` (use `#lib`), no Svelte 4 syntax, no `$app/stores`.
+- Node **24.22.3** and Bun **1.4.5** are development-only. The core daemon and Python
+  install never need Node. Bun runs scripts; never `--bun` for the Node tools.
+- The UI is a REST client. Do not add a UI-only backend route, auth/login, CORS, a
+  public tunnel, telemetry, an external font/CDN, or a UI editor for Tier-A settings.
+- `scripts/export_openapi.py` and `tests/test_frontend_openapi_export.py` are the only
+  approved Python-side files; do not change `src/agent_voice/`, `engines/`, or other
+  `tests/` from a frontend task.
+- `frontend/build/` is gitignored. The future UI-readiness release builds it in CI and
+  ships package data so a tagged install needs no Node.
+
+```bash
+cd frontend
+bun ci
+bun run check && bun run check:svelte5 && bun run lint && bun run test && bun run build
+bun run check:api
+bunx playwright test
+bun audit --audit-level=high
+```
+
+`docs/frontend/phase0-research.md` records every version, age, licence and measured
+probe; `docs/frontend/architecture.md` records the `/ui` serving and packaging plan.
 
 ## Security defaults
 

@@ -9,7 +9,25 @@ given for every release so a tag can be verified against the history.
 
 ## [Unreleased]
 
-No unreleased changes.
+### Added
+
+- **Frontend preview scaffold.** A static Svelte 5 + SvelteKit 3 SPA in `frontend/`,
+  built for a future `/ui` mount: `adapter-static` with `200.html`, `ssr = false`,
+  `/ui` base, Tailwind CSS 4, shadcn-svelte/Bits UI, Inter/Fontsource, a hand-rolled
+  theme and a responsive shell. The dashboard reads `/health` and `/v1/engines`;
+  Speak, Voices, Transcribe, Models, History and Settings are explicit placeholders.
+  The daemon, CLI, MCP server, installers and Python package are unchanged, and
+  Python users never need Node or Bun.
+- **Typed API boundary.** `scripts/export_openapi.py` writes a deterministic
+  `frontend/openapi.json` from a temporary app context (`mount_mcp=False`, no workers,
+  no torch); `openapi-typescript` generates the committed TypeScript schema and
+  `openapi-fetch`'s path-based client reads it. `/health` and `/v1/engines` are
+  locally type-guarded because those routes still lack response models.
+- **Frontend quality gates.** Vitest + happy-dom component tests, Playwright Chromium
+  smoke tests, ESLint 10 + Prettier, a Svelte 5 blocklist checker, a separate
+  `frontend-ci.yml` with OpenAPI drift and `bun audit --audit-level=high`, and the
+  Phase 0 research/architecture docs. Exact pins, a committed `bun.lock`, and Bun's
+  14-day release-age/install-script policy apply. No version bump or tag.
 
 ## [0.6.0] — 2026-11-27 — `fd3ec50`
 
