@@ -4,40 +4,50 @@ const routes = [
 	{ label: 'Speak', heading: 'Speak' },
 	{ label: 'Voices', heading: 'Voices' },
 	{ label: 'Transcribe', heading: 'Transcribe' },
-	{ label: 'Models', heading: 'Models' },
+	{ label: 'Models & Engines', heading: 'Models & Engines' },
 	{ label: 'History', heading: 'History' },
 	{ label: 'Settings', heading: 'Settings' }
 ];
 
-test('navigates every stub route from the sidebar', async ({ page }) => {
+test('navigates every studio route from the sidebar', async ({ page }) => {
 	await page.goto('/ui/');
-	await expect(page.getByRole('heading', { name: 'Dashboard', exact: true })).toBeVisible();
+	const main = page.getByRole('main');
+	await expect(main.getByRole('heading', { name: 'Dashboard', exact: true })).toBeVisible();
 
 	for (const route of routes) {
 		await page.locator('aside').getByRole('link', { name: route.label, exact: true }).click();
-		await expect(page.getByRole('heading', { name: route.heading, exact: true })).toBeVisible();
+		await expect(main.getByRole('heading', { name: route.heading, exact: true })).toBeVisible();
 	}
 });
 
-test('toggles the colour theme and persists it across reloads', async ({ page }) => {
-	await page.emulateMedia({ colorScheme: 'light' });
+test('starts dark and toggles to light across reloads', async ({ page }) => {
 	await page.goto('/ui/');
 
 	const html = page.locator('html');
+	await expect(html).toHaveClass(/dark/);
+
+	await page.getByRole('button', { name: 'Switch to light theme' }).click();
 	await expect(html).not.toHaveClass(/dark/);
 
-	await page.getByRole('button', { name: 'Switch to dark theme' }).click();
-	await expect(html).toHaveClass(/dark/);
-
 	await page.reload();
-	await expect(html).toHaveClass(/dark/);
+	await expect(html).not.toHaveClass(/dark/);
 });
 
-test('shows the dashboard error state when the daemon is unreachable', async ({ page }) => {
+test('shows the dashboard offline state when the daemon is unreachable', async ({ page }) => {
 	await page.route('**/health', (route) => route.abort());
 	await page.route('**/v1/engines', (route) => route.abort());
 
 	await page.goto('/ui/');
-	await expect(page.getByText('Daemon not reachable')).toBeVisible();
-	await expect(page.getByText('agent-voice serve', { exact: true })).toBeVisible();
+	await expect(page.getByText(/daemon offline/i)).toBeVisible();
+});
+
+test('collapses the rail and remembers it', async ({ page }) => {
+	await page.goto('/ui/');
+	const aside = page.locator('aside');
+	await page.getByRole('button', { name: 'Collapse navigation rail' }).click();
+	await expect(aside).toHaveClass(/w-16/);
+	await page.reload();
+	await expect(aside).toHaveClass(/w-16/);
+	await page.getByRole('button', { name: 'Expand navigation rail' }).click();
+	await expect(aside).toHaveClass(/w-\[220px\]/);
 });

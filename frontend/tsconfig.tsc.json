@@ -1,0 +1,15 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": true
+	},
+	"include": [
+		"src/**/*.ts",
+		"vite.config.ts",
+		"vitest.config.ts",
+		"vitest-setup.ts",
+		"playwright.config.ts",
+		"e2e/**/*.ts"
+	],
+	"exclude": ["src/lib/components/ui/**"]
+}

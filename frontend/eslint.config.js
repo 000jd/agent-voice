@@ -11,7 +11,7 @@ const gitignorePath = path.resolve(import.meta.dirname, '.gitignore');
 export default defineConfig(
 	includeIgnoreFile(gitignorePath),
 	{
-		ignores: ['scripts/check-svelte5.mjs']
+		ignores: ['scripts/check-svelte5.mjs', 'scripts/check-spa.mjs']
 	},
 	js.configs.recommended,
 	ts.configs.recommendedTypeChecked,
@@ -49,7 +49,7 @@ export default defineConfig(
 		}
 	},
 	{
-		files: ['src/lib/components/nav-link.svelte'],
+		files: ['src/lib/components/nav-link.svelte', 'src/routes/+page.svelte'],
 		rules: {
 			'svelte/no-navigation-without-resolve': 'off'
 		}

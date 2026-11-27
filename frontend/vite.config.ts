@@ -8,16 +8,18 @@ const DEV_ORIGIN = 'http://127.0.0.1:8000';
 export default defineConfig(({ mode }) => {
 	const env = loadEnv(mode, process.cwd(), '');
 	const devKey = (env.AGENT_VOICE_DEV_API_KEY ?? process.env.AGENT_VOICE_DEV_API_KEY ?? '').trim();
+	const devOrigin =
+		(env.AGENT_VOICE_DEV_URL ?? process.env.AGENT_VOICE_DEV_URL ?? DEV_ORIGIN).trim() || DEV_ORIGIN;
 	const proxyHeaders: Record<string, string> = {
-		Origin: DEV_ORIGIN
+		Origin: devOrigin
 	};
 	if (devKey) {
 		proxyHeaders.Authorization = `Bearer ${devKey}`;
 	}
 	const proxy = {
-		'/health': { target: DEV_ORIGIN, changeOrigin: true, headers: proxyHeaders },
-		'/v1': { target: DEV_ORIGIN, changeOrigin: true, headers: proxyHeaders, ws: true },
-		'/audio': { target: DEV_ORIGIN, changeOrigin: true, headers: proxyHeaders }
+		'/health': { target: devOrigin, changeOrigin: true, headers: proxyHeaders },
+		'/v1': { target: devOrigin, changeOrigin: true, headers: proxyHeaders, ws: true },
+		'/audio': { target: devOrigin, changeOrigin: true, headers: proxyHeaders }
 	};
 
 	return {

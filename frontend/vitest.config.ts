@@ -1,9 +1,14 @@
-import { svelte } from '@sveltejs/vite-plugin-svelte';
+import { sveltekit } from '@sveltejs/kit/vite';
 import { svelteTesting } from '@testing-library/svelte/vite';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
-	plugins: [svelte({ compilerOptions: { runes: true } }), svelteTesting()],
+	plugins: [
+		sveltekit({
+			compilerOptions: { runes: true }
+		}),
+		svelteTesting()
+	],
 	test: {
 		environment: 'happy-dom',
 		setupFiles: ['./vitest-setup.ts'],

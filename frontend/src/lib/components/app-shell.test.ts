@@ -1,32 +1,33 @@
 import { render, screen } from '@testing-library/svelte';
 import { createRawSnippet } from 'svelte';
 import { expect, test } from 'vitest';
-import { NAV_ITEMS } from '#lib/nav.js';
+import { NAV_GROUPS } from '#lib/nav.js';
 import AppShell from './app-shell.svelte';
 
 const children = createRawSnippet(() => ({
 	render: () => '<p>Shell content</p>'
 }));
 
-const nav = NAV_ITEMS.map((item) => ({
-	...item,
-	href: item.href ? `/${item.href}` : '/'
+const groups = NAV_GROUPS.map((group) => ({
+	...group,
+	items: group.items.map((item) => ({
+		...item,
+		href: item.href ? `/ui/${item.href}` : '/ui'
+	}))
 }));
 
-test('renders the navigation and marks the active route', () => {
-	render(AppShell, { nav, currentPath: '/speak', children });
+test('renders the grouped navigation and marks the active route', () => {
+	render(AppShell, { groups, title: 'Speak', currentPath: '/ui/speak', children });
 
 	expect(screen.getByText('Shell content')).toBeInTheDocument();
-	expect(screen.getByRole('button', { name: 'Switch to dark theme' })).toBeInTheDocument();
+	expect(screen.getByRole('button', { name: /Switch to (light|dark) theme/ })).toBeInTheDocument();
+	expect(screen.getAllByText('Studio').length).toBeGreaterThan(0);
+	expect(screen.getByText('Library')).toBeInTheDocument();
 
 	const speakLinks = screen.getAllByRole('link', { name: 'Speak' });
-	expect(speakLinks).toHaveLength(2);
-	for (const link of speakLinks) {
-		expect(link).toHaveAttribute('aria-current', 'page');
-	}
+	expect(speakLinks).toHaveLength(1);
+	expect(speakLinks[0]).toHaveAttribute('aria-current', 'page');
 
 	const settingsLinks = screen.getAllByRole('link', { name: 'Settings' });
-	for (const link of settingsLinks) {
-		expect(link).not.toHaveAttribute('aria-current');
-	}
+	expect(settingsLinks[0]).not.toHaveAttribute('aria-current');
 });
