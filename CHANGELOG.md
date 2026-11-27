@@ -11,7 +11,7 @@ given for every release so a tag can be verified against the history.
 
 No unreleased changes.
 
-## [0.5.0] — 2026-11-27 — `<commit>`
+## [0.5.0] — 2026-11-27 — `0d4d31d`
 
 "Speech in: pluggable ASR engines, agent-native two-stage dubbing, and a CPU
 listener that never touches the GPU."
