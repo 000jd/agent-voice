@@ -18,15 +18,34 @@ the rest of the time.
   `mock` on the CPU. Two ASR engines: `phonon` (`fermion-research==0.2.15`, 25
   languages, 0 MB VRAM) and `mock_asr` (dependency-free, timed synthetic
   transcript). Kokoro is preset-timbre only (`voice_clone: false`,
-  `voice_design: false`, `instruct_control: false`) and never initialises CUDA:
-  `CUDA_VISIBLE_DEVICES=""` before the torch import, `device="cpu"` on
-  `KPipeline`, `gpu_vram_mb: 0`.
+  `voice_design: false`, `instruct_control: false`) and on its shipped `cpu` variant
+  never initialises CUDA: `CUDA_VISIBLE_DEVICES=""` before the torch import,
+  `device="cpu"` on `KPipeline`, `gpu_vram_mb: 0`.
 - **`kind` routes, `device` schedules.** `kind` picks the IPC method
   (`synthesize`/`stream_pcm` vs `transcribe`) and the `engines test` table;
   `device: cpu` makes an engine **exempt from the single-GPU-owner slot**, so a
   transcription runs next to a resident TTS model instead of evicting it, and the
   VRAM-pressure reaper leaves it alone. Both default to the v0.4 behaviour (`tts`,
   `gpu`), which is why every older manifest still loads.
+- **`device` schedules; `supported_devices`/`default_device` describe the backend.** They
+  are different fields on purpose. Runtime devices are `cpu` · `cuda` · `mps` · `rocm`,
+  resolved per engine as `AGENT_VOICE_DEVICES[engine]` → non-`auto`
+  `AGENT_VOICE_DEVICE` → manifest `default_device` → host accelerator, and validated
+  against `supported_devices`. `DEVICE_SUPPORT` in `src/agent_voice/hardware.py` is the
+  support matrix and the only place a pair becomes `verified`; a device is a **dependency
+  set** (each `uv.lock` bakes the torch index in), so switching one reinstalls that
+  engine's venv via `engines install <id> --device <d> [--experimental]`. Only one
+  variant per engine is resident, and the manager's torch probe turns a stale variant
+  into a clear `409 ENGINE_NOT_INSTALLED`. The 0 MB claim belongs to `device=cpu`
+  alone.
+- **One home anchors every path.** `default_home()` is `AGENT_VOICE_HOME`, else the first
+  parent holding both `pyproject.toml` and `engines/`, else `~/.agent-voice`.
+  `get_settings()` reads `<home>/.env`, and relative `DATA_DIR`/`ENGINES_DIR` values
+  resolve against the home — never the cwd — so the CLI and daemon work from any
+  directory. Prefixed aliases (`AGENT_VOICE_DATA_DIR`, `AGENT_VOICE_ENGINES_DIR`,
+  `AGENT_VOICE_MCP_BASE_PATH`) win over the unprefixed spellings. Do not reintroduce a
+  `Path.cwd()` or `Path(__file__).parents[…]` anchor; `WorkingDirectory` no longer
+  decides which `.env` is read.
 - **Two surfaces per direction.** Speech out: `/v1/agent/speak`,
   `/v1/audio/speech` (OpenAI), the PCM stream and the WebSocket. Speech in:
   `/v1/agent/transcribe` (a confined local path) and `/v1/audio/transcriptions`
@@ -81,6 +100,21 @@ AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""
 # environment + client onboarding
 .venv/bin/agent-voice doctor
 .venv/bin/agent-voice mcp-config --client claude-code
+
+# hardware-aware install: detects the host, recommends verified pairs, writes .env,
+# optionally downloads weights. --dry-run prints the plan and writes nothing;
+# --yes alone NEVER downloads (only --download or an interactive yes does).
+.venv/bin/agent-voice setup
+.venv/bin/agent-voice setup --dry-run
+.venv/bin/agent-voice setup -y --profile cpu-only --engines kokoro,phonon
+
+# engine installs, including a specific device variant. Switching a device replaces
+# that engine's venv in place; --experimental is required for an experimental pair
+# and never unlocks an unsupported one. --dry-run prints the resolved project + argv.
+.venv/bin/agent-voice engines install kokoro
+.venv/bin/agent-voice engines install qwen3_tts --device cpu
+.venv/bin/agent-voice engines install kokoro --device cuda --experimental
+.venv/bin/agent-voice engines install qwen3_tts --device rocm --experimental --dry-run  # resolves variants/rocm (lock only; not run here)
 
 # speech in: in-process, no daemon, no GPU (16 kHz WAV extraction happens once)
 .venv/bin/agent-voice transcribe data/inbox/clip.wav --srt --words
@@ -226,6 +260,16 @@ fastmcp) are legitimately present.
   slot for a `cpu` engine, and the VRAM-pressure reaper must never kill one. If a new code path
   starts a worker, it inherits that rule from `_begin_job` — do not re-check the manifest in three
   places and get two of them wrong.
+- **`DEVICE_SUPPORT` is evidence-only.** A `(engine, device)` pair becomes `verified` only when a
+  measured run is recorded in `docs/phase0-devices-report.md` (or a named prior report); everything
+  else is `experimental` or `unsupported`, and no doc, README row or `doctor` line may round that
+  up. Never invent a speed multiplier — "slow on CPU" is what the measurement supports
+  (0.196–0.22× realtime, 5.55 GiB peak RSS), and an unsupported pair stays refused even with
+  `--experimental`.
+- **The core stays torch-free, including the device paths.** `hardware.py`, `setup_wizard.py`,
+  `config.py` and `cli.py` must not import torch: hardware probes are `subprocess` argv lists or
+  stdlib reads, and the only torch inspection goes through an engine's own interpreter
+  (`engine_registry._torch_probe`).
 - **`kind` decides the method, never the caller.** Routing checks it in exactly two places —
   `resolve_target` (refuses an ASR engine for speech) and `resolve_asr_target` (refuses a TTS
   engine for transcription) — so a wrong-kind request is a clear `BAD_REQUEST`, not a worker crash.

@@ -379,11 +379,14 @@ def build_mcp_server(ctx) -> FastMCP:
         Read: version, default_engine, default_asr_engine, default_voice,
         voices_count, voices[], inbox_dir, preset_speakers[],
         voice_design_available, installed_engines[], engines[], asr_engines[],
-        dubbing_available, gpu_status and next_steps[].
+        dubbing_available, device, devices, home, gpu_status and next_steps[].
         """
         from . import __version__
 
-        entries = ctx.registry.list_entries(loaded=ctx.workers.loaded_models())
+        entries = ctx.registry.list_entries(
+            loaded=ctx.workers.loaded_models(),
+            devices=ctx.workers.worker_devices(),
+        )
         voices = ctx.voices.list()
         preset_speakers, voice_design_available = _preset_speech_surface(
             entries, settings.default_engine
@@ -409,6 +412,17 @@ def build_mcp_server(ctx) -> FastMCP:
             ],
             "installed_engines": [e.engine_id for e in entries if e.installed],
             "inbox_dir": str(settings.inbox_dir),
+            # What each installed engine will run on. Read from the preference
+            # map, not from a probe: server_info stays free of nvidia-smi and of
+            # any worker wake, and "auto" is the honest answer until a worker
+            # actually reports its device.
+            "device": settings.device,
+            "devices": {
+                e.engine_id: settings.devices.get(e.engine_id, settings.device)
+                for e in entries
+                if e.installed
+            },
+            "home": str(settings.home),
             "preset_speakers": preset_speakers,
             "voice_design_available": voice_design_available,
             "next_steps": _next_steps(
@@ -830,7 +844,10 @@ def build_mcp_server(ctx) -> FastMCP:
                 possible.
             engines[].models[]: aliases on that engine, each with a `loaded` flag.
         """
-        entries = ctx.registry.list_entries(loaded=ctx.workers.loaded_models())
+        entries = ctx.registry.list_entries(
+            loaded=ctx.workers.loaded_models(),
+            devices=ctx.workers.worker_devices(),
+        )
         return {"engines": [e.model_dump(mode="json") for e in entries]}
 
     @tool(annotations=read_only, full_only=True)
@@ -1024,12 +1041,18 @@ def build_mcp_server(ctx) -> FastMCP:
             _raise_tool_error(exc)
 
     @tool(annotations=open_world_mutation, full_only=True)
-    async def install_engine(engine_id: str) -> dict[str, Any]:
+    async def install_engine(engine_id: str, device: str = "auto") -> dict[str, Any]:
         """Run `uv sync` for an engine and verify the IPC handshake, as a job.
 
         Use it when an engine is present but reports ENGINE_NOT_INSTALLED or a
         stale backend version. Refused unless ALLOW_AGENT_ENGINE_MUTATION=true and
         both ends are loopback: it installs packages and then executes the result.
+
+        Args:
+            device: auto|cpu|cuda|mps|rocm. A different device is a different
+                dependency set, so it reinstalls that engine's venv. Experimental
+                pairs are refused here on purpose: they need the CLI's
+                `--experimental`, which is an operator decision at a terminal.
 
         Read:
             job_id: poll get_job(); `result.installed` is true only once the
@@ -1044,7 +1067,9 @@ def build_mcp_server(ctx) -> FastMCP:
             job = ctx.jobs.create("install_engine")
             ctx.jobs.register_task(
                 job.job_id,
-                asyncio.create_task(_run_install(ctx, engine_id, job.job_id)),
+                asyncio.create_task(
+                    _run_install(ctx, engine_id, job.job_id, device=device)
+                ),
             )
             return {"job_id": job.job_id, "kind": "install_engine"}
         except AgentVoiceError as exc:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
 import json
 import os
 import shutil
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import uuid
 from pathlib import Path
 
@@ -34,6 +36,7 @@ from fastapi.testclient import TestClient
 from agent_voice.api.app import create_app
 from agent_voice.config import Settings
 from agent_voice.engine_registry import EngineRegistry, hf_model_downloaded
+from agent_voice.hardware import pair_level
 from agent_voice.ipc.transport import SyncListener, accept_async, make_transport
 from agent_voice.kokoro_support import KOKORO_OPENAI_VOICES, KOKORO_PRESET_SPEAKERS
 from agent_voice.schemas import SAMPLE_RATE
@@ -475,6 +478,24 @@ def test_manifest_reports_installed_engine_and_downloaded_weights():
 # ---------------------------------------------------------------------------
 
 
+def test_manifest_declares_the_device_matrix():
+    """The manifest is the resolver's contract, readable without the engine.
+
+    v0.6.0 turned the runtime device into a real choice, but Kokoro's *verified*
+    pair is cpu: `device: cpu` is the scheduling class (its absence was the
+    v0.5.0 bug that let a 0 MB engine take the single-accelerator slot), `cpu` is
+    the default, and cuda/mps are declared as experimental.
+    """
+    manifest = EngineRegistry(ENGINES_DIR).get(ENGINE_ID).manifest
+
+    assert manifest.device == "cpu"
+    assert manifest.default_device == "cpu"
+    assert list(manifest.supported_devices) == ["cpu", "cuda", "mps"]
+    assert pair_level(ENGINE_ID, "cpu") == "verified"
+    assert pair_level(ENGINE_ID, "cuda") == "experimental"
+    assert pair_level(ENGINE_ID, "mps") == "experimental"
+
+
 @requires_engine
 def test_engine_venv_torch_sees_no_cuda():
     script = (
@@ -525,6 +546,122 @@ def test_load_model_reports_zero_vram(kokoro_worker):
     assert reply["loaded_models"] == [MODEL_ALIAS]
     assert reply["gpu_vram_mb"] == 0
     assert reply["device"] == "cpu"
+
+
+# -- the non-zero path, mocked: never against the real CPU venv --------------
+
+
+class _FakeCuda:
+    """Records every `torch.cuda.*` call so the cpu path can prove it made none."""
+
+    def __init__(self, *, available: bool, allocated_bytes: int) -> None:
+        self.available = available
+        self.allocated_bytes = allocated_bytes
+        self.calls: list[str] = []
+
+    def is_available(self) -> bool:
+        self.calls.append("is_available")
+        return self.available
+
+    def memory_allocated(self) -> int:
+        self.calls.append("memory_allocated")
+        return self.allocated_bytes
+
+    def empty_cache(self) -> None:
+        self.calls.append("empty_cache")
+
+
+class _FakeTorch(types.ModuleType):
+    def __init__(self, *, cuda_available: bool, allocated_bytes: int) -> None:
+        super().__init__("torch")
+        self.cuda = _FakeCuda(available=cuda_available, allocated_bytes=allocated_bytes)
+        self.float32 = object()
+        self.bfloat16 = object()
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    def send_json(self, payload: dict) -> None:
+        self.sent.append(dict(payload))
+
+    def send_pcm(self, *args: object) -> dict:  # pragma: no cover - not expected
+        raise AssertionError("no PCM frame expected here")
+
+
+@pytest.fixture
+def kokoro_worker_module(monkeypatch: pytest.MonkeyPatch):
+    """Load `engines/kokoro/worker.py` by path under a test-owned env.
+
+    The worker reads ``AGENT_VOICE_RESOLVED_DEVICE`` once, at import, so each
+    variant needs its own module object — and the real venv is never involved.
+    """
+    loaded: list[str] = []
+
+    def _load(device: str):
+        monkeypatch.setenv("AGENT_VOICE_RESOLVED_DEVICE", device)
+        # The cpu path empties this before torch is imported; record the key so
+        # teardown restores whatever this machine had.
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+        name = f"av_kokoro_worker_{device}"
+        spec = importlib.util.spec_from_file_location(name, ENGINE_DIR / "worker.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        loaded.append(name)
+        spec.loader.exec_module(module)
+        return module
+
+    yield _load
+    for name in loaded:
+        sys.modules.pop(name, None)
+
+
+def test_mocked_cuda_reports_a_real_vram_number(kokoro_worker_module, monkeypatch):
+    """`gpu_vram_mb` must be *measured* off the cpu path, not hard-coded to 0.
+
+    Only the allocator is mocked: the worker's own device plumbing, its hello and
+    its health reply are the shipped code, so a regression in `_vram_mb()`'s cuda
+    branch fails here instead of on a GPU somebody has to own.
+    """
+    fake = _FakeTorch(cuda_available=True, allocated_bytes=64 * 1024**2)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    worker = kokoro_worker_module("cuda")
+
+    assert worker.RESOLVED_DEVICE == "cuda"
+    conn = _RecordingConnection()
+    engine = worker.KokoroEngine(conn, {MODEL_ALIAS: HF_REPO})
+    engine.hello({"id": "hello"})
+    engine.health({"id": "health"})
+
+    hello, health = conn.sent
+    assert hello["device"] == "cuda"
+    assert hello["gpu_vram_mb"] == 64
+    assert health["device"] == "cuda"
+    assert health["gpu_vram_mb"] == 64
+    assert fake.cuda.calls == ["is_available", "memory_allocated"] * 2
+
+
+def test_mocked_cpu_reports_zero_and_never_touches_torch_cuda(
+    kokoro_worker_module, monkeypatch
+):
+    """The real CPU assertions above, restated as a mock that can catch a leak."""
+    fake = _FakeTorch(cuda_available=False, allocated_bytes=0)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    worker = kokoro_worker_module("cpu")
+
+    assert worker.RESOLVED_DEVICE == "cpu"
+    # The cpu path empties CUDA_VISIBLE_DEVICES before torch could read it.
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == ""
+    conn = _RecordingConnection()
+    engine = worker.KokoroEngine(conn, {MODEL_ALIAS: HF_REPO})
+    engine.hello({"id": "hello"})
+    engine.health({"id": "health"})
+
+    assert [reply["gpu_vram_mb"] for reply in conn.sent] == [0, 0]
+    assert [reply["device"] for reply in conn.sent] == ["cpu", "cpu"]
+    assert fake.cuda.calls == [], "a cpu worker must never probe CUDA"
 
 
 @requires_kokoro

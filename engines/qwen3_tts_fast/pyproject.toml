@@ -13,7 +13,12 @@ requires-python = ">=3.11,<3.13"
 #   AttributeError: property 'upsample' of 'Qwen3TTSTokenizerV2Encoder' has no setter
 # because its __init__ assigns `self.upsample = None` while transformers now
 # defines `upsample` as a read-only property. 5.15.1 is the version the upstream
-# project validated against (see its ROCm notes).
+# project validated against.
+#
+# CUDA is the only backend this distribution supports: its installed 0.5.4
+# METADATA requires "an NVIDIA GPU with CUDA" and it captures torch.cuda.CUDAGraph
+# graphs. There is no ROCm claim in that metadata and no CPU/MPS path, so none is
+# declared here or in engine.yaml.
 dependencies = [
     "faster-qwen3-tts==0.5.4",
     "transformers==5.15.1",
@@ -32,3 +37,9 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
 torchaudio = [{ index = "pytorch-cu128" }]
+
+# Which device this project root installs for. `engines install --device` compares
+# it against the requested device and falls through to `variants/<device>/` when
+# they differ. There is no other variant: this engine is CUDA only.
+[tool.agent-voice]
+device = "cuda"

@@ -632,8 +632,70 @@ def test_gpu_status_shape(client):
         "queue_depth",
         "in_flight",
         "unload_in_seconds",
+        # v0.6.0: the runtime device is a first-class part of the status, not
+        # dead data dropped by the route.
+        "cpu_engines",
+        "worker_devices",
+        "worker_vram_mb",
+        "vram_source",
     ):
         assert key in body
+
+    # Types are part of the contract a client parses.
+    assert isinstance(body["cpu_engines"], list)
+    assert isinstance(body["worker_devices"], dict)
+    assert isinstance(body["worker_vram_mb"], dict)
+    assert body["vram_source"] in {"nvml", "worker", "none"}
+
+    # Nothing has been spawned yet, so every per-worker map is empty and the
+    # total is whatever the driver (or nothing) answered.
+    assert body["cpu_engines"] == []
+    assert body["worker_devices"] == {}
+    assert body["worker_vram_mb"] == {}
+    assert body["workers"] == {}
+
+
+def test_gpu_status_reports_a_cpu_worker_without_taking_the_gpu_slot(client):
+    """A resident mock worker is visible as CPU, 0 MB, and not the GPU owner.
+
+    This is the v0.6.0 scheduling fix seen from the outside: the manifest says
+    `device: cpu`, the resolved device stays cpu, and the single-accelerator slot
+    (`active_engine`) must stay empty.
+    """
+    client.post("/v1/agent/speak", json={"text": "Who owns the accelerator?"})
+
+    body = client.get("/v1/gpu").json()
+
+    assert body["workers"] == {"mock": "alive"}
+    assert body["worker_devices"] == {"mock": "cpu"}
+    assert body["worker_vram_mb"] == {"mock": 0}
+    assert body["cpu_engines"] == ["mock"]
+    assert body["active_engine"] is None
+
+
+def test_engines_expose_the_device_contract(client):
+    """`EngineEntry` carries the declared device matrix for every engine."""
+    entries = client.get("/v1/engines").json()["engines"]
+    by_id = {entry["engine_id"]: entry for entry in entries}
+
+    mock = by_id["mock"]
+    assert mock["device"] == "cpu"
+    assert mock["default_device"] == "cpu"
+    assert mock["supported_devices"] == ["cpu"]
+
+    kokoro = by_id["kokoro"]
+    assert kokoro["device"] == "cpu", "the scheduling class must not claim the GPU slot"
+    assert kokoro["default_device"] == "cpu"
+    assert kokoro["supported_devices"] == ["cpu", "cuda", "mps"]
+
+    fast = by_id["qwen3_tts_fast"]
+    assert fast["default_device"] == "cuda"
+    assert fast["supported_devices"] == ["cuda"]
+
+    # The key exists on every entry; it stays null until that engine has a live
+    # worker (the list route does not pass the worker device map).
+    for entry in entries:
+        assert "resolved_device" in entry, entry["engine_id"]
 
 
 def test_unload_when_idle_succeeds(client):

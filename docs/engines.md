@@ -7,23 +7,24 @@ it when idle. Adding an engine never requires touching the daemon.
 
 Six engines ship, in **two kinds**:
 
-| Engine id | Kind | Device | Backend | Venv | Streaming | When to use |
+| Engine id | Kind | Scheduling | Backend | Venv | Streaming | When to use |
 |---|---|---|---|---|---|---|
-| `qwen3_tts_fast` | `tts` | `gpu` | `faster-qwen3-tts` (CUDA graphs) | own `uv` venv | native PCM | default GPU; fastest, real streaming |
-| `qwen3_tts` | `tts` | `gpu` | `qwen-tts` (official) | own `uv` venv | emulated | GPU fallback when graph capture misbehaves |
-| `kokoro` | `tts` | `cpu` | `kokoro==0.9.4` (CPU PyTorch) | own `uv` venv | native PCM | **no GPU**: 82M, 24 kHz, 3.4–5.2× real time |
-| `mock` | `tts` | `gpu`* | built-in tone generator | core interpreter | native PCM | CPU-only testing of the full routing surface |
+| `qwen3_tts_fast` | `tts` | `gpu` | `faster-qwen3-tts` (CUDA graphs) | own `uv` venv | native PCM | default GPU; fastest, real streaming. **CUDA only** |
+| `qwen3_tts` | `tts` | `gpu` | `qwen-tts` (official) | own `uv` venv | emulated | GPU fallback when graph capture misbehaves; also the CPU/MPS/ROCm engine |
+| `kokoro` | `tts` | `cpu` | `kokoro==0.9.4` (CPU PyTorch) | own `uv` venv | native PCM | **no GPU** on its shipped `cpu` variant: 82M, 24 kHz, 3.4–5.2× real time |
+| `mock` | `tts` | `cpu` | built-in tone generator | core interpreter | native PCM | CPU-only testing of the full routing surface |
 | `phonon` | `asr` | `cpu` | `fermion-research==0.2.15` | own `uv` venv | — | **no GPU**: real transcription, 25 languages, ≈42–48× real time |
 | `mock_asr` | `asr` | `cpu` | built-in synthetic transcript | core interpreter | — | testing transcription with no deps |
 
-\* `mock` leaves `device` at its default. It costs nothing either way, since it never
-allocates VRAM.
+`kokoro` and `mock` declare `device: cpu` in their manifests, so neither takes the
+single-GPU-owner slot and neither is killed by the VRAM-pressure reaper. Before v0.6.0
+they inherited `gpu` and took that slot while holding 0 MB — a scheduling bug, now fixed.
 
 The two Qwen backends need **mutually exclusive** dependency universes
 (`transformers==4.57.3` for `qwen-tts`, `transformers==5.15.1` for
 `faster-qwen3-tts`), which is why they are separate plugins with separate venvs.
 They cannot share an environment. `kokoro` is separate for a different reason: its
-venv pins CPU-only torch, so it can never see a CUDA device even on a GPU box.
+shipped venv pins CPU-only torch, so it cannot see a CUDA device even on a GPU box.
 `phonon` is separate for that same reason plus the opposite job.
 
 ## Two manifest fields: `kind` and `device`
@@ -36,9 +37,196 @@ manifest keeps loading unchanged:
 | `kind` | `tts` (default) · `asr` | Which IPC method the daemon calls — `synthesize`/`stream_pcm` versus `transcribe` — and which conformance table `engines test` walks. Routing refuses a wrong-kind request with `BAD_REQUEST` before a worker spawns |
 | `device` | `gpu` (default) · `cpu` | **Scheduling**, not routing. A `cpu` engine is exempt from the single-GPU-owner slot: `_begin_job` never acquires it, so a transcription runs while a TTS model is resident instead of evicting it. The VRAM-pressure reaper also leaves `cpu` workers alone |
 
+v0.6.0 adds two **runtime-device** fields alongside them, and they are deliberately not
+the same field:
+
+| Field | Values | What it decides |
+|---|---|---|
+| `supported_devices` | `[cpu]` by default; any of `cpu`, `cuda`, `mps`, `rocm` | Which runtime devices the engine's backend can serve. Used to validate `AGENT_VOICE_DEVICE`/`AGENT_VOICE_DEVICES` and `engines install --device`; a request for a device outside this list is a `BAD_REQUEST` naming the supported list |
+| `default_device` | `cpu`, `cuda`, `mps`, `rocm`, or `null` | What `auto` resolves to for this engine before the host's accelerator is considered |
+
 Declare `device: cpu` honestly. A `cpu` engine that grabs a CUDA context breaks the
 "0 MB VRAM" promise an operator planned around; a `gpu` engine marked `cpu` would
-hold no slot while competing for the card anyway.
+hold no slot while competing for the card anyway. Declare `supported_devices` honestly
+too — it is what stops `AGENT_VOICE_DEVICE=cuda` from silently installing a torch build
+the engine's package cannot use.
+
+## Device variants
+
+A device is **not** a `uv sync` flag. Each committed `uv.lock` bakes the torch wheel
+index into every torch entry, so the shipped locks already disagree about which torch
+they hold — and the variants are different dependency sets by construction:
+
+| Engine / variant | torch | torchaudio | index |
+|---|---|---|---|
+| `qwen3_tts` canonical (`cuda`) | `2.11.0+cu128` | `2.11.0+cu128` | `https://download.pytorch.org/whl/cu128` |
+| `qwen3_tts` `variants/cpu` | `2.15.0+cpu` | `2.11.1+cpu` | `https://download.pytorch.org/whl/cpu` |
+| `kokoro` canonical (`cpu`) | `2.15.0+cpu` | — | `https://download.pytorch.org/whl/cpu` |
+| `kokoro` `variants/cuda` | `2.11.0+cu128` | — | `https://download.pytorch.org/whl/cu128` |
+| `kokoro` `variants/mps` | `2.15.0` (PyPI, `macosx_14_0_arm64`) | — | PyPI |
+| `phonon` canonical (`cpu`) | `2.15.0+cpu` | — | `https://download.pytorch.org/whl/cpu` |
+| `phonon` `variants/mps` | `2.15.0` (PyPI, `macosx_14_0_arm64`) | — | PyPI + `fermion-research[mlx]` |
+| `qwen3_tts` `variants/rocm` (measured) | `2.15.0+rocm7.14` | `2.11.1+rocm7.14` | `https://download.pytorch.org/whl/rocm7.14` |
+| `qwen3_tts` `variants/mps` (measured) | `2.15.0` (PyPI, `macosx_14_0_arm64`) | `2.11.1` | PyPI |
+
+Do **not** expect the variants to hold the same torch: the CPU index lags on
+torchaudio, so the CPU pair is `torch 2.15.0+cpu` / `torchaudio 2.11.1+cpu` — a
+declared, visible difference, not a bug. The exact measurements are in
+[phase0-devices-report.md](phase0-devices-report.md).
+
+Rows marked *(measured)* come from the Phase 0 throwaway copy. What this checkout can
+actually install is what lives under `engines/<id>/variants/`. Run
+`agent-voice engines install <id> --device <d> --dry-run` to see the resolved project
+root, and note that a pair with no shipped variant project or lock **refuses to
+install** — `--experimental` cannot conjure a lock.
+
+### The proven index URLs
+
+| Variant | Index | Notes |
+|---|---|---|
+| `cpu` | `https://download.pytorch.org/whl/cpu` | `explicit = true` is fine — the index serves only torch/torchaudio |
+| `cuda` | `https://download.pytorch.org/whl/cu128` | the canonical project for the Qwen engines |
+| `rocm` | `https://download.pytorch.org/whl/rocm7.14` | must be **non-`explicit`** (torch's `rocm[device-all]` and `triton-rocm` live on the same index) **and** narrowed with `[tool.uv] environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]`. `rocm10.0` also carries torch 2.15.0 but is undocumented, so it is not used |
+| `mps` | none — PyPI's macOS arm64 wheel *is* the MPS build | narrowed with `[tool.uv] environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]` |
+
+Two rules that come straight out of the measurements, and that a new variant must obey:
+
+1. **A non-PyPI index must declare `[tool.uv] environments`** for the platforms it
+   actually serves. Without it uv's universal resolution backtracks to an ancient torch
+   that has broad wheel coverage — measured: `rocm7.14` → `torch 2.0.1`, a lock with
+   zero wheels.
+2. **Only an index that serves nothing but torch/torchaudio may be `explicit = true`.**
+   ROCm cannot be, because torch's own runtime dependencies are published on that same
+   index. A non-explicit extra index must be checked per package — an extra index can
+   remap a transitive dependency such as `networkx`.
+
+**Intel macOS is excluded.** `fermion-research` pins `torch>=2.2,<2.3` on Intel macOS,
+which cannot coexist with Phonon's `torch==2.15.0` CPU pin, so
+`engines/phonon/pyproject.toml` limits uv's resolution environments to Linux, Windows
+and Apple silicon. Intel Macs are not a supported Phonon host, and no variant changes
+that.
+
+### Layout: one venv, several lock roots
+
+```text
+engines/<id>/
+├── pyproject.toml              # canonical variant; [tool.agent-voice] device = "<default>"
+├── uv.lock                     # the canonical lock — never rewritten by an install
+├── .venv                       # THE one venv, created and populated by the sync below
+├── .variant                    # stamp: device + torch version, written by install
+└── variants/<device>/
+    ├── pyproject.toml          # same deps, different torch index, [tool.agent-voice] device = "<device>"
+    └── uv.lock
+```
+
+`engines install <id> --device <d>` resolves the project directory (the canonical one
+when its `[tool.agent-voice] device` already matches, otherwise `variants/<device>/`)
+and runs exactly:
+
+```python
+subprocess.run(
+    [uv, "sync", "--project", str(project_dir), "--locked"],
+    env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(engine_dir / ".venv")},
+    cwd=str(project_dir),
+    shell=False,
+    check=True,
+)
+```
+
+Consequences worth knowing:
+
+- The venv stays at the **canonical** `engines/<id>/.venv` path that `engine.yaml`
+  already points at, so nothing else in the daemon changes. No `.venv` is created under
+  `variants/<device>/`.
+- `--locked` is mandatory, not an optimisation: without it a `uv sync` against a drifted
+  variant **silently rewrites the committed lock** (measured: the sha changed and a
+  package was added). With it, drift is refused with exit code 1 and the lock is
+  untouched.
+- **Switching a device replaces that engine's venv contents in place** — `uv sync`
+  installs and prunes to exactly the variant's lock, so a cuda→cpu switch leaves no
+  `nvidia-*` or `triton` directories behind. Only **one variant per engine** is resident
+  at a time. On a cold uv cache the same switch is a full download: the CPU venv is
+  1.6 GB and the CUDA venv is 7.3 GB.
+- An `--index`, `--default-index`, `--index-url`, `UV_INDEX` or `UV_DEFAULT_INDEX` can
+  **never** select a device: `[tool.uv.sources]` wins over all of them (seven measured
+  variants of the flag, seven identical results), and on the real CUDA project `--index`
+  silently downgraded torch while desynchronising torchaudio. `engines install` never
+  passes them and strips them from the environment.
+- The manager runs a torch probe on the installed engine: if the venv holds `torch
+  2.15.0+cpu` while the resolved device is `cuda`, the engine answers
+  `409 ENGINE_NOT_INSTALLED` naming `agent-voice engines install <id> --device cuda` —
+  a clear refusal, not a worker crash. That is the "stale variant" case.
+
+### Flags
+
+```bash
+agent-voice engines install qwen3_tts --device cpu                 # verified pair
+agent-voice engines install kokoro --device cuda --experimental    # experimental pair
+agent-voice engines install qwen3_tts --device cuda                # the canonical project
+```
+
+| Flag | Effect |
+|---|---|
+| `--device auto\|cpu\|cuda\|mps\|rocm` | Which variant to sync. `auto` (the default) keeps the canonical project, or the variant the resolved device selects |
+| `--experimental` | Allow an `experimental` pair. Never unlocks an `unsupported` one |
+| `--dry-run` | Print the resolved project root and the exact `uv sync` argv, then exit — writes nothing |
+
+A pair is installable only if a variant **project and lock exist** for it
+(`engines/<id>/variants/<device>/` or a canonical project whose
+`[tool.agent-voice] device` matches). `--experimental` grants permission; it cannot
+create a lock. So:
+
+```text
+$ agent-voice engines install qwen3_tts_fast --device rocm --experimental
+BAD_REQUEST: engine 'qwen3_tts_fast' does not support device 'rocm'
+Supported devices: cuda.
+```
+
+That is the honest gate: `qwen3_tts_fast` is CUDA-only, and a supported pair whose
+variant project or lock is missing is refused with `Available variants: …` rather than
+silently resolving a different dependency set. Shipped roots today:
+`qwen3_tts` cpu/cuda/mps/rocm, `kokoro` cpu/cuda/mps, `phonon` cpu/mps.
+`--dry-run` is the cheapest way to see which projects this checkout has. `engines install`
+never touches another engine's venv.
+
+### The support matrix, per pair
+
+`DEVICE_SUPPORT` in [`../src/agent_voice/hardware.py`](../src/agent_voice/hardware.py) is
+the single source of truth; this table is a copy of it. **verified here** = installed and
+run end to end on the reference host (Linux, RTX 4060 Ti 16 GB) or in a named prior
+report; **experimental** = wired, lock producible, never run on that hardware;
+**unsupported** = the package does not claim it.
+
+| Engine | `cpu` | `cuda` | `mps` | `rocm` |
+|---|---|---|---|---|
+| `kokoro` | **verified here** | experimental | experimental | unsupported |
+| `phonon` | **verified here** | unsupported — container only | experimental | unsupported |
+| `qwen3_tts` | **verified here** | **verified here** | experimental | experimental |
+| `qwen3_tts_fast` | unsupported — CUDA-only package | **verified here** | unsupported | unsupported |
+| `mock` | **verified here** | unsupported | unsupported | unsupported |
+| `mock_asr` | **verified here** | unsupported | unsupported | unsupported |
+
+Why the refusals are refusals:
+
+- **`qwen3_tts_fast` is CUDA-only.** Its METADATA says *"The Torch backend requires an
+  NVIDIA GPU with CUDA"*, and its graph code calls `torch.cuda.CUDAGraph()`
+  unconditionally. There is no ROCm or HIP claim anywhere in the distribution — the
+  "ROCm notes" comment this repo used to carry was unsourced and is gone. Its only
+  non-NVIDIA path is the GGML/Metal backend, which is not shipped here.
+- **`phonon` has no CUDA wheel.** NVIDIA support is the
+  `ghcr.io/fermionresearch/phonon-cuda` **container**, not a package extra, and
+  `fermion.load_speech` takes no device kwarg to pass. Its Apple path is the `mlx` extra,
+  exposed here as `mps` (`FERMION_DEVICE=mlx`) and experimental.
+- **`mock`/`mock_asr` are CPU by construction** — no dependencies, no torch, always
+  `gpu_vram_mb: 0`.
+
+### What the 0 MB claim covers
+
+Only `device=cpu`. The shipped `kokoro` and `phonon` venvs hold CPU torch, set
+`CUDA_VISIBLE_DEVICES=""` before the torch import and report `gpu_vram_mb: 0`; that is a
+verified property of the `cpu` variant. Their `cuda`/`mps` paths are **experimental** and
+report real memory (`torch.cuda.memory_allocated()` / `torch.mps.current_allocated_memory()`),
+so the existing 0 MB assertions apply to the CPU path only.
 
 ## Speech in: the transcribe path
 
@@ -220,18 +408,23 @@ numbers and dependency findings: [phase0-report.md](phase0-report.md).
 
 `kokoro` is the zero-GPU engine: a real neural TTS model (82M parameters,
 Apache-2.0) that runs on the CPU at 3.4–5.2× real time, uses **0 MB of VRAM** and
-emits native 24 kHz mono audio. Nothing about it touches CUDA — the engine venv
-installs torch from the `pytorch-cpu` index, and the worker sets
+emits native 24 kHz mono audio. On its shipped `cpu` variant nothing about it touches
+CUDA: the manifest declares `device: cpu` and `supported_devices: [cpu, cuda, mps]`, the
+engine venv installs torch from the `pytorch-cpu` index, and the worker sets
 `CUDA_VISIBLE_DEVICES=""` before importing torch and passes `device="cpu"` to
-`KPipeline` (whose default would auto-select CUDA on a GPU box).
+`KPipeline` (whose default would auto-select CUDA on a GPU box). The `cuda` and `mps`
+variants are **experimental**: they swap the venv for a GPU build, make
+`CUDA_VISIBLE_DEVICES=""` conditional, pass the resolved device through, and report real
+memory instead of 0 MB.
 
 | | |
 |---|---|
 | Model | `kokoro-82m` — `hexgrad/Kokoro-82M` (Apache-2.0), 82M parameters |
-| Backend | `kokoro==0.9.4` (Apache-2.0), CPU-only PyTorch, `engines/kokoro/.venv` |
+| Backend | `kokoro==0.9.4` (Apache-2.0), CPU-only PyTorch on the `cpu` variant, `engines/kokoro/.venv` |
 | Weights | 363 MB repo, 327 MB `kokoro-v1_0.pth`, fetched through the HF cache |
 | Native rate | 24,000 Hz mono int16 — no resampling |
-| VRAM | **0 MB**: `gpu_vram_mb: 0`, `torch.version.cuda is None`, no `nvidia-*` wheel |
+| Devices | `cpu` **verified here** · `cuda` experimental · `mps` experimental · `rocm` unsupported |
+| VRAM | **0 MB on `device=cpu`**: `gpu_vram_mb: 0`, `torch.version.cuda is None`, no `nvidia-*` wheel |
 | Modes | `custom_voice` only — no clone, no design, no `instruct` |
 | Languages | `Auto`, `English` |
 | Streaming | native: one chunk per pipeline result, cancelled between chunks |
@@ -304,16 +497,17 @@ would need a custom downloader.
 `phonon` is the listening half of the daemon and the first shipped `kind: asr`
 engine. It is a real speech recogniser — a 0.6B FastConformer/TDT model compressed
 to int6 — that runs on the **CPU** at ≈42–48× real time, uses **0 MB of VRAM**
-and comes from a **156 MB** download. It declares `device: cpu`, so it is exempt
-from the GPU owner slot: transcribing while a Qwen model is resident does not evict
-it.
+and comes from a **156 MB** download. It declares `device: cpu` and
+`default_device: cpu`, so it is exempt from the GPU owner slot: transcribing while a
+Qwen model is resident does not evict it.
 
 | | |
 |---|---|
 | Models | `phonon-2.5` (default, 25 languages, 156 MB), `phonon-2.5-en` (English, 158 MB), `phonon-2` (164 MB, `quality_tier: fast`) |
 | Backend | `fermion-research==0.2.15`, CPU-only PyTorch, `engines/phonon/.venv` |
 | Licence | **CC-BY-4.0 weights** (derived from NVIDIA Parakeet TDT 0.6B v3), **Apache-2.0 code**. Attribution is required on redistribution; the model card and `NOTICE` carry it |
-| VRAM | **0 MB**: `CUDA_VISIBLE_DEVICES=""` before the torch import, `gpu_vram_mb: 0`, no `nvidia-*` wheel |
+| Devices | `cpu` **verified here** · `mps` experimental (the `mlx` extra, `FERMION_DEVICE=mlx`) · `cuda` **unsupported** — the NVIDIA path is a container · `rocm` unsupported |
+| VRAM | **0 MB on `device=cpu`**: `CUDA_VISIBLE_DEVICES=""` before the torch import, `gpu_vram_mb: 0`, no `nvidia-*` wheel |
 | Modes | `asr`. No speech output at all — `synthesize` on it is `BAD_REQUEST` |
 | Languages | 25 with `phonon-2.5`: en, es, fr, de, it, pt, nl, pl, ru, uk, ro, cs, sk, bg, hr, sv, da, fi, et, lv, lt, hu, sl, mt, el |
 | Capabilities | `word_timestamps: true`, `hotwords: true`, `multilingual: true` |
@@ -321,7 +515,12 @@ it.
 
 Phonon's `pyproject.toml` limits uv's resolution environments to Linux, Windows and
 Apple silicon. Fermion pins `torch>=2.2,<2.3` on Intel macOS, which cannot coexist with
-this engine's `torch==2.15.0` CPU pin; Intel Macs are not a supported Phonon host.
+this engine's `torch==2.15.0` CPU pin; **Intel Macs are not a supported Phonon host**, and
+no device variant changes that. The only other variant is `mps` — the `mlx` extra,
+mapped to `FERMION_DEVICE=mlx`, experimental and never executed on Apple silicon. There
+is no `cuda` variant to install: `fermion`'s NVIDIA path is the
+`ghcr.io/fermionresearch/phonon-cuda` container, not a wheel, and `load_speech` takes no
+device kwarg.
 
 Phonon has **no per-request language control** on 2.5: it auto-detects, and the
 worker reports `"auto"` when the backend says nothing. It also has **no confidence
@@ -395,12 +594,24 @@ models:
     mode: custom_voice        # clone | custom_voice | voice_design
     supports_instruct: false
     preset_speakers: [Ash, Blair]
+
+supported_devices: [cpu]      # runtime devices the backend can serve
+default_device: cpu           # what `auto` resolves to before the host is considered
 ```
 
 An ASR engine swaps `kind: asr` / `device: cpu` in, drops `mode`/`preset_speakers`,
 and adds `word_timestamps`/`hotwords`/`multilingual` to `capabilities`. The full
 walkthrough, with a complete `faster_whisper` sketch, is in
 [`engines/ADDING_AN_ENGINE.md#6-adding-an-asr-engine`](../engines/ADDING_AN_ENGINE.md#6-adding-an-asr-engine).
+
+`supported_devices` and `default_device` are new in v0.6.0 and are **required keys in
+practice**: `EngineManifest` forbids unknown keys, so a manifest carrying a typo silently
+drops the engine instead of failing loudly. Defaults are `["cpu"]` and `null`, which is
+why every older manifest keeps loading; a GPU engine should declare them explicitly.
+Adding a non-default variant also means adding `variants/<device>/{pyproject.toml,uv.lock}`
+with `[tool.agent-voice] device = "<device>"`, and following the two index rules in
+[Device variants](#device-variants) — a variant whose lock cannot be produced is not
+installable and the pair stays `unsupported`.
 
 The shipped `engines/kokoro/engine.yaml` is the worked example of a CPU **TTS**
 engine: `device: cpu`, `est_vram_gb: 0.0`, `voice_clone: false`, one
@@ -421,6 +632,11 @@ Rules that keep the system honest:
 - `kind` and `device` are declarations, not hints. `kind: asr` puts the engine in
   the transcription family; `device: cpu` exempts it from the GPU owner slot. Say
   `device: cpu` only if the worker really allocates no VRAM.
+- `supported_devices` is a claim about the **backend**, `device` is about
+  **scheduling**, and they are different fields on purpose. Declaring `cuda` in
+  `supported_devices` promises a variant that installs and runs; if you have not run it
+  on that hardware, the pair belongs in `DEVICE_SUPPORT` as `experimental`, not
+  `verified`, and `--experimental` is required to install it.
 - `worker.py` must keep reading the socket while inference runs, so `cancel` and
   `health` land mid-decode. Copy the parent-death guards
   (`PR_SET_PDEATHSIG` + a 2 s `os.getppid()` poll) or an orphan keeps VRAM.
@@ -461,14 +677,20 @@ skips the prompt).
 ## GPU lifecycle
 
 - **0 workers at boot, 0 MB VRAM.** Only the core daemon runs; it holds no model
-  code. When a `kokoro` or `phonon` worker *is* resident it still contributes 0 MB
-  of VRAM — the model lives in system RAM.
+  code. When a `kokoro` or `phonon` worker *is* resident on `device=cpu` it still
+  contributes 0 MB of VRAM — the model lives in system RAM. Their experimental
+  cuda/mps variants do allocate, and report what they allocate.
 - **`device: cpu` engines never take the GPU slot.** `_begin_job` skips
   `_acquire_gpu` for them, so a transcription runs next to a resident Qwen model
   instead of evicting it, and `gpu_status().active_engine` keeps meaning "the GPU
   owner" rather than "whatever ran last". The VRAM-pressure reaper skips them too.
+  Scheduling uses the **resolved** runtime device, not the static `device` field, so
+  a `kokoro` switched to `cuda` takes an accelerator slot and a `qwen3_tts` switched
+  to `cpu` does not.
 - **The cache is consulted before any worker is spawned.** A hit costs a disk
-  read and never wakes the GPU.
+  read and never wakes the GPU. The resolved **device** is part of the cache key:
+  a CPU render and a CUDA render of the same text are not bit-identical, so they must
+  not share an entry.
 - **Workers are lazy and reapable.** A worker spawns on the first uncached request
   for its engine and is reaped after `MODEL_IDLE_TTL_SECONDS` (default 900) idle
   seconds.
@@ -487,7 +709,10 @@ skips the prompt).
 `workers`, `vram_used_mb`, `vram_free_mb`, `queue_depth`, `in_flight`,
 `unload_in_seconds`, `last_used_at`, and `cpu_engines[]` — the alive workers that
 hold no VRAM, so `active_engine` can keep meaning "the GPU owner" while a
-transcription is plainly visible.
+transcription is plainly visible. v0.6.0 adds `worker_devices` (`{engine: device}`),
+`worker_vram_mb` (`{engine: mb | null}`) and `vram_source`
+(`nvml` | `worker` | `none`), so a caller can tell a real 0 MB from an unknown one.
+`server_info()` gains `device` and `devices` for the same reason.
 
 ## Concurrency and backpressure
 
@@ -527,6 +752,8 @@ uv run agent-voice models download qwen3_tts 1.7b-base
 # then either set AGENT_VOICE_DEFAULT_ENGINE=qwen3_tts or pass engine="qwen3_tts"
 ```
 
-It is slower per request and streams in an emulated way, but it is reliable. See
+It is slower per request and streams in an emulated way, but it is reliable. It is also
+the only Qwen backend with a `cpu`, `mps` or `rocm` variant — `qwen3_tts_fast` is
+CUDA-only — so a machine without an NVIDIA GPU uses `qwen3_tts` or the CPU engines. See
 [troubleshooting.md](troubleshooting.md#cuda-graph-capture-fails-qwen3_tts_fast)
 for the failure signature and the VRAM-free retry.

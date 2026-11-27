@@ -11,6 +11,211 @@ given for every release so a tag can be verified against the history.
 
 No unreleased changes.
 
+## [0.6.0] — 2026-11-27 — `<commit>`
+
+"Install in one command, let setup detect the hardware, and switch an engine between
+CPU, CUDA, MPS and ROCm — with a support matrix that says which pairs were actually
+run."
+
+### Added
+
+- **One-command installers.** `scripts/install.sh` (POSIX `sh`) and
+  `scripts/install.ps1` (PowerShell, **experimental/unverified on real Windows**):
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/000jd/agent-voice/main/scripts/install.sh | sh
+  irm https://raw.githubusercontent.com/000jd/agent-voice/main/scripts/install.ps1 | iex
+  ```
+
+  The default version is the **latest release tag**, resolved with
+  `git ls-remote --tags --refs` and semver-sorted; `main` is installed only for an
+  explicit `--ref main`. Flags: `--dir`, `--version`, `--ref`, `--repo`, `--yes`,
+  `--profile`, `--download`/`--no-download`, `--no-setup`, `--uninstall`, `--dry-run`,
+  `--help` (PowerShell mirrors them as `-Dir`, `-Version`, `-Ref`, `-Repo`, `-Yes`,
+  `-Profile`, `-Download`, `-NoDownload`, `-NoSetup`, `-Uninstall`, `-DryRun`). `uv` is
+  installed only if missing and only with consent; no `sudo`, no telemetry; every
+  subprocess is an argv list. `--dry-run` prints every action and `argv` and writes
+  nothing. **The data directory is a sibling of the install directory**
+  (`~/.local/share/agent-voice-data`, `%LOCALAPPDATA%\agent-voice-data`) and
+  `--uninstall` never removes it, so re-installing costs no voices, lexicons, cache or
+  weights. Docs: `docs/install/one-command.md`.
+- **`agent-voice setup`** — a hardware-aware wizard with a pure planning core
+  (`setup_wizard.py`) and injected `Runner`/`Downloader`. Flags: `-y/--yes`,
+  `--non-interactive`, `--profile auto|cpu-only|nvidia-gpu|apple-silicon`,
+  `--device auto|cpu|cuda|mps|rocm`, `--engines <csv>`, `--download`/`--no-download`,
+  `--dry-run`. Interactive only on a real TTY (and not for `--yes`,
+  `--non-interactive` or `--dry-run`); with no terminal and no `--yes` it prints the
+  plan, applies nothing and exits non-zero telling you to re-run with `--yes`.
+  **`--yes` alone never downloads weights** — only an explicit `--download` (or an
+  interactive yes) does. It writes `<home>/.env` atomically with
+  mode `0600`, preserving comments and unknown keys, after backing the old file up to
+  `.env.bak` (or `.env.<UTC>.bak` if a backup exists — an existing backup is never
+  overwritten), records **absolute** `DATA_DIR`/`ENGINES_DIR`/`AGENT_VOICE_HOME` plus the
+  device and default-engine settings, never echoes `AGENT_VOICE_API_KEY`, then runs
+  `doctor` and prints the `mcp-config` snippet and the per-pair support table.
+- **Hardware detection** (`src/agent_voice/hardware.py`) — zero torch, zero engine
+  imports, every OS/GPU branch injectable. NVIDIA via `nvidia-smi` (argv list,
+  `shell=False`, timeout), AMD via `rocm-smi`/`rocminfo`, Apple silicon via
+  `sys.platform`/`platform.machine`, RAM via `/proc/meminfo`, `sysctl` or
+  `GlobalMemoryStatusEx`, tools via `shutil.which`. `DEVICE_SUPPORT` is the single
+  support matrix; `recommend_profile()` uses **only verified pairs as defaults**, with
+  thresholds that agree with `MAX_GPU_VRAM_GB=12.5` / `MIN_FREE_VRAM_GB=2.0`. The
+  measurements behind every row are in `docs/phase0-devices-report.md`.
+- **Device preference and switching.** `AGENT_VOICE_DEVICE=auto|cpu|cuda|mps|rocm` and
+  per-engine `AGENT_VOICE_DEVICES=kokoro=cpu,qwen3_tts=cuda`, resolved as
+  per-engine override → non-`auto` global → manifest `default_device` → host
+  accelerator, and validated against the manifest's `supported_devices` with an error
+  that names the engine, the device and the supported list. `engines install <id>
+  --device <d>` (and its `--experimental` gate) selects a variant project root under
+  `engines/<id>/variants/<device>/`, syncs it with `uv sync --project … --locked` and
+  `UV_PROJECT_ENVIRONMENT=<engine>/.venv`, and writes an `.variant` stamp (device +
+  torch version) next to the venv. `mock` and `kokoro` now declare `device: cpu`, so they
+  no longer take the single-GPU-owner slot while holding 0 MB. Only one variant per engine
+  is resident; switching replaces that engine's venv in place.
+- **Per-engine device plumbing.** Every worker takes the resolved device, reports it in
+  `hello`/`health`/`unload_model`, and reports real VRAM on cuda/rocm/mps instead of a
+  hard-coded 0. `server_info()` gains `device`/`devices`; `gpu_status()` gains
+  `cpu_engines[]`, `worker_devices`, `worker_vram_mb` and `vram_source`
+  (`nvml`|`worker`|`none`). The synthesis cache key includes the resolved device — a CPU
+  and a CUDA render are not bit-identical.
+- **Home anchoring.** `default_home()` is `AGENT_VOICE_HOME`, else the checkout that
+  holds both `pyproject.toml` and `engines/`, else `~/.agent-voice`; `get_settings()`
+  constructs `Settings(_env_file=home / ".env")`, so the daemon reads `<home>/.env`
+  rather than `$PWD/.env`. `Settings.home` exists, `data_dir`/`engines_dir` resolve
+  relative values against the home, `config_path`/`home` joined `SettingsLike`, and
+  `AGENT_VOICE_DATA_DIR` / `AGENT_VOICE_ENGINES_DIR` / `AGENT_VOICE_MCP_BASE_PATH` are
+  accepted as prefixed aliases (the `AGENT_VOICE_*` spelling wins). `mcp-config` uses
+  `default_home()` instead of `Path(__file__).parents[2]`, and the stdio proxy passes
+  `cwd=<home>` plus `AGENT_VOICE_HOME` to the daemon it spawns.
+- **`doctor` severity `INFO`.** Uninstalled engines and undownloaded model aliases that
+  you did **not** select are `INFO` (rank 1) instead of noise; a missing accelerator is
+  `INFO` because a CPU box is supported; selected-but-missing stays `WARN`; only `FAIL`
+  changes the exit code. New `hardware` row (OS/arch/cores/RAM/accelerator), `home` row
+  (resolved home/data/engines/config) and `device` row (per installed engine, resolved
+  device plus `verified`/`experimental`). The summary reads
+  `N checks, X optional, Y warning(s), no failures`.
+- **Device variants**: `qwen3_tts` ships `cpu`, `mps` and `rocm` variant projects under
+  `variants/` (canonical project = `cuda`); `kokoro` ships `cuda` and `mps` (canonical =
+  `cpu`); `phonon` ships `mps` (Fermion's `mlx` extra, canonical = `cpu`). Each has its
+  own `pyproject.toml`, `uv.lock` and `[tool.agent-voice] device`. The canonical
+  committed `uv.lock` is never rewritten — verified byte-for-byte (same sha256 *and*
+  mtime). The ROCm and MPS locks were produced on this Linux host; those pairs stay
+  `experimental` because nothing was run on AMD or Apple silicon. An
+  `engines install <id> --device <d>` for a supported pair with no shipped variant
+  project is refused with the list of variants the checkout actually has.
+- **Documentation of the honest matrix.** The README and `docs/engines.md` now carry the
+  same per-`(engine, device)` table as `hardware.py:DEVICE_SUPPORT`, with
+  `verified here` / `experimental` / `unsupported` and the measured evidence for each
+  row. `docs/config.md` gains a Hardware section and the `[PATH]` table with the alias
+  spellings; `docs/troubleshooting.md` gains the stale-variant 409, the `VIRTUAL_ENV`
+  warning, the no-variant and wrong-device cases, the interrupted-installer and
+  `AGENT_VOICE_HOME` sections; `.env.example` gains `# --- Hardware ---` and the home
+  notes.
+
+### Changed
+
+- **A device is a dependency set, not a runtime flag.** Each committed `uv.lock` bakes
+  the torch index into every torch entry, so CPU and CUDA lock different torch builds
+  (`2.15.0+cpu`/`2.11.1+cpu` versus `2.11.0+cu128`/`2.11.0+cu128`). `engines install` now
+  always passes `--locked`: without it, a `uv sync` against a drifted variant silently
+  rewrites the committed lock (measured: the sha changed and a package was added).
+- **Scheduling uses the resolved device.** `_begin_job`, `ensure_worker` and the reaper
+  reason about the resolved device class (cpu versus accelerator, with MPS/ROCm in the
+  accelerator class) rather than the static `device` field, so a `kokoro` switched to
+  `cuda` takes an accelerator slot and a `qwen3_tts` switched to `cpu` does not.
+- **OOM and death classification is device-aware**: `MPS backend out of memory`,
+  `hipErrorOutOfMemory` and `DefaultCPUAllocator` are recognised, and `CUDA_OOM` is only
+  used for cuda/rocm.
+- **`Settings` reads no `.env` by default.** `model_config` is `env_file=None` and
+  `get_settings()` supplies `<home>/.env`, so a direct `Settings(...)` in a test is
+  hermetic; `_env_file=None` remains the escape hatch.
+- **README install order.** The one-command installers come first and the `git clone`
+  from-source path is a secondary section; both end at `agent-voice setup` or the
+  per-engine commands. Platform support is now a per-device matrix rather than three
+  rows.
+- `pyproject.toml` and `src/agent_voice/__init__.py`: version `0.6.0`. No dependency
+  changes; the core venv still installs no torch.
+
+### Security
+
+- **`SECURITY.md` gains "Supply chain and the one-command installer"**: what each
+  installer fetches, tag pinning by default, `--dry-run` as the audit path, no `sudo`,
+  no telemetry, argv-list subprocesses, the data directory living outside the install
+  directory, and the inherent `curl | sh` trust decision with the reviewed-clone,
+  `--repo <local path>` and from-source alternatives. The Supported versions table is
+  current again (`0.6.x` / `0.5.x` / `≤0.4.x`).
+- **`engines install` cannot be tricked into an index override.** It never passes
+  `--index`, `--default-index`, `--index-url`, `UV_INDEX` or `UV_DEFAULT_INDEX` and
+  strips them from the environment: measured, `[tool.uv.sources]` wins over all of them,
+  and on the real CUDA project `--index` silently downgraded torch to `2.9.1+cu128`
+  while leaving torchaudio at `2.11.0+cu128` — a mismatched pair with a plausible-looking
+  venv.
+- **The setup `.env` writer is conservative.** It updates only known keys, preserves
+  comments and unknown keys byte-for-byte, writes atomically, uses mode `0600`, never
+  overwrites an existing backup, and never echoes the API key.
+- **`AGENT_VOICE_RESOLVED_DEVICE` is always overwritten** into a worker's environment
+  (never `setdefault`), so an inherited value cannot silently change the backend, and a
+  worker that reports a different device than it was given is a clear error rather than
+  a quiet downgrade.
+
+### Fixed
+
+- **`resolve_target`/`resolve_asr_target` check the manifest `kind` before the install
+  gate**, so on a fresh clone `speak(engine="phonon")` says "cannot speak" instead of
+  "install phonon" — the actionable error, first time.
+- **`PATH_OUTSIDE_BASE` names the real base.** The inbox case says
+  `path escapes the inbox (<inbox_dir>): <path>` instead of always claiming
+  `MCP_BASE_PATH`; the MCP-confined message stays byte-identical.
+- **`Settings(api_key="x")` is no longer silently dropped**, without letting the
+  standard `HOME`/`PORT`/`HOST`/`DEVICE` environment variables match fields. The home is
+  an `agent_home` field behind a `home` property, and constructor field names are mapped
+  to their aliases explicitly; `Settings(_env_file=None).home` is the checkout, not
+  `$HOME`.
+- **`auto` never silently chooses an `experimental` device when a verified one exists.**
+  On Apple, `qwen3_tts` (manifest default `cuda`) resolves to the verified CPU path, not
+  experimental MPS; an explicit `AGENT_VOICE_DEVICE=mps` still opts in.
+- **`GET /v1/engines` and MCP `list_engines` fill `resolved_device`** from the live
+  workers instead of always returning `null`.
+- **`pytest` works from the bare console script** without `PYTHONPATH`:
+  `[tool.pytest.ini_options] pythonpath = ["."]`, and the `PYTHONPATH` workaround is gone
+  from CI and the docs.
+- The MCP `_unwrap` guard no longer mangles a digit-only payload string into a number.
+- `doctor`'s `.env` probe reads `settings.config_path` (`<home>/.env`), and its fix
+  suggests `agent-voice setup`.
+- `kokoro` and `mock` declared no `device:`, so they inherited `gpu` and took the
+  single-GPU-owner slot while holding 0 MB. Both now declare `device: cpu`.
+- `scripts/install.sh` no longer duplicates its managed `.env` banner on a re-run, and
+  `setup` keeps the actionable suggestion when an engine variant is missing.
+
+### Known limitations
+
+- **`qwen3_tts` on CPU is slow, and the number is measured, not estimated**: 0.196–0.22×
+  realtime (about five times slower than realtime) and 5.55 GiB peak RSS for a 0.6B
+  checkpoint on a Ryzen 7 5700X. No speed multiplier is invented anywhere; use it for
+  short utterances when its voice matters.
+- **Only the shipped variants are installable.** `qwen3_tts` offers `cuda` (canonical),
+  `cpu`, `mps` and `rocm`; `kokoro` offers `cpu` (canonical), `cuda` and `mps`; `phonon`
+  offers `cpu` (canonical) and `mps`. The `(qwen3_tts, rocm)` and `(qwen3_tts, mps)`
+  pairs are `experimental` — the locks were produced, but nothing was run on AMD or Apple
+  silicon. `--experimental` is required; an unsupported pair is refused regardless.
+- **Only one device variant per engine can be resident.** The venv is the canonical
+  `engines/<id>/.venv`, and switching replaces its contents. On a cold `uv` cache that
+  is a full download: the CPU venv is ~1.6 GB, the CUDA venv ~7.3 GB.
+- **MPS and ROCm are `experimental`.** Both locks are producible from Linux, and nothing
+  was installed or run on Apple silicon or an AMD GPU. `recommend_profile` never selects
+  them; `engines install` requires `--experimental`.
+- **Unsupported pairs stay refused**, `--experimental` or not: `qwen3_tts_fast` is
+  CUDA-only (no ROCm or HIP claim exists in the distribution), and `phonon`'s NVIDIA
+  path is the `ghcr.io/fermionresearch/phonon-cuda` container, not a wheel.
+- **The 0 MB VRAM claim holds only for `device=cpu`.** The `kokoro`/`phonon` cuda/mps
+  paths report real memory and are experimental; the existing 0 MB assertions stay on
+  the CPU path.
+- **Windows is unverified**, including `scripts/install.ps1`, which is parse-checked at
+  best. Treat both as experimental.
+- **Intel macOS is not a supported Phonon host**: `fermion` pins `torch>=2.2,<2.3`
+  there, which cannot coexist with the engine's `torch==2.15.0` CPU pin.
+- `models download --no-wait` is still accepted but ignored (L1, unchanged).
+
 ## [0.5.0] — 2026-11-27 — `0d4d31d`
 
 "Speech in: pluggable ASR engines, agent-native two-stage dubbing, and a CPU
@@ -525,7 +730,8 @@ Initial release.
 - `MCP_BASE_PATH` confinement for reference reads and artifact relocation.
 - Every external command run as an argv list with `shell=False`.
 
-[Unreleased]: https://github.com/000jd/agent-voice/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/000jd/agent-voice/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/000jd/agent-voice/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/000jd/agent-voice/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/000jd/agent-voice/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/000jd/agent-voice/compare/v0.3.2...v0.3.3

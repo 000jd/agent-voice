@@ -48,3 +48,12 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu" }]
+
+# Which device this project root installs for. `engines install --device` compares
+# it against the requested device and falls through to `variants/<device>/` when
+# they differ, so this is a build identity, not a runtime hint. The experimental
+# Apple silicon pair lives in variants/mps/: it installs Fermion's `mlx` extra
+# and the PyPI macOS arm64 torch wheel, and the worker maps `mps` to
+# FERMION_DEVICE=mlx.
+[tool.agent-voice]
+device = "cpu"

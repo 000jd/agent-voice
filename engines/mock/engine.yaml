@@ -5,6 +5,13 @@ backend_version: "1"
 protocol_version: 1
 venv_python: null
 
+# `device: cpu` is the scheduling class and fixes a v0.5.0 bug: the schema
+# default is `gpu`, so this 0 MB engine claimed the single-accelerator slot.
+# The tone generator has no torch and no accelerator path at all.
+device: cpu
+default_device: cpu
+supported_devices: [cpu]
+
 capabilities:
   streaming: true
   pcm_native: true

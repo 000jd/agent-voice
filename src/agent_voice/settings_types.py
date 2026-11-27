@@ -18,6 +18,8 @@ class SettingsLike(Protocol):
     default_engine: str
     default_asr_engine: str
     default_voice_id: str
+    device: str
+    devices: dict[str, str]
     model_idle_ttl_seconds: float
     max_active_engines: int
     max_resident_models: int
@@ -44,8 +46,12 @@ class SettingsLike(Protocol):
     allowed_hosts: list[str]
     allow_any_path: bool
     mcp_base_path: str
+    home: Path
     data_dir: Path
     engines_dir: Path
+
+    @property
+    def config_path(self) -> Path: ...
 
     @property
     def voices_dir(self) -> Path: ...

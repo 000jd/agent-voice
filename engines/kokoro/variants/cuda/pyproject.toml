@@ -1,0 +1,47 @@
+[project]
+name = "agent-voice-engine-kokoro"
+version = "0.1.0"
+description = "Kokoro-82M TTS backend for agent-voice (CUDA variant)"
+requires-python = ">=3.12,<3.13"
+
+# Same dependency set as ../../pyproject.toml; only the torch wheel index changes.
+#
+# torch is `>=2.5.1` here instead of the canonical `==2.15.0`, and that is a
+# measured fact rather than a relaxation: the cu128 index publishes no 2.15.0
+# wheel at all (its newest is 2.11.0 — see docs/phase0-devices-report.md and
+# `curl https://download.pytorch.org/whl/cu128/torch/`). Kokoro 0.9.4 is
+# device-agnostic, so the newest cu128 build is the right one to pair with it;
+# pinning a version the index does not carry would only make the variant
+# unlockable. The CPU project keeps its exact 2.15.0 pin.
+#
+# experimental: neither this variant's lock nor a Kokoro CUDA run has been
+# exercised on a GPU in this release. The lock is produced; a real 7/7
+# conformance run on CUDA is what would promote the pair to `verified`.
+#
+# en-core-web-sm is misaki[en]'s spaCy model for English G2P, declared directly
+# for the same reason as in the canonical project: misaki otherwise downloads it
+# with its own installer, which can target the wrong interpreter.
+dependencies = [
+    "kokoro==0.9.4",
+    "torch>=2.5.1",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+    "huggingface-hub>=0.26",
+]
+
+[tool.uv]
+# No build backend: this is a virtual project (worker.py is run, not installed),
+# so `uv sync` only materialises .venv.
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+
+[tool.agent-voice]
+device = "cuda"

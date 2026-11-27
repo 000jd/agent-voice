@@ -12,6 +12,18 @@ This backend has real token-level streaming via ``generate_*_streaming(chunk_siz
 so ``stream_pcm`` forwards audio while the model is still decoding and
 ``streaming_mode`` is ``"native"``. Cancellation is checked between yielded
 chunks *and* the generator is closed so the CUDA graph loop stops promptly.
+
+CUDA only, and the refusal is explicit rather than accidental: the installed
+``faster-qwen3-tts 0.5.4`` metadata requires an NVIDIA GPU with CUDA and drives
+``torch.cuda.CUDAGraph``, so there is no CPU or MPS code path to offer. When
+``AGENT_VOICE_RESOLVED_DEVICE`` resolves to anything but cuda/rocm, ``load_model``
+answers ``BAD_REQUEST`` naming engine ``qwen3_tts`` — the same model family with
+real cpu/mps/rocm paths — instead of failing deep inside the loader.
+
+CUDA-graph capture is an optimization, never a promise: ``warmup()`` may fail on
+a driver or a model that does not support it, and the worker then keeps working
+in eager mode. That is reported (``cuda_graphs`` in ``hello``/``health``) and
+logged to stderr instead of being swallowed.
 """
 
 from __future__ import annotations
@@ -46,6 +58,16 @@ PROMPT_CACHE_SIZE = 8
 # Reproduce it exactly so a warm cache hit is bit-identical to a cold compute.
 _ICL_APPEND_SILENCE = True
 
+ACCELERATOR_DEVICES: frozenset[str] = frozenset({"cuda", "rocm"})
+"""The only devices this backend has a code path for.
+
+``rocm`` is admitted because HIP is exposed through ``torch.cuda``, so the same
+``CUDAGraph`` code runs there. It is not *declared* in engine.yaml: the installed
+metadata makes no ROCm claim, so the resolver never selects it on its own.
+"""
+
+UNSUPPORTED_DEVICE_MARKER = "faster-qwen3-tts needs CUDA"
+
 # Request-level mistakes the worker can spot before touching the model. Marker ->
 # fix, so _classify can answer BAD_REQUEST with a suggestion an agent can act on
 # instead of a generic INTERNAL_ERROR.
@@ -62,7 +84,23 @@ CLIENT_ERROR_HINTS: tuple[tuple[str, str], ...] = (
         "unknown mode",
         "Use mode='clone', 'custom_voice' or 'voice_design'.",
     ),
+    (
+        UNSUPPORTED_DEVICE_MARKER,
+        "Use engine qwen3_tts for cpu/mps/rocm (same checkpoints, no CUDA graphs), or "
+        "run this engine on cuda with AGENT_VOICE_DEVICES=qwen3_tts_fast=cuda.",
+    ),
 )
+
+
+def resolved_device() -> str:
+    """The runtime device the daemon resolved for this engine.
+
+    Defaults to ``cuda``: that is the only build this engine installs, so a
+    worker started outside the daemon (a conformance run, a GPU test) keeps the
+    behaviour it had before the device variable existed.
+    """
+    value = (os.environ.get("AGENT_VOICE_RESOLVED_DEVICE") or "").strip().lower()
+    return value or "cuda"
 
 
 def _client_error_suggestion(message: str) -> str:
@@ -165,6 +203,10 @@ class FastEngine:
         self.in_flight = 0
         self._lock = threading.Lock()
         self.backend_version = _read_dist_version("faster-qwen3-tts")
+        self.device = resolved_device()
+        self.cuda_graphs = False
+        """True only after a ``warmup()`` actually captured. ``hello``/``health``
+        report it so a silent fallback to eager mode is visible to the daemon."""
         # (alias, sha256, ref_text, xvec, backend_version) -> dict accepted as
         # voice_clone_prompt by faster_qwen3_tts.
         self.prompt_cache: OrderedDict[tuple, dict] = OrderedDict()
@@ -174,6 +216,14 @@ class FastEngine:
         if alias in self.loaded:
             return self.loaded[alias]
 
+        if self.device not in ACCELERATOR_DEVICES:
+            # Refused before the import: a CUDA-graph backend has nothing to offer
+            # a cpu/mps runtime, and the sibling engine has a real path there.
+            raise ValueError(
+                f"{UNSUPPORTED_DEVICE_MARKER}: this backend requires an NVIDIA GPU "
+                f"with CUDA and is not available on device '{self.device}'"
+            )
+
         from faster_qwen3_tts import FasterQwen3TTS
 
         repo = self.models.get(alias)
@@ -182,20 +232,39 @@ class FastEngine:
 
         model = FasterQwen3TTS.from_pretrained(repo)
         # Captures CUDA graphs so the first real request is not the slow one.
+        # An optimization, not a requirement: on failure the model still generates
+        # in eager mode, so the failure is reported and logged rather than hidden.
+        # stderr is what the daemon reads as the crash report, hence the warning
+        # goes there.
         try:
             model.warmup(prefill_len=100)
-        except Exception:
-            pass
+            self.cuda_graphs = True
+        except Exception as exc:
+            self.cuda_graphs = False
+            print(
+                "qwen3_tts_fast worker: CUDA graph capture failed "
+                f"({type(exc).__name__}: {exc}); continuing without graphs",
+                file=sys.stderr,
+            )
         self.loaded[alias] = model
         return model
 
-    def _vram_mb(self) -> int:
+    def _vram_mb(self) -> int | None:
+        """This worker's device allocation in MB, or ``None`` when it cannot say.
+
+        ``None`` means "no allocator to ask" (the device is not cuda/rocm, so the
+        worker will refuse at load anyway); a real number is the allocator's own.
+        """
+        if self.device not in ACCELERATOR_DEVICES:
+            return None
         try:
             import torch
 
-            return int(torch.cuda.memory_allocated() / 1024**2)
+            if torch.cuda.is_available():
+                return int(torch.cuda.memory_allocated() / 1024**2)
         except Exception:
-            return 0
+            return None
+        return None
 
     def _seed(self, seed) -> None:
         if seed is None:
@@ -225,6 +294,8 @@ class FastEngine:
                 },
                 "loaded_models": list(self.loaded),
                 "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
+                "cuda_graphs": self.cuda_graphs,
                 "pid": os.getpid(),
             }
         )
@@ -234,11 +305,23 @@ class FastEngine:
         try:
             self._load(alias)
         except Exception as exc:
-            self._error(msg["id"], self._classify(exc), f"could not load {alias}: {exc}",
-                        "Check the model is downloaded and the GPU has free VRAM.")
+            self._error(
+                msg["id"],
+                self._classify(exc),
+                f"could not load {alias}: {exc}",
+                _client_error_suggestion(str(exc))
+                or "Check the model is downloaded and the GPU has free VRAM.",
+            )
             return
         self.conn.send_json(
-            {"id": msg["id"], "model_alias": alias, "loaded_models": list(self.loaded)}
+            {
+                "id": msg["id"],
+                "model_alias": alias,
+                "loaded_models": list(self.loaded),
+                "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
+                "cuda_graphs": self.cuda_graphs,
+            }
         )
 
     def unload_model(self, msg: dict) -> None:
@@ -251,11 +334,21 @@ class FastEngine:
             import torch
 
             gc.collect()
-            torch.cuda.empty_cache()
+            # Guarded: an empty device is exactly what a bad resolve produces, and
+            # torch.cuda.empty_cache() on a build without CUDA is not free.
+            if self.device in ACCELERATOR_DEVICES and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except Exception:
             pass
         self.conn.send_json(
-            {"id": msg["id"], "model_alias": alias, "loaded_models": list(self.loaded)}
+            {
+                "id": msg["id"],
+                "model_alias": alias,
+                "loaded_models": list(self.loaded),
+                "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
+                "cuda_graphs": self.cuda_graphs,
+            }
         )
 
     def health(self, msg: dict) -> None:
@@ -265,6 +358,8 @@ class FastEngine:
                 "ok": True,
                 "loaded_models": list(self.loaded),
                 "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
+                "cuda_graphs": self.cuda_graphs,
                 "in_flight": self.in_flight,
             }
         )
@@ -567,6 +662,8 @@ class FastEngine:
                     "model_alias": msg["model_alias"],
                     "backend_name": BACKEND_NAME,
                     "backend_version": self.backend_version,
+                    "gpu_vram_mb": self._vram_mb(),
+                    "device": self.device,
                 }
             )
         except Exception as exc:
@@ -623,6 +720,8 @@ class FastEngine:
                     "done": True,
                     "duration_sec": produced / 2 / SAMPLE_RATE,
                     "streaming_mode": "native",
+                    "gpu_vram_mb": self._vram_mb(),
+                    "device": self.device,
                 }
             )
         except Exception as exc:
@@ -641,11 +740,22 @@ class FastEngine:
                 self.in_flight -= 1
             self.cancel_events.pop(request_id, None)
 
-    @staticmethod
-    def _classify(exc: BaseException) -> str:
+    def _classify(self, exc: BaseException) -> str:
+        """Map a failure onto the daemon's taxonomy.
+
+        ``CUDA_OOM`` is only claimed on cuda/rocm; every other device is refused
+        at load, so any other device's allocation failure is an INTERNAL_ERROR
+        with the allocator's own message rather than a misleading CUDA verdict.
+        """
         message = str(exc)
-        if "out of memory" in message.lower() or "OutOfMemoryError" in type(exc).__name__:
-            return "CUDA_OOM"
+        lowered = message.lower()
+        oom = (
+            "out of memory" in lowered
+            or "outofmemory" in type(exc).__name__.lower()
+            or "defaultcpuallocator" in lowered
+        )
+        if oom:
+            return "CUDA_OOM" if self.device in ACCELERATOR_DEVICES else "INTERNAL_ERROR"
         if _client_error_suggestion(message):
             return "BAD_REQUEST"
         return "INTERNAL_ERROR"

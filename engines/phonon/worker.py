@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phonon (Fermion Research) worker — CPU-only ASR, IPC protocol v1.
+"""Phonon (Fermion Research) worker — ASR, IPC protocol v1.
 
 Runs inside ``engines/phonon/.venv`` (torch==2.15.0+cpu from the explicit
 pytorch-cpu index, fermion-research==0.2.15). Speaks the frozen v1 protocol
@@ -7,13 +7,18 @@ exactly like ``engines/mock/worker.py``: a dedicated reader thread keeps
 ``cancel``/``health`` answerable while a decode runs, and a parent-death watchdog
 stops an orphaned worker from lingering.
 
-Zero-GPU guarantees, in order of importance:
+The runtime device comes from ``AGENT_VOICE_RESOLVED_DEVICE`` (``cpu`` by
+default, so a worker started outside the daemon keeps the CPU behaviour it had).
+Two rules keep it honest:
 
-1. ``CUDA_VISIBLE_DEVICES`` is emptied *before* torch is imported, so the process
-   never sees a device even if the daemon exported one.
-2. ``FERMION_DEVICE=cpu`` is defaulted for the same reason: the backend's own
-   device selection must not decide to use a GPU the manifest says it does not.
-3. ``gpu_vram_mb`` is always 0 and no ``torch.cuda`` API is ever called.
+1. ``CUDA_VISIBLE_DEVICES`` is emptied *before* torch is imported — but only on
+   the cpu path. Fermion's declared Apple path is MLX, not Metal-via-torch, so a
+   ``mps`` resolve must not blank the device list.
+2. ``FERMION_DEVICE`` follows the resolved device: ``cpu`` -> ``cpu``,
+   ``mps`` -> ``mlx``. The backend's own selection must never decide to use a
+   device the manifest says it does not.
+3. ``gpu_vram_mb`` is 0 on cpu and ``None`` on mps: the MLX allocator is not
+   torch's, so torch cannot measure it and a near-zero number would be a lie.
 
 The library is imported **inside** ``load_model``, never at module scope: a venv
 whose torch/fermion install is broken still reaches ``hello`` (so the manager
@@ -51,11 +56,36 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-# --- zero-GPU, applied BEFORE torch/fermion import ---------------------------
-# Overwritten, not setdefault: a CUDA device exported by the daemon must not
-# reach this process. torch reads this at import time, hence the module scope.
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["FERMION_DEVICE"] = "cpu"
+# --- device selection, applied BEFORE torch/fermion import --------------------
+RESOLVED_DEVICE = (os.environ.get("AGENT_VOICE_RESOLVED_DEVICE") or "cpu").strip().lower()
+"""The runtime device the daemon resolved for this engine.
+
+Default ``cpu``: the canonical install is the CPU wheel, and a worker started
+outside the daemon (``engines test phonon``, the ASR test fixtures) must keep the
+behaviour it had before the variable existed.
+"""
+
+
+def fermion_device_for(device: str) -> str:
+    """Fermion's own switch for a resolved runtime device.
+
+    Fermion knows ``cpu`` and ``mlx``; ``mps`` is this project's spelling of the
+    Apple-silicon path, so it maps to ``mlx``. Only those two are declared in
+    engine.yaml, so nothing else can reach here through the resolver; a stale
+    environment that sets one anyway gets ``cpu`` while the load itself fails
+    loudly rather than half-claiming a GPU Fermion has no wheel for.
+    """
+    return "mlx" if device == "mps" else "cpu"
+
+
+if RESOLVED_DEVICE == "cpu":
+    # Overwritten, not setdefault: a CUDA device exported by the daemon must not
+    # reach a cpu worker, and torch reads this at import time. Deliberately *not*
+    # applied on mps: Fermion reaches Apple silicon through MLX, not a torch CUDA
+    # context, and blanking the list there would be a claim about torch that has
+    # nothing to do with the path being used.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["FERMION_DEVICE"] = fermion_device_for(RESOLVED_DEVICE)
 # stderr is captured by the daemon as the crash report; progress bars are noise.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
@@ -445,8 +475,19 @@ class PhononEngine:
         self._state_lock = threading.Lock()
         self._load_lock = threading.Lock()
         self.backend_version = BACKEND_VERSION
+        self.device = RESOLVED_DEVICE
 
     # -- model ----------------------------------------------------------
+    def _vram_mb(self) -> int | None:
+        """Device memory in MB, or ``None`` when this worker cannot measure it.
+
+        ``0`` on cpu is a measurement: nothing is on a device. On mps the model is
+        MLX-managed, and MLX owns its own allocator that torch cannot read, so
+        torch's ``current_allocated_memory`` would report a near-zero number and
+        imply the model is not loaded. ``None`` says "cannot say" instead.
+        """
+        return 0 if self.device == "cpu" else None
+
     def _repo(self, alias: str) -> str:
         repo = self.models.get(alias)
         if not repo:
@@ -549,9 +590,9 @@ class PhononEngine:
                 },
                 "languages": list(LANGUAGES),
                 "loaded_models": list(self.loaded_models),
-                "gpu_vram_mb": 0,
+                "gpu_vram_mb": self._vram_mb(),
                 "pid": os.getpid(),
-                "device": "cpu",
+                "device": self.device,
             }
         )
 
@@ -576,8 +617,8 @@ class PhononEngine:
                 "id": request_id,
                 "model_alias": alias,
                 "loaded_models": list(self.loaded_models),
-                "gpu_vram_mb": 0,
-                "device": "cpu",
+                "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
             }
         )
 
@@ -595,7 +636,8 @@ class PhononEngine:
                 "id": msg["id"],
                 "model_alias": alias,
                 "loaded_models": list(self.loaded_models),
-                "gpu_vram_mb": 0,
+                "device": self.device,
+                "gpu_vram_mb": self._vram_mb(),
             }
         )
 
@@ -606,9 +648,9 @@ class PhononEngine:
                 "ok": True,
                 "kind": KIND,
                 "loaded_models": list(self.loaded_models),
-                "gpu_vram_mb": 0,
+                "gpu_vram_mb": self._vram_mb(),
                 "in_flight": self.in_flight,
-                "device": "cpu",
+                "device": self.device,
             }
         )
 
@@ -721,6 +763,8 @@ class PhononEngine:
                     "duration_sec": _duration_sec(audio_path, words),
                     "text": text,
                     "truncated": bool(getattr(result, "truncated", False)),
+                    "device": self.device,
+                    "gpu_vram_mb": self._vram_mb(),
                     "segments": reply_segments,
                 }
             )

@@ -11,7 +11,7 @@
   (`agent-voice mcp`) for clients that cannot speak HTTP.
 
 The wire contract lives in `src/agent_voice/schemas.py` and is treated as frozen:
-fields are added, never silently repurposed. This document describes v0.5.0.
+fields are added, never silently repurposed. This document describes v0.6.0.
 
 Default base URL: `http://127.0.0.1:8000`. Interactive schema: `/docs`, `/redoc`
 and `/openapi.json`.
@@ -138,7 +138,7 @@ A request-body validation failure is a `422` whose `error_code` is also
 ### `GET /health`
 
 ```json
-{"status": "ok", "version": "0.5.0", "protocol_version": 1, "torch_loaded": false}
+{"status": "ok", "version": "0.6.0", "protocol_version": 1, "torch_loaded": false}
 ```
 
 `torch_loaded` is reported by looking for `torch` in the core daemon's
@@ -499,7 +499,9 @@ VRAM immediately.
 
 `GET /v1/engines` — `{"engines": [EngineEntry]}`, each with `engine_id`,
 `display_name`, `backend_name`, `backend_version`, `installed`, `venv_python`,
-`kind` (`tts`/`asr`), `device` (`gpu`/`cpu`), capability flags (`streaming`,
+`kind` (`tts`/`asr`), `device` (`gpu`/`cpu` scheduling class), `default_device`,
+`supported_devices`, `resolved_device` (the device a running worker reported),
+capability flags (`streaming`,
 `pcm_native`, `custom_voice`, `voice_design`, `instruct_control`, plus the ASR flags
 `word_timestamps`, `hotwords`, `multilingual` and `languages`), `models` and
 `why_unavailable`.
@@ -541,7 +543,7 @@ covered by the same guard, so a key protects `/mcp/*` too.
 Bidirectional: the client sends JSON control messages, the server sends binary
 PCM frames (24 kHz mono int16 LE) interleaved with JSON events.
 
-Handshake requirements (v0.5.0): a loopback `Host`, no foreign `Origin`, and — if
+Handshake requirements (v0.6.0): a loopback `Host`, no foreign `Origin`, and — if
 `AGENT_VOICE_API_KEY` is set — a valid credential via `Authorization: Bearer …` or
 `Sec-WebSocket-Protocol: bearer, <key>`.
 
@@ -663,7 +665,10 @@ questions that otherwise cost a failed synthesis round-trip:
 
 ```json
 {
-  "version": "0.5.0",
+  "version": "0.6.0",
+  "home": "/home/me/agent-voice",
+  "device": "auto",
+  "devices": {"kokoro": "cpu", "phonon": "cpu", "qwen3_tts_fast": "cuda"},
   "default_engine": "qwen3_tts_fast",
   "default_asr_engine": "phonon",
   "default_voice": "a1b2c3d4e5f6",
@@ -680,7 +685,9 @@ questions that otherwise cost a failed synthesis round-trip:
                    "word_timestamps": true, "hotwords": true,
                    "languages": ["en", "es", "fr"]}],
   "dubbing_available": true,
-  "gpu_status": {"active_engine": null, "loaded_models": [], "vram_used_mb": 631},
+  "gpu_status": {"active_engine": null, "loaded_models": [], "vram_used_mb": 631,
+                 "cpu_engines": [], "worker_devices": {}, "worker_vram_mb": {},
+                 "vram_source": "nvml"},
   "next_steps": []
 }
 ```
@@ -688,6 +695,8 @@ questions that otherwise cost a failed synthesis round-trip:
 | Field | Read it as |
 |---|---|
 | `voices_count` | `0` means you must clone a voice before a clone-only checkpoint can speak |
+| `home` | The resolved install home; `.env`, relative `DATA_DIR`/`ENGINES_DIR` and `mcp-config` are anchored here, not at the caller's cwd |
+| `device` / `devices` | The global preference and the per-engine effective device; a worker's actual report is in `gpu_status.worker_devices` |
 | `default_asr_engine` | Which `kind: asr` engine a transcription uses when none is named. Independent of `default_engine` |
 | `inbox_dir` | Where an agent-supplied `ref_audio_path`, `audio_path` or `media_path` must live unless `MCP_BASE_PATH` is set |
 | `preset_speakers` | Names `speak(speaker=…)` accepts on the default engine *right now*; empty means only a clone or a design can produce audio |
@@ -697,8 +706,12 @@ questions that otherwise cost a failed synthesis round-trip:
 | `dubbing_available` | `true` only when a TTS engine *and* an ASR engine are usable, so a dub can complete |
 | `next_steps` | Advisory list of suggested next actions, added in v0.3.3: empty when the default engine is installed, weights are cached and at least one voice or preset speaker is available; otherwise short copy-pasteable actions such as "Run `agent-voice engines install qwen3_tts_fast`." or "Put a 3-10 s reference clip in `<inbox_dir>` and call `clone_voice()`, or call `design_voice()`." It is advice, never an error — tool calls still enforce their own rules |
 
-`engines[]` entries also carry `kind` (`tts`/`asr`) and `device` (`gpu`/`cpu`), so an
-agent can tell which engine speaks, which listens, and which one will not touch VRAM.
+`engines[]` entries also carry `kind` (`tts`/`asr`), `device` (`gpu`/`cpu` scheduling
+class), `default_device`, `supported_devices` and `resolved_device`, so an agent can tell
+which engine speaks, which listens, which device it actually runs on, and which one will
+not touch VRAM. `gpu_status()` reports `cpu_engines`, `worker_devices`, `worker_vram_mb`
+and `vram_source` alongside the existing NVML totals; `vram_source="worker"` means the
+numbers are the workers' own allocators because no NVML driver answered.
 Speaker lists for another engine come from `list_models(engine_id)`; pass
 `engine=` to `speak`/`speak_script` to use it.
 

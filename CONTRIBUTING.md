@@ -22,9 +22,10 @@ group. The core venv must never contain torch.
 
 | Path | What lives there |
 |---|---|
-| `src/agent_voice/` | Core daemon: FastAPI app, routes, MCP server, CLI, cache, voice/engine registry, worker manager |
+| `src/agent_voice/` | Core daemon: FastAPI app, routes, MCP server, CLI, cache, voice/engine registry, worker manager, hardware detection and the setup planner |
 | `src/agent_voice/ipc/` | The frozen IPC v1 protocol and transport |
-| `engines/<id>/` | Engine plugins (`engine.yaml`, `worker.py`, optional `pyproject.toml`) |
+| `engines/<id>/` | Engine plugins (`engine.yaml`, `worker.py`, optional `pyproject.toml`, `variants/<device>/`) |
+| `scripts/` | The one-command installers — `install.sh` (POSIX `sh`) and `install.ps1` (PowerShell) |
 | `tests/` | Mock-backed and contract tests; GPU tests are marked and skipped by default |
 | `docs/` | Reference documentation (the README is a landing page) |
 | `skills/agent-voice/SKILL.md` | Agent-facing playbook, also served as the `agent-voice://guide` resource |
@@ -92,6 +93,45 @@ AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""
 `-o addopts=""` is required: the default `addopts` excludes `gpu` before `-m` is
 applied. CI sets `AGENT_VOICE_RUN_GPU_TESTS=0` explicitly and runs no GPU tests.
 
+### Installer smoke test
+
+`scripts/install.sh` is the one place this project documents a `curl | sh`, so a
+change to it needs more than a read-through. The suite covers this
+(`tests/test_install_script.py`), and you can run the same checks by hand:
+
+```bash
+sh -n scripts/install.sh                 # POSIX parse
+bash -n scripts/install.sh               # bash parse (pipefail path)
+scripts/install.sh --help
+scripts/install.sh --dry-run             # prints every action and argv, writes nothing
+```
+
+The meaningful test is a **local, offline install into a throwaway `HOME`**, which
+proves the shim, the absolute `DATA_DIR` and that nothing is written outside it:
+
+```bash
+tmp=$(mktemp -d)
+HOME="$tmp" scripts/install.sh --repo "$PWD" --yes --no-setup --dir "$tmp/av"
+HOME="$tmp" "$tmp/av/.venv/bin/agent-voice" engines list
+grep -E '^(AGENT_VOICE_HOME|DATA_DIR|ENGINES_DIR)=' "$tmp/av/.env"   # absolute paths
+test -f "$tmp/.local/bin/agent-voice"                                # the shim
+```
+
+Rules for the installers, checked in review:
+
+- POSIX `sh` with `set -eu`; `pipefail` only where the shell supports it.
+- **No `sudo`, ever.** No telemetry, no version check.
+- The default version is the **latest release tag**; `main` only for an explicit
+  `--ref main`.
+- `--dry-run` writes nothing and prints every `argv`.
+- Data lives **outside** the install directory and `--uninstall` never removes it.
+- `uv` is installed only if missing, and only with consent.
+- Every subprocess is an argv list, never a shell string.
+
+`install.ps1` is parse-checked with `pwsh` when it is available and is explicitly
+skipped (not passed) when it is not — it has never been run on real Windows, and the
+docs say so.
+
 ## Code style
 
 - `ruff check .` with `line-length = 100`, rules `E,F,I,UP,B` (B008 ignored for
@@ -123,6 +163,12 @@ applied. CI sets `AGENT_VOICE_RUN_GPU_TESTS=0` explicitly and runs no GPU tests.
 - Add an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for any
   user-visible change — Added / Changed / Fixed / Security, Keep a Changelog
   style.
+- **Do not round a support claim up.** A `(engine, device)` pair is `verified` only when
+  a measured run exists in `docs/phase0-devices-report.md` (or a named prior report);
+  `README.md`, `docs/engines.md` and `doctor` must agree with
+  `hardware.py:DEVICE_SUPPORT` exactly. No invented speed numbers: a measured value, or
+  "slow" and nothing more. Windows and `install.ps1` stay labelled experimental/unverified
+  until someone runs them on real Windows.
 - `docs/phase0-report.md` is a point-in-time hardware measurement record. Do not
   retro-edit its numbers; add a dated section or new measurements to
   `docs/engines.md` instead.

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Kokoro-82M worker — CPU only, preset voices, IPC protocol v1.
+"""Kokoro-82M worker — preset voices, IPC protocol v1.
 
-Runs inside ``engines/kokoro/.venv`` (torch==2.15.0+cpu, kokoro==0.9.4). Speaks
-the frozen v1 protocol exactly like ``engines/mock/worker.py``: a dedicated
-reader thread keeps ``cancel``/``health`` answerable while a compute thread
-renders, and a parent-death watchdog stops an orphaned worker from lingering.
+Runs inside ``engines/kokoro/.venv`` (torch==2.15.0+cpu on the canonical install,
+kokoro==0.9.4). Speaks the frozen v1 protocol exactly like
+``engines/mock/worker.py``: a dedicated reader thread keeps ``cancel``/``health``
+answerable while a compute thread renders, and a parent-death watchdog stops an
+orphaned worker from lingering.
 
-Zero-GPU guarantees, in order of importance:
+The runtime device comes from ``AGENT_VOICE_RESOLVED_DEVICE`` (``cpu`` by
+default, so a worker started outside the daemon keeps the CPU behaviour it had).
+Kokoro 0.9.4 is device-agnostic, so the device is passed through rather than
+assumed:
 
-1. ``CUDA_VISIBLE_DEVICES`` is emptied *before* torch is imported, so the
-   process never sees a device even if the daemon exported one.
-2. ``KPipeline(..., device="cpu")`` is passed explicitly: its default is
+1. ``CUDA_VISIBLE_DEVICES`` is emptied *before* torch is imported — but only on
+   the cpu path. On cuda/mps the worker must see the device it was resolved onto.
+2. ``KPipeline(..., device=<resolved>)`` is always explicit: its default is
    ``device=None``, which auto-selects CUDA whenever a GPU is present.
-3. ``gpu_vram_mb`` is always 0 and no ``torch.cuda`` API is ever called.
+3. ``gpu_vram_mb`` is 0 on cpu and the real allocation on cuda/mps. The cpu path
+   never touches a ``torch.cuda`` API.
 
 Mode is ``custom_voice`` only. Kokoro-82M has 54 built-in voices (8 advertised
 by ``engine.yaml``), no reference-audio encoder and no instruction channel, so
@@ -39,10 +44,21 @@ import time
 import uuid
 from pathlib import Path
 
-# --- zero-GPU + offline-safety, applied BEFORE torch/huggingface_hub import ----
-# Overwritten, not setdefault: a CUDA device exported by the daemon must not
-# reach this process. torch reads this at import time, hence the module scope.
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# --- device + offline-safety, applied BEFORE torch/huggingface_hub import ----
+RESOLVED_DEVICE = (os.environ.get("AGENT_VOICE_RESOLVED_DEVICE") or "cpu").strip().lower()
+"""The runtime device the daemon resolved for this engine.
+
+Default ``cpu``: the canonical install is the CPU wheel, and a worker started
+outside the daemon (``engines test kokoro``, the CPU test fixtures) must keep the
+behaviour it had before the variable existed.
+"""
+
+if RESOLVED_DEVICE == "cpu":
+    # Overwritten, not setdefault: a CUDA device exported by the daemon must not
+    # reach a cpu worker, and torch reads this at import time. Deliberately *not*
+    # applied on cuda/mps: there the worker has to see the device it was resolved
+    # onto, which is the whole point of the resolution.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 # The Phase 0 spike saw the xet backend hang on a large download finalization;
 # the plain HTTP path is slower to start but always finishes.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -219,6 +235,7 @@ class KokoroEngine:
         self.in_flight = 0
         self._state_lock = threading.Lock()
         self.backend_version = _read_dist_version(BACKEND_NAME)
+        self.device = RESOLVED_DEVICE
 
     # -- model ----------------------------------------------------------
     def _repo(self, alias: str) -> str:
@@ -279,7 +296,9 @@ class KokoroEngine:
         from kokoro import KPipeline
 
         try:
-            pipeline = KPipeline(lang_code=lang_code, repo_id=repo, device="cpu")
+            pipeline = KPipeline(
+                lang_code=lang_code, repo_id=repo, device=self.device
+            )
         except Exception as exc:
             if _is_missing_weights(exc):
                 raise _MissingWeights(
@@ -298,6 +317,50 @@ class KokoroEngine:
         if alias not in self.loaded_models:
             self.loaded_models.append(alias)
         return repo
+
+    def _vram_mb(self) -> int:
+        """This worker's device allocation in MB; exactly 0 on the cpu path.
+
+        Kokoro is 82M parameters, so the real number is small on cuda/mps too —
+        but it must be measured there, because a hard-coded 0 would claim the
+        model is not on the device it was just loaded onto. ``mps`` has no
+        ``memory_allocated``: Metal reports unified memory through
+        ``current_allocated_memory`` only.
+        """
+        if self.device == "cpu":
+            return 0
+        try:
+            import torch
+
+            if self.device == "mps":
+                allocated = getattr(
+                    getattr(torch, "mps", None), "current_allocated_memory", None
+                )
+                return int(allocated() / 1024**2) if allocated is not None else 0
+            if torch.cuda.is_available():
+                return int(torch.cuda.memory_allocated() / 1024**2)
+        except Exception:
+            return 0
+        return 0
+
+    def _empty_device_cache(self) -> None:
+        """Release cached device blocks for the device in use (no-op on cpu)."""
+        if self.device == "cpu":
+            return
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if self.device == "mps":
+                empty = getattr(getattr(torch, "mps", None), "empty_cache", None)
+                if empty is not None:
+                    empty()
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     # -- request validation ---------------------------------------------
     @staticmethod
@@ -437,9 +500,9 @@ class KokoroEngine:
                     "instruct_control": False,
                 },
                 "loaded_models": list(self.loaded_models),
-                "gpu_vram_mb": 0,
+                "gpu_vram_mb": self._vram_mb(),
                 "pid": os.getpid(),
-                "device": "cpu",
+                "device": self.device,
                 "sample_rate": SAMPLE_RATE,
                 "mode": MODE,
                 "preset_speakers": list(PRESET_SPEAKERS),
@@ -462,8 +525,8 @@ class KokoroEngine:
                 "id": msg["id"],
                 "model_alias": alias,
                 "loaded_models": list(self.loaded_models),
-                "gpu_vram_mb": 0,
-                "device": "cpu",
+                "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
             }
         )
 
@@ -478,12 +541,17 @@ class KokoroEngine:
             import gc
 
             gc.collect()
+        # Only meaningful on cuda/mps, and a null op on cpu: dropping the pipeline
+        # releases the Python objects, while the device allocator keeps its cached
+        # blocks until it is told to let them go.
+        self._empty_device_cache()
         self.conn.send_json(
             {
                 "id": msg["id"],
                 "model_alias": alias,
                 "loaded_models": list(self.loaded_models),
-                "gpu_vram_mb": 0,
+                "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
             }
         )
 
@@ -493,9 +561,9 @@ class KokoroEngine:
                 "id": msg["id"],
                 "ok": True,
                 "loaded_models": list(self.loaded_models),
-                "gpu_vram_mb": 0,
+                "gpu_vram_mb": self._vram_mb(),
                 "in_flight": self.in_flight,
-                "device": "cpu",
+                "device": self.device,
             }
         )
 
@@ -565,7 +633,8 @@ class KokoroEngine:
                     "speaker": speaker,
                     "backend_name": BACKEND_NAME,
                     "backend_version": self.backend_version,
-                    "gpu_vram_mb": 0,
+                    "gpu_vram_mb": self._vram_mb(),
+                    "device": self.device,
                 }
             )
         except _BadRequest as exc:
@@ -630,7 +699,8 @@ class KokoroEngine:
                     "model_alias": alias,
                     "mode": MODE,
                     "speaker": speaker,
-                    "gpu_vram_mb": 0,
+                    "gpu_vram_mb": self._vram_mb(),
+                    "device": self.device,
                 }
             )
         except _BadRequest as exc:
@@ -645,17 +715,25 @@ class KokoroEngine:
             self.cancel_events.pop(request_id, None)
 
     # -- errors ---------------------------------------------------------
-    @staticmethod
-    def _classify(exc: BaseException) -> str:
-        """Map a failure onto the daemon's error taxonomy.
+    def _classify(self, exc: BaseException) -> str:
+        """Map a failure onto the daemon's error taxonomy, aware of the device.
 
-        No CUDA_OOM branch on purpose: this engine owns no GPU memory, so a
-        CUDA out-of-memory verdict here would only ever be a misclassification.
+        ``CUDA_OOM`` only on the cuda path. On cpu and mps an allocation failure
+        is real but not a CUDA one, so it stays INTERNAL_ERROR with the
+        allocator's own message rather than a verdict that names the wrong knob.
         """
         if isinstance(exc, _BadRequest):
             return "BAD_REQUEST"
         if isinstance(exc, _MissingWeights) or _is_missing_weights(exc):
             return "MODEL_NOT_FOUND"
+        message = str(exc).lower()
+        oom = (
+            "out of memory" in message
+            or "outofmemory" in type(exc).__name__.lower()
+            or "defaultcpuallocator" in message
+        )
+        if oom and self.device == "cuda":
+            return "CUDA_OOM"
         return "INTERNAL_ERROR"
 
     @staticmethod

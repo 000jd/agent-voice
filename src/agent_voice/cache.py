@@ -4,6 +4,14 @@ The cache key hashes the *entire* parameter set that can change the produced
 audio. That includes the backend identity, which is why ``engine.yaml`` declares
 ``backend_name``/``backend_version``: the key must be computable before a worker
 is ever spawned (see the architecture note on cache-before-GPU).
+
+It also includes the resolved runtime **device**. The same request rendered on
+the CPU and on a CUDA card is not bit-identical: kernels accumulate in a
+different order, so the float samples differ in the last bits — and a rarer,
+worse case is a bfloat16 CUDA render served to a CPU-only caller that asked for
+the same text. The device is resolvable before a spawn for exactly the same
+reason the backend identity is (``hardware.resolve_device`` reads the manifest,
+the settings and the host probe, never the worker).
 """
 
 from __future__ import annotations
@@ -28,6 +36,9 @@ CACHE_KEY_FIELDS: tuple[str, ...] = (
     "model_alias",
     "backend_name",
     "backend_version",
+    # v0.6: the resolved runtime device. A CPU render and a CUDA render of the
+    # same request are not bit-identical, so they may never share an entry.
+    "device",
     "language",
     "seed",
     "speed",
@@ -49,6 +60,11 @@ CACHE_KEY_FIELDS: tuple[str, ...] = (
 different repository, or pulling updated weights for the same repo, can never
 serve audio rendered by the old model. That is worth a cold cache: silently
 returning the wrong voice is far worse than re-rendering.
+
+``device`` is included for the same reason at the transport level: switching an
+engine from ``cpu`` to ``cuda`` changes the dtype some backends pick and always
+changes the reduction order, so the old entry is a different render of the same
+request, not a hit.
 
 Adding a field here invalidates every existing entry by design — old keys simply
 never match again.

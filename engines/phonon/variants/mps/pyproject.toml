@@ -1,0 +1,24 @@
+[project]
+name = "agent-voice-engine-phonon"
+version = "0.1.0"
+description = "Phonon (Fermion Research) Apple MLX ASR backend for agent-voice (experimental)"
+requires-python = ">=3.12,<3.13"
+
+# Fermion reaches Apple silicon through its `mlx` extra; the worker maps the
+# operator-facing `mps` device to `FERMION_DEVICE=mlx`. The PyPI macOS arm64
+# torch wheel is the only torch needed (Fermion's metadata still requires it).
+# Nothing was run on Apple silicon; the pair is experimental in DEVICE_SUPPORT.
+dependencies = [
+  "fermion-research[mlx]==0.2.15",
+  "torch==2.15.0",
+  "numpy>=1.26",
+  "soundfile>=0.12",
+  "huggingface-hub>=0.26",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+
+[tool.agent-voice]
+device = "mps"

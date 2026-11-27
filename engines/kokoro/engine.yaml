@@ -5,13 +5,24 @@ backend_version: "0.9.4"
 protocol_version: 1
 venv_python: .venv/bin/python
 
-# CPU-only by construction: the engine venv installs torch from the explicit
-# pytorch-cpu index, so no CUDA wheel (and no nvidia-*) can ever be present.
-# The worker also sets CUDA_VISIBLE_DEVICES="" before importing torch and passes
-# device="cpu" to KPipeline, whose default auto-selects CUDA when one exists.
-# Measured in docs/phase0-kokoro-report.md: 2.05 s load, 1.37 GB peak RSS,
-# 3.4-5.2x realtime on a Ryzen 7 5700X, 0 GPU memory. espeak-ng is the English
-# out-of-dictionary fallback (present at /usr/bin/espeak-ng on the reference host).
+# The verified install is CPU: the canonical engine venv takes torch from the
+# explicit pytorch-cpu index, so no CUDA wheel (and no nvidia-*) can be present,
+# and the worker empties CUDA_VISIBLE_DEVICES *only* on the cpu path. Kokoro
+# 0.9.4 is device-agnostic, which is why cuda and mps are declared at all — but
+# neither was *run* on this release (only the CUDA variant's lock was produced,
+# from the cu128 index), so both stay experimental and `auto` never picks them.
+#
+# Measured in docs/phase0-kokoro-report.md on the cpu path: 2.05 s load, 1.37 GB
+# peak RSS, 3.4-5.2x realtime on a Ryzen 7 5700X, 0 GPU memory. espeak-ng is the
+# English out-of-dictionary fallback (present at /usr/bin/espeak-ng on the
+# reference host).
+#
+# `device: cpu` is the scheduling class. Its absence was the v0.5.0 bug: the
+# schema default is `gpu`, so this engine took the single-accelerator slot while
+# holding 0 MB.
+device: cpu
+default_device: cpu
+supported_devices: [cpu, cuda, mps]
 
 capabilities:
   streaming: true

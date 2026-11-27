@@ -54,6 +54,14 @@ KIND = "asr"
 DEFAULT_ALIAS = "mock-asr-parity"
 DEFAULT_MODELS: dict[str, str] = {DEFAULT_ALIAS: "local/mock-asr-parity"}
 
+RESOLVED_DEVICE = (os.environ.get("AGENT_VOICE_RESOLVED_DEVICE") or "cpu").strip().lower()
+"""The device the daemon resolved for this engine.
+
+Read from the environment, default ``cpu``. The transcript is synthesised from
+the request, so there is no backend and no accelerator to select; cpu is the
+only truthful answer and the one a worker started outside the daemon gets.
+"""
+
 LANGUAGES: tuple[str, ...] = ("English",)
 """The only language this synthetic transcript speaks.
 
@@ -286,6 +294,7 @@ class MockAsrEngine:
         self.shutdown_event = threading.Event()
         self.in_flight = 0
         self._state_lock = threading.Lock()
+        self.device = RESOLVED_DEVICE
 
     # -- helpers --------------------------------------------------------
     def _alias(self, msg: dict) -> str:
@@ -343,7 +352,7 @@ class MockAsrEngine:
                 "loaded_models": list(self.loaded_models),
                 "gpu_vram_mb": 0,
                 "pid": os.getpid(),
-                "device": "cpu",
+                "device": self.device,
             }
         )
 
@@ -362,7 +371,7 @@ class MockAsrEngine:
                 "model_alias": alias,
                 "loaded_models": list(self.loaded_models),
                 "gpu_vram_mb": 0,
-                "device": "cpu",
+                "device": self.device,
             }
         )
 
@@ -376,6 +385,7 @@ class MockAsrEngine:
                 "model_alias": alias,
                 "loaded_models": list(self.loaded_models),
                 "gpu_vram_mb": 0,
+                "device": self.device,
             }
         )
 
@@ -388,7 +398,7 @@ class MockAsrEngine:
                 "loaded_models": list(self.loaded_models),
                 "gpu_vram_mb": 0,
                 "in_flight": self.in_flight,
-                "device": "cpu",
+                "device": self.device,
             }
         )
 
@@ -450,6 +460,8 @@ class MockAsrEngine:
                 "duration_sec": duration_sec,
                 "text": text,
                 "truncated": False,
+                "device": self.device,
+                "gpu_vram_mb": 0,
                 "segments": emitted,
             }
             if hotwords:

@@ -1,9 +1,14 @@
-"""v0.3.3/v0.4.0 CLI onboarding: `doctor` (environment gate), `serve` and `mcp-config`.
+"""v0.3.3/v0.4.0/v0.6.0 CLI onboarding: `doctor`, `serve` and `mcp-config`.
 
 `doctor` deliberately inspects the real machine — PATH, a socket bind,
 nvidia-smi, the engine registry — so every test that asserts on a row fakes the
 probe instead of trusting the host. One test runs it against this checkout for
 real, and skips when the box cannot satisfy doctor's hard requirements.
+
+v0.6.0 adds `INFO` rows: "optional and absent" is not a warning. A CPU-only box,
+an engine you never installed and its un-downloaded weights are all INFO, so a
+fresh clone reports 0 FAIL and does not look broken. The tests below therefore
+assert the *status of a named row* instead of "WARN appears somewhere".
 
 `serve` is never actually started: uvicorn.run is replaced, so these tests assert
 what the command would bind (and whether it refuses at all) without a daemon.
@@ -12,6 +17,7 @@ what the command would bind (and whether it refuses at all) without a daemon.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import socket
 import subprocess
@@ -78,6 +84,45 @@ def _assert_exit(result, code: int) -> str:
     return output
 
 
+_STATUSES = ("PASS", "INFO", "WARN", "FAIL")
+
+
+def _rows(output: str) -> list[tuple[str, str]]:
+    """Parse `doctor`'s table into `(name, status)` pairs, in print order.
+
+    Rows are `name<pad>  STATUS  detail`, and a detail can itself contain spaces
+    (`dub filters`, `engines: mock`), so the status token is what separates the
+    two — never `split()`. `fix:` continuation lines and the dashed rule match
+    nothing and drop out.
+    """
+    rows: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        for status in _STATUSES:
+            index = line.find(f"  {status}  ")
+            if index > 0:
+                rows.append((line[:index].strip(), status))
+                break
+    return rows
+
+
+def _status(output: str, name: str) -> str:
+    """The status of one named row, or a failure that prints the whole table."""
+    found = [status for row_name, status in _rows(output) if row_name == name]
+    assert found, f"no {name!r} row in:\n{output}"
+    return found[0]
+
+
+def _summary(output: str) -> dict[str, int]:
+    """Parse `doctor: N checks, X optional, Y warning(s), no failures`."""
+    match = re.search(r"doctor: (\d+) checks, (\d+) optional, (\d+) warning\(s\)", output)
+    assert match, output
+    return {
+        "checks": int(match.group(1)),
+        "optional": int(match.group(2)),
+        "warnings": int(match.group(3)),
+    }
+
+
 def patch_which(mapping: dict[str, str | None], monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch `shutil.which` for the named tools only; everything else stays real."""
     inherited = shutil.which
@@ -118,7 +163,14 @@ def patch_nvidia_smi(
     stdout: str = "Fake GPU, 8192 MiB",
     stderr: str = "",
 ) -> list[list[str]]:
-    """Fake nvidia-smi. Returns the argv lists it was called with."""
+    """Fake nvidia-smi. Returns the argv lists it was called with.
+
+    Two callers ask it: the `gpu` row (argv[0] is the `which`-resolved path, and
+    it is recorded) and `hardware.probe_nvidia()` (argv[0] is the bare
+    ``nvidia-smi``, and it reads stdout as text). Everything else — the engine
+    registry's ``<venv python> -c ...`` version probe — gets the ``b"null"`` it
+    decodes as bytes.
+    """
     patch_which({"nvidia-smi": "/fake/nvidia-smi"}, monkeypatch)
     seen: list[list[str]] = []
 
@@ -126,8 +178,11 @@ def patch_nvidia_smi(
         # House rule: an argv list, never a shell string.
         assert isinstance(argv, list), argv
         assert kwargs.get("shell") is False
-        if list(argv)[0] == "/fake/nvidia-smi":
+        first = list(argv)[0]
+        if first == "/fake/nvidia-smi":
             seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+        if first == "nvidia-smi":
             return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
         # EngineRegistry also probes each installed backend's version through a
         # subprocess (`<venv python> -c ...`) and decodes its stdout as bytes.
@@ -218,13 +273,16 @@ def test_doctor_fails_when_uv_is_missing(
 # ---------------------------------------------------------------------------
 
 
-def test_doctor_warns_without_a_gpu_but_still_exits_zero(tools: None, free_port: int) -> None:
+def test_doctor_reports_a_cpu_only_box_as_info_but_still_exits_zero(
+    tools: None, free_port: int
+) -> None:
+    """v0.6.0: no accelerator is INFO, not WARN — a CPU box is a supported setup."""
     result = runner.invoke(app, ["doctor"])
     output = _text(result)
 
     assert result.exit_code == 0, output
     assert "mock/CPU only" in output
-    assert "WARN" in output
+    assert _status(output, "gpu") == "INFO"
 
 
 def test_doctor_reports_the_interpreter_it_runs_under(tools: None, free_port: int) -> None:
@@ -243,9 +301,13 @@ def test_doctor_passes_when_nvidia_smi_answers(
     argv = patch_nvidia_smi(monkeypatch, stdout="Fake GPU, 8192 MiB\n")
 
     result = runner.invoke(app, ["doctor"])
+    output = _text(result)
 
-    assert result.exit_code == 0, _text(result)
-    assert "Fake GPU, 8192 MiB" in result.output
+    assert result.exit_code == 0, output
+    assert "Fake GPU, 8192 MiB" in output
+    # Exactly the `gpu` row's probe: one argv list, resolved through `which`, no
+    # shell. (The hardware probe behind the `hardware`/`device` rows invokes the
+    # bare `nvidia-smi` name with `shell=False`, so it is not this call.)
     assert argv == [
         [
             "/fake/nvidia-smi",
@@ -253,6 +315,9 @@ def test_doctor_passes_when_nvidia_smi_answers(
             "--format=csv,noheader",
         ]
     ]
+    # A GPU that answers is a PASS row, and the hardware row is measured too.
+    assert _status(output, "gpu") == "PASS"
+    assert _status(output, "hardware") == "PASS"
 
 
 def test_doctor_warns_when_nvidia_smi_fails(
@@ -280,11 +345,53 @@ def test_doctor_warns_when_dotenv_is_absent(
     output = _text(result)
 
     assert result.exit_code == 0, output
-    assert "cp .env.example .env" in output
-    assert "WARN" in output
+    # v0.6.0: the fix is the setup wizard, and the path is `<home>/.env`.
+    assert "agent-voice setup" in output
+    assert str(tmp_path.resolve() / ".env") in output
+    assert _status(output, ".env") == "WARN"
     # M4: absence is its own status text, but the effective engine is still judged.
     assert "absent, built-in defaults apply" in output
     assert "AGENT_VOICE_DEFAULT_ENGINE=mock (installed)" in output
+
+
+def test_doctor_reports_hardware_home_and_device_rows(tools: None, free_port: int) -> None:
+    """v0.6.0 adds the measurements a recommendation can be traced back to."""
+    result = runner.invoke(app, ["doctor"])
+    output = _text(result)
+
+    assert result.exit_code == 0, output
+    rows = dict(_rows(output))
+    for name in ("hardware", "home", "device"):
+        assert name in rows, f"no {name!r} row in:\n{output}"
+    assert rows["hardware"] == "PASS"
+    assert rows["home"] == "PASS"
+
+    # The hardware row names the OS/arch and the accelerator it detected.
+    hardware_line = next(line for line in output.splitlines() if line.startswith("hardware "))
+    assert "accelerator=" in hardware_line, hardware_line
+    # The home row is what makes the CLI CWD-independent, so it prints all of it.
+    home_line = next(line for line in output.splitlines() if line.startswith("home "))
+    assert "home=" in home_line and "data=" in home_line, home_line
+
+
+def test_doctor_summary_counts_optional_entries_apart_from_warnings(
+    tools: None, free_port: int
+) -> None:
+    """INFO is "optional", never folded into the warning count."""
+    result = runner.invoke(app, ["doctor"])
+    output = _text(result)
+
+    assert result.exit_code == 0, output
+    rows = _rows(output)
+    info = [name for name, status in rows if status == "INFO"]
+    warnings = [name for name, status in rows if status == "WARN"]
+    summary = _summary(output)
+
+    assert summary["checks"] == len(rows), rows
+    assert summary["optional"] == len(info), (info, summary)
+    assert summary["warnings"] == len(warnings), (warnings, summary)
+    # The CPU-only gpu row is INFO on this fixture, so the split is not vacuous.
+    assert "gpu" in info
 
 
 def test_doctor_fails_on_a_ghost_engine_from_the_environment_without_a_dotenv(

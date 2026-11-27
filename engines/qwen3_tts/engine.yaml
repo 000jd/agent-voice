@@ -4,6 +4,15 @@ backend_name: qwen-tts
 backend_version: "0.1.1"
 protocol_version: 1
 venv_python: .venv/bin/python
+# CUDA is the verified path and the one the canonical venv installs (cu128
+# torch). The other three are real runtime paths, not marketing: cpu is
+# `variants/cpu` (torch.float32, run and measured in
+# docs/phase0-devices-report.md), rocm is the same code on a HIP build (never run
+# here, so experimental), and mps is torch.float32 on a macOS arm64 host (no
+# variant project, experimental). `auto` takes the manifest default, so a host
+# without CUDA falls back to cpu only via an explicit override.
+default_device: cuda
+supported_devices: [cpu, cuda, mps, rocm]
 
 capabilities:
   streaming: false

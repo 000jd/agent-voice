@@ -10,6 +10,9 @@ dist/
 # These are multi-GB and fully reproducible from pyproject.toml + uv.lock.
 .venv/
 engines/*/.venv/
+engines/*/variants/*/.venv/
+# Which dependency variant is installed into the canonical engine venv.
+engines/*/.variant
 
 # Runtime data: voices, cache, artifacts, jobs, bindings, logs
 data/

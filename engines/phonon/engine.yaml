@@ -6,17 +6,24 @@ protocol_version: 1
 venv_python: .venv/bin/python
 kind: asr
 device: cpu
+default_device: cpu
+# `mps` is Fermion's MLX path on Apple silicon, spelled with the shared runtime
+# device name: the worker maps mps -> FERMION_DEVICE=mlx and nothing else. It has
+# no variant project and was never run here, so it is experimental. Fermion's
+# NVIDIA support is a container image, not a CUDA wheel, so `cuda` is *not*
+# declared — claiming it would promise a wheel that does not exist.
+supported_devices: [cpu, mps]
 
-# CPU-only by construction, exactly like Kokoro: the engine venv installs torch
-# from the explicit pytorch-cpu index, so no CUDA wheel (and no nvidia-* /
-# triton) can ever be present, and the worker empties CUDA_VISIBLE_DEVICES plus
-# sets FERMION_DEVICE=cpu before importing anything. Every model therefore
-# declares est_vram_gb: 0.0 — transcription runs on the CPU while a GPU TTS
-# engine keeps the GPU owner slot, which is what `device: cpu` in this manifest
-# tells the worker manager. Phonon 2.5 is one multilingual checkpoint that
-# auto-detects the spoken language (there is no per-request language switch on
-# 2.5); the -en alias is the English-only build and Phonon 2 is the smaller,
-# faster generation.
+# The verified install is CPU, exactly like Kokoro: the canonical engine venv
+# installs torch from the explicit pytorch-cpu index, so no CUDA wheel (and no
+# nvidia-* / triton) can be present, and on the cpu path the worker empties
+# CUDA_VISIBLE_DEVICES and sets FERMION_DEVICE=cpu before importing anything.
+# Every model therefore declares est_vram_gb: 0.0 — transcription runs on the CPU
+# while a GPU TTS engine keeps the accelerator slot, which is what `device: cpu`
+# in this manifest tells the worker manager. Phonon 2.5 is one multilingual
+# checkpoint that auto-detects the spoken language (there is no per-request
+# language switch on 2.5); the -en alias is the English-only build and Phonon 2
+# is the smaller, faster generation.
 
 capabilities:
   streaming: false

@@ -8,12 +8,15 @@ uv run agent-voice status     # daemon health, torch_loaded, GPU/queue state
 uv run agent-voice engines test mock   # IPC v1 conformance without a GPU (~1 s)
 ```
 
-`doctor` prints one `PASS`/`FAIL`/`WARN` row per check — Python, `uv`, `ffmpeg`,
+`doctor` prints one `PASS`/`INFO`/`WARN`/`FAIL` row per check — Python, `uv`, `ffmpeg`,
 the GPU (via `nvidia-smi`), `espeak-ng` (when the Kokoro engine ships), the bind
 port (free, or already serving a healthy daemon), one row per engine, cached
-weights, the inbox and `.env` — with a `fix:` line under every problem. It exits
-non-zero only on a `FAIL`: a CPU-only box, an uninstalled GPU engine, a missing
-`espeak-ng` or a missing `.env` are warnings, not failures.
+weights, the inbox, `.env`, the detected hardware, the resolved home and each
+installed engine's device — with a `fix:` line under every problem. It exits
+non-zero only on a `FAIL`: a CPU-only box, an uninstalled engine you did not select, a
+missing `espeak-ng` and a missing `.env` all exit 0. `INFO` means "optional and
+absent, and you did not ask for it"; `WARN` means "absent but expected", such as the
+selected default engine's venv or the `.env` itself.
 
 For a GPU engine, `agent-voice engines test qwen3_tts_fast` walks the same
 protocol end to end and isolates "the worker cannot start / cannot load" from
@@ -214,6 +217,223 @@ uv run agent-voice engines test phonon      # 7/7 on the ASR table
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv   # empty, before and after
 ```
 
+## The device is not the one you asked for
+
+**Symptoms.** `doctor`'s `device` row shows `global=cpu; qwen3_tts=cpu` when you expected
+`cuda` (or `server_info().device` says `cpu`), or a request answers `400 BAD_REQUEST` with
+*"engine 'qwen3_tts' does not support device 'cuda'"* or *"device 'cuda' is not available
+on this host for 'qwen3_tts'"*, or the daemon refuses to start with a message like
+*"AGENT_VOICE_DEVICES sets kokoro=rocm, but that engine supports: cpu, cuda, mps"*.
+
+**Why.** A device resolves in this order, and the first match wins:
+
+1. `AGENT_VOICE_DEVICES[<engine_id>]` — e.g. `AGENT_VOICE_DEVICES=kokoro=cpu,qwen3_tts=cuda`;
+2. a non-`auto` `AGENT_VOICE_DEVICE`;
+3. the manifest's `default_device`;
+4. the host's accelerator (`cuda` on NVIDIA, `mps` on Apple silicon, `rocm` on AMD,
+   otherwise `cpu`).
+
+`auto` never silently reassigns a device. It applies the order above, then refuses a
+device the manifest does not declare or the host cannot serve — including an engine whose
+manifest default is `cuda` on a box with no NVIDIA GPU. That is deliberate: a silent
+downgrade to CPU would look like a working setup and behave like a slow surprise. Pin the
+device instead, and note that `agent-voice setup` records the pin for you when its
+recommendation differs from a manifest default.
+
+**Fix.**
+
+- Read the `device` row in `agent-voice doctor`; it names each installed engine's
+  resolved device and level.
+- Set the preference explicitly:
+  `AGENT_VOICE_DEVICE=cpu` (or `=cuda`), or per engine
+  `AGENT_VOICE_DEVICES="kokoro=cpu,qwen3_tts=cuda"` in `<home>/.env`.
+- `qwen3_tts_fast` has no `cpu`, `mps` or `rocm` variant. If you set
+  `AGENT_VOICE_DEVICE=cpu` globally, it will refuse — use `qwen3_tts` for those devices,
+  or override the fast engine back to `cuda` with `AGENT_VOICE_DEVICES=qwen3_tts_fast=cuda`.
+- Changing the preference is not enough on its own: the engine's **venv** has to hold a
+  matching torch build. See the next two sections.
+
+## `409 ENGINE_NOT_INSTALLED` after changing the device (stale variant)
+
+**Symptoms.** The engine is installed and `engines test` passed last week, but after
+setting a new device a request answers:
+
+```json
+{
+  "error_code": "ENGINE_NOT_INSTALLED",
+  "message": "engine 'qwen3_tts' cannot serve device 'cuda': its installed torch build (2.15.0+cpu) does not support it",
+  "suggestion": "Run `agent-voice engines install qwen3_tts --device cuda` to install that build (a device switch reinstalls this engine's venv), or set AGENT_VOICE_DEVICES=qwen3_tts=<device> to one of: cpu, cuda, mps, rocm."
+}
+```
+
+**Cause.** A device is a dependency set, not a runtime flag. Each engine has **one** venv
+at `engines/<id>/.venv`, and its contents are whichever variant was synced last. Ask for
+`cuda` while the venv holds `torch 2.15.0+cpu` and the manager's torch probe refuses to
+spawn a worker that would fail on the first CUDA call. That is the intended behaviour:
+a clear `409` naming the fix, not a worker crash mid-decode and not a silent fall-through
+to CPU.
+
+**Fix.** Re-sync the variant for the device you want:
+
+```bash
+uv run agent-voice engines install qwen3_tts --device cuda
+uv run agent-voice engines test qwen3_tts
+```
+
+Only **one** variant per engine can be resident at a time; switching back is the same
+command with the other `--device`. The sync is in-place, prunes the packages the new
+variant does not lock (no leftover `nvidia_*`/`triton` directories) and keeps the venv at
+the canonical `engines/<id>/.venv` path. The canonical committed `uv.lock` is never
+rewritten — `engines install` always passes `--locked`.
+
+If the probe's message names a different torch version than you expect, check what is
+actually installed rather than guessing:
+
+```bash
+engines/qwen3_tts/.venv/bin/python -c \
+  "import torch; print(torch.__version__, torch.version.cuda, torch.version.hip)"
+```
+
+A related failure, immediately after a worker starts, is:
+
+```text
+worker for 'X' reports device 'cpu' but 'cuda' was injected as AGENT_VOICE_RESOLVED_DEVICE
+```
+
+That is the same mismatch one level lower: the venv is fine, but the engine's own
+`worker.py` ignores the injected device. Either fix the worker to honour
+`AGENT_VOICE_RESOLVED_DEVICE`, or pin the device it really uses with
+`AGENT_VOICE_DEVICES=X=cpu`.
+
+## There is no installable variant for that engine and device
+
+**Symptoms.** `engines install <id> --device <d>` refuses, even with `--experimental`, or
+there is simply no `engines/<id>/variants/<d>/` project to sync.
+
+**Cause.** The pair is `unsupported` in `DEVICE_SUPPORT` — the package itself does not
+claim it, so shipping a variant would be a lie with a lock file attached.
+
+| Refused pair | Why | What to do instead |
+|---|---|---|
+| `qwen3_tts_fast` on `cpu` | `faster-qwen3-tts`'s Torch backend requires an NVIDIA GPU with CUDA; its graph code calls `torch.cuda.CUDAGraph()` unconditionally | Use `qwen3_tts` on `cpu` (verified), or `kokoro` |
+| `qwen3_tts_fast` on `mps` | same; the package's only non-NVIDIA path is GGML/Metal, which is not shipped here | Use `qwen3_tts` on `mps` (experimental) |
+| `qwen3_tts_fast` on `rocm` | there is **no ROCm or HIP claim anywhere** in the installed distribution | Use `qwen3_tts` on `rocm` (experimental) |
+| `phonon` on `cuda` | phonon's NVIDIA path is the `ghcr.io/fermionresearch/phonon-cuda` **container**, not a wheel; `load_speech` takes no device kwarg | Run Phonon CPU as designed; use the container separately if you want GPU ASR |
+| `phonon` on `rocm` | no such extra exists | CPU |
+| `kokoro` on `rocm` | `KPipeline` documents only `cuda`/`cpu`; ROCm is not a claimed backend | CPU, or `cuda` (experimental) |
+| any mock engine on `cuda`/`mps`/`rocm` | CPU-only by construction | CPU |
+
+**Fix.** Pick a pair that is `verified here` or `experimental` in the
+[README matrix](../README.md#device-support) / [engines.md](engines.md#device-variants).
+An `experimental` pair installs with `--experimental` — and is never selected by `auto`:
+
+```bash
+uv run agent-voice engines install kokoro --device cuda --experimental
+```
+
+`--experimental` grants permission, not a lock. The refusal names the variants this
+checkout actually has, so read it instead of guessing:
+
+```text
+BAD_REQUEST: engine 'qwen3_tts_fast' does not support device 'rocm'
+Supported devices: cuda.
+```
+
+A supported pair whose variant project or lock is missing is a different refusal and
+names what the checkout actually has (`Available variants: …`). Shipped roots today:
+`qwen3_tts` cpu/cuda/mps/rocm, `kokoro` cpu/cuda/mps, `phonon` cpu/mps.
+`engines install <id> --device <d> --dry-run` prints the resolved project without running
+anything.
+
+## `uv` warns that `VIRTUAL_ENV` does not match the project environment
+
+**Symptoms.** During `engines install`, `uv` prints:
+
+```text
+warning: `VIRTUAL_ENV=/home/you/agent-voice/.venv` does not match the project environment path
+`engines/kokoro/.venv` and will be ignored; use `--active` to target the active environment instead
+```
+
+**Cause.** You have a virtualenv activated in the shell (often the repo's own `.venv`
+from `uv sync --extra dev`). `engines install` sets `UV_PROJECT_ENVIRONMENT` to the
+engine's venv, which wins: the warning is informational and the install lands in the
+right place. It is not a failure and nothing is installed into the active environment.
+
+**Fix.** Nothing, or `deactivate` if the noise bothers you. Do **not** pass `--active` to
+`uv` inside an engine install: it would target your shell's venv instead of the engine's,
+which is exactly the bug the warning describes. If you script it, `env -u VIRTUAL_ENV`
+silences the warning with identical results.
+
+## The installer stopped halfway
+
+**Symptoms.** `scripts/install.sh` (or `install.ps1`) exits non-zero partway through —
+no network, a failed `uv sync`, Ctrl-C — and you are not sure what state you are in.
+
+**Why it is safe to just re-run.** The steps are ordered so that a failure leaves a
+re-runnable state, and each one is idempotent:
+
+- the clone/update into the install directory and the `uv sync` can be repeated; an
+  existing clone is updated rather than re-cloned;
+- the shim is a single file in `~/.local/bin` and is rewritten in place;
+- `<install>/.env` is written only after the clone and the sync succeed, **atomically**
+  (`os.replace`), with the previous file backed up to `.env.bak` (or `.env.<UTC>.bak` if a
+  backup already exists);
+- the data directory is a sibling of the install directory and is never written by the
+  installer — `--uninstall` does not remove it either.
+
+**Fix.**
+
+```bash
+# see exactly what it will do, writing nothing
+curl -fsSL https://raw.githubusercontent.com/000jd/agent-voice/main/scripts/install.sh \
+  | sh -s -- --dry-run
+
+# then re-run the same command you used before, e.g.
+curl -fsSL https://raw.githubusercontent.com/000jd/agent-voice/main/scripts/install.sh \
+  | sh -s -- --dir ~/.local/share/agent-voice
+```
+
+Confirm the result with `agent-voice doctor`. If the shim is on the wrong `PATH`, the
+installer says so and prints the export line; `~/.local/bin` is the usual one. Nothing
+was installed with `sudo`, so there is no root-owned leftover to clean up.
+
+## `AGENT_VOICE_HOME` is not what you expected
+
+**Symptoms.** `doctor` reports a `home` row pointing at an unexpected directory;
+`engines list` is empty although you installed engines; `.env` changes have no effect; or
+a test/sandbox run writes into your real `data/`.
+
+**Cause.** There is one anchor, resolved in this order:
+
+1. `AGENT_VOICE_HOME`, when set (including when it is set to a sandbox by a test);
+2. the first parent of the installed package that contains both `pyproject.toml` and
+   `engines/` — the checkout, or the installer's install directory;
+3. `~/.agent-voice`, which `doctor` reports rather than creating silently.
+
+Relative `DATA_DIR`/`ENGINES_DIR` values resolve against that home, and the daemon reads
+`<home>/.env` — the current working directory and a systemd unit's `WorkingDirectory=`
+are not consulted. That is what makes the CLI work from any directory, and it is also
+why an exported `AGENT_VOICE_HOME` in your shell (or a stale one in a service unit)
+overrides the checkout you think you are using.
+
+**Fix.**
+
+```bash
+uv run agent-voice doctor | grep -E 'home|config'   # prints home= data= engines= config=
+echo "$AGENT_VOICE_HOME"                            # empty means "use the checkout"
+```
+
+- Unset a stray `AGENT_VOICE_HOME` (`unset AGENT_VOICE_HOME`), or set it deliberately in
+  the unit that starts the daemon.
+- Prefer the **prefixed** spellings `AGENT_VOICE_DATA_DIR` / `AGENT_VOICE_ENGINES_DIR`;
+  when both spellings are set the prefixed one wins, and `DATA_DIR` is generic enough to
+  be set by something else in your environment.
+- A `.env` copied from the repo that still says `DATA_DIR=./data` is fine: a relative
+  value resolves against the home, not the cwd. `agent-voice setup` writes absolute
+  paths, which is easier to reason about.
+- For a systemd unit, add `Environment=AGENT_VOICE_HOME=%h/projects/agent-voice`; do not
+  rely on `WorkingDirectory=` to pick the config.
+
 ## `sidechaincompress` / `alimiter` missing (dubbing degrades)
 
 **Symptoms.** `agent-voice doctor` prints a `dub filters` row:
@@ -326,7 +546,7 @@ pausing, or a request fails with `400 BAD_REQUEST` mentioning `[pause]`.
 | `422 INVALID_REF_AUDIO` | The clip exists but could not be decoded as usable audio: corrupt, an unsupported container, or shorter than the 1 s minimum for a reference | Re-export it (`ffmpeg -i in -ac 1 -ar 24000 out.wav`) and use 3–10 s of clean speech. For `transcribe`, an unreadable file is a `BAD_REQUEST` carrying the ffprobe reason instead |
 | `403 AGENT_MUTATION_DISABLED` | Engine/model mutation is off, or the caller is not on loopback | Set `ALLOW_AGENT_ENGINE_MUTATION=true` **and** call from loopback, or make the change as the operator |
 | `409 WORKER_BUSY` | `unload` without `force` while a job runs, an engine switch while the active engine drains, or a minimum-residency window | Retry after the job, or `agent-voice unload --force` |
-| `409 ENGINE_NOT_INSTALLED` | The engine is discovered but its venv is missing — including an ASR engine you asked for by name | `agent-voice engines install <id>`; for transcription that is usually `agent-voice engines install phonon` |
+| `409 ENGINE_NOT_INSTALLED` | The engine is discovered but its venv is missing — including an ASR engine you asked for by name — **or** the venv holds a torch build that cannot serve the resolved device (a stale variant) | `agent-voice engines install <id>`, or `agent-voice engines install <id> --device <d>` when the message names a device mismatch. For transcription that is usually `agent-voice engines install phonon` |
 | `422 MANIFEST_INVALID` | `engine.yaml` failed validation | Fix the manifest; the message names the field |
 | `429 BACKPRESSURE` | The global wait queue (`MAX_QUEUE_DEPTH`) is full, or a stream consumer stalled | Retry, raise `MAX_QUEUE_DEPTH` deliberately, or submit long work with `start_script_job` |
 | `413 TEXT_TOO_LONG` | `MAX_TEXT_CHARS`, `MAX_INSTRUCT_CHARS`, `MAX_DESIGN_SAMPLE_CHARS` or `MAX_REF_TEXT_CHARS` exceeded | Shorten the input or raise the cap |
@@ -416,16 +636,26 @@ voices or lexicon data.
 
 ## Platform notes
 
-- **macOS.** The CPU engines run: `kokoro` and `mock`. There is no CUDA, so
-  `qwen3_tts` and `qwen3_tts_fast` cannot load; `doctor` flags the missing GPU as a
-  `WARN`, which is expected there. Use `AGENT_VOICE_DEFAULT_ENGINE=kokoro` (or
-  `mock`) for development.
-- **Windows.** Untested. The IPC transport switches to loopback TCP
-  automatically. Engine venvs use the Windows layout (`Scripts/` rather than
-  `bin/`) while the shipped manifests declare a POSIX `venv_python` path — that
-  mismatch is one of the things nobody has verified on Windows yet. If something
-  fails, run `agent-voice doctor`, then `engines test mock`, and report the output
-  with the bug template.
+- **macOS (Apple silicon).** The `cpu` engines are the supported choice — `kokoro`,
+  `phonon` and `mock` — and they are the pairs the matrix marks `verified here`
+  (measured on the reference Linux host; none of them is CUDA-specific). `qwen3_tts` has
+  an `mps` variant, but it is **experimental**: the lock is producible and the worker
+  passes `device_map="mps"`, and no Apple-silicon run has been measured yet.
+  `qwen3_tts_fast` is CUDA-only and cannot load. `doctor` flags a missing CUDA GPU as a
+  `WARN`, which is expected there. Use `AGENT_VOICE_DEFAULT_ENGINE=kokoro` (or `mock`)
+  for development.
+- **macOS (Intel).** Not a supported Phonon host: `fermion` pins `torch>=2.2,<2.3`
+  there, which cannot coexist with the engine's `torch==2.15.0` CPU pin. `kokoro` and
+  `mock` still run.
+- **Linux + AMD ROCm.** `qwen3_tts` has a `rocm` variant (lock produced from
+  `whl/rocm7.14`), and it is **experimental**: no AMD GPU was available to run it. The
+  verified path on an AMD box is the CPU engines.
+- **Windows.** **Experimental and unverified.** `scripts/install.ps1` exists and is
+  parse-checked at best; the IPC transport switches to loopback TCP automatically, but
+  engine venvs use the Windows layout (`Scripts/` rather than `bin/`) while the shipped
+  manifests declare a POSIX `venv_python` path — that mismatch is one of the things
+  nobody has verified on Windows yet. If something fails, run `agent-voice doctor`, then
+  `engines test mock`, and report the output with the bug template.
 - **Linux.** The reference platform. UDS IPC plus CUDA is the tested path.
 
 ## Where the logs are

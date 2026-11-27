@@ -99,6 +99,11 @@ class AppContext:
         self.settings = settings
         self.settings.ensure_dirs()
         self.registry = EngineRegistry(settings.engines_dir)
+        # A typo in AGENT_VOICE_DEVICES must fail at startup, not on the first
+        # request; the registry is available here and the check is torch-free.
+        from ..hardware import validate_device_preferences
+
+        validate_device_preferences(settings, self.registry)
         self.cache = SynthesisCache(settings.cache_dir, max_gb=settings.max_cache_gb)
         self.voices = VoiceStore(
             settings.voices_dir, max_ref_text_chars=settings.max_ref_text_chars

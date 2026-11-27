@@ -24,3 +24,11 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
 torchaudio = [{ index = "pytorch-cu128" }]
+
+# Which device this project root installs for. `engines install --device` compares
+# it against the requested device and falls through to `variants/<device>/` when
+# they differ, so this is a build identity, not a runtime hint. The CPU build
+# lives in variants/cpu/ (torch/torchaudio from whl/cpu), ROCm in variants/rocm/
+# (whl/rocm7.14, experimental), and Apple MPS in variants/mps/ (PyPI macOS arm64).
+[tool.agent-voice]
+device = "cuda"

@@ -4,6 +4,14 @@ backend_name: faster-qwen3-tts
 backend_version: "0.5.4"
 protocol_version: 1
 venv_python: .venv/bin/python
+# CUDA only, and that is a metadata fact rather than a choice: the installed
+# faster-qwen3-tts 0.5.4 distribution requires an NVIDIA GPU with CUDA and drives
+# torch.cuda.CUDAGraph. There is no ROCm claim in its metadata and no CPU/MPS
+# code path, so declaring more than `cuda` would promise paths that cannot run.
+# The worker refuses any other resolved device with BAD_REQUEST pointing at
+# qwen3_tts instead.
+default_device: cuda
+supported_devices: [cuda]
 
 # Verified on RTX 4060 Ti 16GB / driver 580.178.04 / torch 2.11.0+cu128:
 # both talker and predictor CUDA graphs capture and replay, native PCM streaming

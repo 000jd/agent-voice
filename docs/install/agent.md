@@ -1,12 +1,26 @@
 # Connect an agent
 
+Install first — one command, or from source — then come back here:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/000jd/agent-voice/main/scripts/install.sh | sh
+```
+
+Both routes and their flags: [one-command.md](one-command.md). The installer puts the
+shim at `~/.local/bin/agent-voice` and runs `agent-voice setup`, which ends by printing
+the snippet this page documents.
+
 `agent-voice mcp` is a **stdio shim**. It starts the daemon if it is not already
 running (under `data/daemon.lock`, so two agents cannot race), then proxies MCP to
 the daemon's Streamable HTTP endpoint. The agent process never loads a model, and
-there is exactly one GPU owner.
+there is exactly one GPU owner. The shim spawns the daemon with `cwd=<home>` and
+`AGENT_VOICE_HOME` set, so the client's working directory cannot change which `.env`
+the daemon reads.
 
-Every configuration below runs the same command with the absolute path to your
-checkout substituted for `<abs-path>`:
+Every configuration below runs the same command with the absolute path to your home
+substituted for `<abs-path>`. That is the checkout root for a source install, or the
+installer's directory (`~/.local/share/agent-voice` by default) — `agent-voice
+mcp-config` prints the resolved value for you:
 
 ```bash
 uv run --directory <abs-path> agent-voice mcp
@@ -20,10 +34,12 @@ Instead of hand-editing paths:
 uv run agent-voice mcp-config --client claude-code
 ```
 
-`mcp-config` prints a ready-to-paste JSON snippet for the named client, with this
-checkout's absolute path and the matching `AGENT_VOICE_CLIENT_ID` already filled
-in. `--client` is required; the output goes to stdout, nothing is written to disk
-and nothing is started.
+`mcp-config` prints a ready-to-paste JSON snippet for the named client, with your
+resolved home's absolute path and the matching `AGENT_VOICE_CLIENT_ID` already filled
+in. The home is `AGENT_VOICE_HOME` when set, otherwise the checkout/install directory,
+otherwise `~/.agent-voice` — so the snippet is right even when you are not standing in
+the project. `--client` is required; the output goes to stdout, nothing is written to
+disk, and no daemon is started.
 
 | `--client` value | Emits |
 |---|---|
@@ -52,6 +68,11 @@ clients because stdio is their default; VS Code requires it explicitly.
 > the **absolute** path to `uv` in `"command"` — e.g. `/home/you/.local/bin/uv`
 > instead of `uv` — and make sure `ffmpeg`/`ffprobe` are on the `PATH` that
 > process inherits. That is the single most common "server failed to start" cause.
+
+> Add `"AGENT_VOICE_HOME": "<abs-path>"` to the `env` block when the daemon should use
+> a home other than the one `mcp-config` detected (a second checkout, a sandbox, a test
+> data directory). The shim forwards it and spawns the daemon with it, so the client's
+> own working directory never matters.
 
 ## Claude Code
 
@@ -213,7 +234,17 @@ client.audio.speech.create(model="tts-1", voice="nova", input="Hello.").write_to
 ## CPU-only install (Kokoro + Phonon)
 
 An agent host without a GPU can still **speak and listen**: Kokoro-82M produces
-speech and Phonon-2.5 transcribes, both on the CPU with **0 MB of VRAM**.
+speech and Phonon-2.5 transcribes, both on the CPU with **0 MB of VRAM** — on
+`device=cpu`, which is the verified pair for each.
+
+The fastest path is the wizard, which detects the CPU-only host and installs exactly
+these two:
+
+```bash
+uv run agent-voice setup --profile cpu-only        # or: --non-interactive -y
+```
+
+By hand:
 
 ```bash
 # speak
@@ -286,6 +317,7 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=%h/projects/agent-voice
+Environment=AGENT_VOICE_HOME=%h/projects/agent-voice
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/projects/agent-voice/.venv/bin/agent-voice serve
 Restart=on-failure
@@ -315,21 +347,27 @@ adjust the paths if yours differ, and confirm with:
 systemctl --user show-environment | tr ' ' '\n' | grep '^PATH='
 ```
 
-`WorkingDirectory` also determines which `.env` is read, so point it at the
-checkout.
+`Environment=AGENT_VOICE_HOME=…` is what makes the unit read the config you edited:
+the daemon reads `<home>/.env`, and a unit's `WorkingDirectory` **no longer decides**
+which `.env` is used. Keeping both lines is still good practice (relative paths are
+easier to reason about that way), but the `AGENT_VOICE_HOME` line is the one that
+matters. Confirm what the daemon resolved with `agent-voice doctor` — its `home` row
+prints `home=`, `data=`, `engines=` and `config=`.
 
 ### Windows (NSSM)
 
 ```powershell
 nssm install agent-voice "C:\path\to\agent-voice\.venv\Scripts\agent-voice.exe" serve
 nssm set agent-voice AppDirectory "C:\path\to\agent-voice"
+nssm set agent-voice AppEnvironmentExtra "AGENT_VOICE_HOME=C:\path\to\agent-voice"
 nssm start agent-voice
 ```
 
 Alternatively, Task Scheduler with trigger "At log on" and action
-`agent-voice.exe serve` in the project directory (set "Start in" to the project
-path so `.env` is found). Windows support is untested — see
-[../troubleshooting.md](../troubleshooting.md#platform-notes) if it fails.
+`agent-voice.exe serve` in the project directory; set `AGENT_VOICE_HOME` in the task's
+environment rather than relying on "Start in", which no longer selects the `.env`.
+Windows support (including `scripts/install.ps1`) is **experimental and unverified** —
+see [../troubleshooting.md](../troubleshooting.md#platform-notes) if it fails.
 
 ## Verify the connection
 

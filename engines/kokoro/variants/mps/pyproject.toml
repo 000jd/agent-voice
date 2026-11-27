@@ -1,0 +1,27 @@
+[project]
+name = "agent-voice-engine-kokoro"
+version = "0.1.0"
+description = "Kokoro-82M TTS backend for agent-voice (Apple MPS variant, experimental)"
+requires-python = ">=3.12,<3.13"
+
+# Same dependency set as ../../pyproject.toml. The MPS build is the PyPI macOS
+# arm64 torch wheel, so there is no CPU/CUDA index mapping here. Narrowing to
+# the only platform that has MPS keeps the lock honest.
+#
+# Kokoro's own pipeline documents `cpu` and `cuda`; `mps` is experimental in
+# this repo (mocked probe only), which is why DEVICE_SUPPORT marks it so.
+dependencies = [
+    "kokoro==0.9.4",
+    "torch==2.15.0",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+    "huggingface-hub>=0.26",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+
+[tool.agent-voice]
+device = "mps"

@@ -39,3 +39,11 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu" }]
+
+# Which device this project root installs for. `engines install --device` compares
+# it against the requested device and falls through to `variants/<device>/` when
+# they differ, so this is a build identity, not a runtime hint. `variants/cuda/`
+# (whl/cu128) and `variants/mps/` (PyPI macOS arm64) are experimental; the CPU
+# build here remains the verified default.
+[tool.agent-voice]
+device = "cpu"

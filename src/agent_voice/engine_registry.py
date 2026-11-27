@@ -21,7 +21,9 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import yaml
 from filelock import FileLock
@@ -53,6 +55,8 @@ _ALLOWED_MANIFEST_KEYS = {
     "venv_python",
     "kind",
     "device",
+    "default_device",
+    "supported_devices",
     "capabilities",
     "models",
 }
@@ -66,6 +70,9 @@ class EngineRecord:
     installed: bool
     why_unavailable: str | None = None
     models: list[ModelEntry] = field(default_factory=list)
+    torch_info: dict[str, Any] | None = None
+    """What the venv's torch can do: version/cuda/hip/mps, or an error string.
+    None for a dependency-free engine that runs in the core interpreter."""
 
     @property
     def venv_python(self) -> Path:
@@ -246,6 +253,63 @@ def _dist_version(interpreter: Path, distribution: str) -> str | None:
         return None
 
 
+def _probe_torch_uncached(interpreter: Path) -> dict[str, Any]:
+    """Ask one engine interpreter what its torch build can actually do.
+
+    ``_dist_version`` cannot answer this: CPU and CUDA wheels both report
+    ``torch==2.x``. ``cuda``/``hip``/``mps`` are the only honest discriminators,
+    and they are what the WorkerManager uses to refuse a stale variant.
+    """
+    script = (
+        "import json\n"
+        "try:\n"
+        "    import torch\n"
+        "    print(json.dumps({\n"
+        "        'version': str(torch.__version__),\n"
+        "        'cuda': torch.version.cuda,\n"
+        "        'hip': getattr(torch.version, 'hip', None),\n"
+        "        'cuda_available': bool(torch.cuda.is_available()),\n"
+        "        'mps': bool(getattr(torch.backends, 'mps', None)\n"
+        "                    and torch.backends.mps.is_available()),\n"
+        "    }))\n"
+        "except Exception as exc:\n"
+        "    print(json.dumps({'error': f'{type(exc).__name__}: {exc}'[:200]}))\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(interpreter), "-c", script],
+            capture_output=True,
+            timeout=60,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        return {"error": stderr[:200] or "torch probe failed"}
+    try:
+        payload = json.loads(result.stdout.decode("utf-8").strip() or "null")
+    except json.JSONDecodeError:
+        return {"error": "unreadable torch probe"}
+    return payload if isinstance(payload, dict) else {"error": "unreadable torch probe"}
+
+
+@lru_cache(maxsize=64)
+def _torch_probe_cached(interpreter: str) -> dict[str, Any]:
+    return _probe_torch_uncached(Path(interpreter))
+
+
+def _torch_probe(interpreter: Path) -> dict[str, Any]:
+    """Cached build probe. Importing torch costs ~1 s per engine."""
+    return dict(_torch_probe_cached(str(interpreter)))
+
+
+def clear_torch_probe_cache() -> None:
+    """Call after an engine install: the venv's torch build may have changed."""
+    _torch_probe_cached.cache_clear()
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
@@ -339,6 +403,11 @@ class EngineRegistry:
                     f"engine.yaml declares {manifest.backend_name}=={declared} but "
                     f"{actual} is installed; run install to reconcile"
                 )
+            # A cpu/cuda/rocm/mps build is invisible to _dist_version: both CPU
+            # and CUDA torch report "2.x". Probe the build once per reload so the
+            # manager can refuse a stale variant with a clear message.
+            if manifest.venv_python is not None:
+                record.torch_info = _torch_probe(interpreter)
 
         record.models = [
             ModelEntry(
@@ -400,8 +469,10 @@ class EngineRegistry:
         *,
         loaded: dict[str, list[str]] | None = None,
         kind: EngineKind | None = None,
+        devices: dict[str, str] | None = None,
     ) -> list[EngineEntry]:
         loaded = loaded or {}
+        devices = devices or {}
         entries: list[EngineEntry] = []
         for engine_id in self.ids():
             record = self._records[engine_id]
@@ -427,6 +498,9 @@ class EngineRegistry:
                     instruct_control=bool(record.manifest.capabilities.instruct_control),
                     kind=record.manifest.kind,
                     device=record.manifest.device,
+                    default_device=record.manifest.default_device,
+                    supported_devices=list(record.manifest.supported_devices),
+                    resolved_device=devices.get(engine_id),
                     word_timestamps=bool(record.manifest.capabilities.word_timestamps),
                     hotwords=bool(record.manifest.capabilities.hotwords),
                     multilingual=bool(record.manifest.capabilities.multilingual),

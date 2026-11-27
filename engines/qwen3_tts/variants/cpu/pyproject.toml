@@ -1,0 +1,39 @@
+[project]
+name = "agent-voice-engine-qwen3-tts"
+version = "0.1.0"
+description = "Official Qwen3-TTS backend for agent-voice (CPU variant)"
+requires-python = ">=3.11,<3.13"
+
+# Same dependency set as ../../pyproject.toml; only the torch wheel index changes.
+#
+# A device is a different dependency set, not a `uv sync` flag: the canonical
+# uv.lock bakes whl/cu128 into every torch entry, and CPU and CUDA builds are
+# different wheels (they even resolve different torch versions). This project
+# root exists so `agent-voice engines install qwen3_tts --device cpu` can sync it
+# into the canonical engines/qwen3_tts/.venv with UV_PROJECT_ENVIRONMENT and
+# --locked, leaving the committed canonical lock untouched.
+#
+# Proven on uv 0.9.26 and measured in docs/phase0-devices-report.md: the lock
+# resolves torch 2.15.0+cpu / torchaudio 2.11.1+cpu and contains no nvidia-* and
+# no triton. The CPU index lags on torchaudio, which is why the two versions do
+# not match here; that difference is deliberate and documented.
+dependencies = [
+    "qwen-tts==0.1.1",
+    "torch",
+    "torchaudio",
+    "soundfile",
+    "numpy",
+]
+
+[tool.uv]
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchaudio = [{ index = "pytorch-cpu" }]
+
+[tool.agent-voice]
+device = "cpu"

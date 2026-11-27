@@ -6,6 +6,10 @@ protocol_version: 1
 venv_python: null
 kind: asr
 device: cpu
+# CPU only: the transcript is synthesised from the request, so there is no
+# backend and no accelerator to select.
+default_device: cpu
+supported_devices: [cpu]
 
 capabilities:
   streaming: false

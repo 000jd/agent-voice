@@ -7,11 +7,12 @@ isolated per-engine virtualenvs under ``engines/<engine_id>/.venv``.
 from __future__ import annotations
 
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .pronunciations import (
@@ -20,19 +21,68 @@ from .pronunciations import (
     PROJECT_LEXICON_DIR,
     PRONUNCIATION_FILE,
 )
-from .schemas import MAX_HOTWORDS
+from .schemas import MAX_HOTWORDS, ComputeDevice, DevicePreference
+
+
+def default_home() -> Path:
+    """The one resolved install home.
+
+    ``AGENT_VOICE_HOME`` wins. Otherwise the checkout root is the first parent
+    of this module that holds both ``pyproject.toml`` and ``engines/``. That is
+    what makes the CLI work from any directory without creating ``data/`` or
+    ``engines/`` in the caller's cwd. A non-editable install with no checkout
+    falls back to ``~/.agent-voice``; the doctor row says so.
+    """
+    override = os.environ.get("AGENT_VOICE_HOME", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").is_file() and (parent / "engines").is_dir():
+            return parent
+    return (Path.home() / ".agent-voice").resolve()
+
+
+def settings_env_file(home: Path | None = None) -> Path:
+    """The one ``.env`` the daemon reads, anchored at the home."""
+    return (home or default_home()) / ".env"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # The file is supplied by get_settings() from default_home(); a bare
+        # Settings(...) in a test must not read the developer's checkout .env.
+        env_file=None,
         env_file_encoding="utf-8",
-        # Field names are aliases of last resort for the constructor: without
-        # this, Settings(api_key="x") is dropped silently by extra="ignore".
-        populate_by_name=True,
         extra="ignore",
         case_sensitive=False,
     )
+
+    def __init__(self, **values: object) -> None:
+        """Accept constructor field names, without letting env field names in.
+
+        ``populate_by_name=True`` would also make the standard ``HOME``,
+        ``PORT``, ``HOST`` and ``DEVICE`` environment variables match fields,
+        silently re-homing the install or changing its bind address. Map only
+        *explicit constructor kwargs* from the field name to its alias; the
+        environment source still sees aliases alone.
+        """
+        mapped = dict(values)
+        for name, field in type(self).model_fields.items():
+            if name not in mapped:
+                continue
+            alias = field.alias
+            if alias is None:
+                choices = getattr(field.validation_alias, "choices", None)
+                if choices:
+                    alias = next((choice for choice in choices if isinstance(choice, str)), None)
+            if not alias:
+                continue
+            # An explicit alias always wins over the field-name spelling.
+            if alias in mapped:
+                mapped.pop(name)
+            else:
+                mapped[alias] = mapped.pop(name)
+        super().__init__(**mapped)
 
     # --- Server ---------------------------------------------------------
     host: str = Field(default="127.0.0.1", alias="AGENT_VOICE_HOST")
@@ -49,6 +99,20 @@ class Settings(BaseSettings):
     normal deployment.
     """
     default_voice_id: str = Field(default="", alias="AGENT_VOICE_DEFAULT_VOICE_ID")
+
+    # --- Hardware -------------------------------------------------------
+    device: DevicePreference = Field(default="auto", alias="AGENT_VOICE_DEVICE")
+    """Global device preference. ``auto`` resolves per engine from its manifest
+    and the host; an explicit value applies to every engine that supports it."""
+    devices: Annotated[dict[str, ComputeDevice], NoDecode] = Field(
+        default_factory=dict, alias="AGENT_VOICE_DEVICES"
+    )
+    """Per-engine overrides, the one env spelling ``kokoro=cpu,qwen3_tts=cuda``.
+
+    NoDecode keeps pydantic-settings from JSON-decoding the text before the
+    validator sees it; the validator accepts the documented ``a=b,c=d`` form.
+    Unknown engine ids are checked against the registry at AppContext startup.
+    """
 
     # --- GPU lifecycle --------------------------------------------------
     model_idle_ttl_seconds: float = Field(default=900.0, alias="MODEL_IDLE_TTL_SECONDS")
@@ -114,7 +178,10 @@ class Settings(BaseSettings):
     ``auto`` exposes the read/synthesis surface when agent mutation is disabled,
     and the full surface when it is enabled. ``core`` and ``full`` force it.
     """
-    mcp_base_path: str = Field(default="", alias="MCP_BASE_PATH")
+    mcp_base_path: str = Field(
+        default="",
+        validation_alias=AliasChoices("AGENT_VOICE_MCP_BASE_PATH", "MCP_BASE_PATH"),
+    )
 
     # --- HTTP security --------------------------------------------------
     # NoDecode stops pydantic-settings from JSON-decoding this list from the
@@ -134,8 +201,19 @@ class Settings(BaseSettings):
     paths."""
 
     # --- Paths ----------------------------------------------------------
-    data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
-    engines_dir: Path = Field(default=Path("./engines"), alias="ENGINES_DIR")
+    # Declared first: the path validators below read it from ValidationInfo.
+    # *Not* named `home`: populate_by_name=True would then match the standard
+    # $HOME environment variable and point the whole install at the user's
+    # home directory. `home` is a read-only property over this field.
+    agent_home: Path = Field(default_factory=default_home, alias="AGENT_VOICE_HOME")
+    data_dir: Path = Field(
+        default=Path("data"),
+        validation_alias=AliasChoices("AGENT_VOICE_DATA_DIR", "DATA_DIR"),
+    )
+    engines_dir: Path = Field(
+        default=Path("engines"),
+        validation_alias=AliasChoices("AGENT_VOICE_ENGINES_DIR", "ENGINES_DIR"),
+    )
 
     @field_validator("normalize_lufs")
     @classmethod
@@ -180,16 +258,67 @@ class Settings(BaseSettings):
                 return [str(item).strip() for item in parsed if str(item).strip()]
         return [part.strip() for part in text.split(",") if part.strip()]
 
-    @field_validator("data_dir", "engines_dir")
+    @field_validator("devices", mode="before")
     @classmethod
-    def _absolute(cls, value: Path) -> Path:
-        """Resolve to an absolute path at load time.
+    def _parse_devices(cls, value: object) -> object:
+        """Accept ``kokoro=cpu,qwen3_tts=cuda`` from the environment.
 
-        Workers are spawned with ``cwd=<engine dir>``, so any relative path in
-        their environment (notably the IPC socket) would resolve somewhere else
-        and the handshake would fail with a confusing ENOENT.
+        The resulting dict is validated against ``ComputeDevice`` by pydantic;
+        this only splits the documented text form.
         """
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if not text:
+            return {}
+        parsed: dict[str, str] = {}
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError(
+                    "AGENT_VOICE_DEVICES entries must look like engine=device; "
+                    f"got {part!r}"
+                )
+            engine, device = (piece.strip() for piece in part.split("=", 1))
+            if not engine or not device:
+                raise ValueError(
+                    "AGENT_VOICE_DEVICES entries need both an engine and a device; "
+                    f"got {part!r}"
+                )
+            parsed[engine] = device
+        return parsed
+
+    @field_validator("agent_home", mode="after")
+    @classmethod
+    def _home_absolute(cls, value: Path) -> Path:
         return value.expanduser().resolve()
+
+    @field_validator("data_dir", "engines_dir", mode="after")
+    @classmethod
+    def _under_home(cls, value: Path, info: ValidationInfo) -> Path:
+        """Resolve a relative path against the home, never against the cwd.
+
+        Running `agent-voice` from any directory must use the checkout's
+        ``data/`` and ``engines/``; a relative path in ``.env`` must not create
+        directories in the caller's cwd. Absolute paths are unchanged.
+        """
+        home: Path = info.data.get("agent_home") or default_home()
+        candidate = value.expanduser()
+        if not candidate.is_absolute():
+            candidate = home / candidate
+        return candidate.resolve()
+
+    @property
+    def home(self) -> Path:
+        """The resolved home. A property, not a field, so $HOME cannot match it."""
+        return self.agent_home
+
+    @property
+    def config_path(self) -> Path:
+        """``<home>/.env`` — the file get_settings() reads."""
+        return self.home / ".env"
 
     @property
     def voices_dir(self) -> Path:
@@ -297,7 +426,7 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    return Settings(_env_file=settings_env_file())
 
 
 def reset_settings_cache() -> None:

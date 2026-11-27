@@ -14,6 +14,13 @@ than only between chunks. All three entry points forward ``**kwargs`` to
 ``model.generate()``, so the same criteria covers every mode. Streaming is
 emulated because this backend has no token-level streaming API — the parent is
 told ``streaming_mode: "emulated"`` so nobody claims otherwise.
+
+The runtime device comes from ``AGENT_VOICE_RESOLVED_DEVICE`` (``cpu``, ``cuda``,
+``mps`` or ``rocm``), which the daemon's worker manager resolves and injects. A
+worker started without it keeps the pre-v0.6 behaviour and runs on ``cuda``.
+The device decides three things and nothing else: the ``device_map``, the dtype
+(``bfloat16`` only where the hardware has a fast path for it — CPU and Metal do
+not), and whether VRAM is reported at all.
 """
 
 from __future__ import annotations
@@ -43,6 +50,57 @@ STREAM_CHUNK_SECONDS = 0.1
 PROMPT_SCHEMA_VERSION = 2
 # Live prompt objects kept in RAM (one per distinct voice/text/mode).
 PROMPT_CACHE_SIZE = 8
+
+DEFAULT_DEVICE = "cuda"
+"""Device for a worker spawned without AGENT_VOICE_RESOLVED_DEVICE.
+
+Backward compatibility, deliberately: a v0.5 daemon, a direct IPC harness or a
+GPU test starts this worker with no device variable, and that worker has always
+run on CUDA. Anything else would silently change the audio those callers get.
+"""
+
+ACCELERATOR_DEVICES: frozenset[str] = frozenset({"cuda", "rocm"})
+"""Devices whose torch build is a CUDA/HIP build.
+
+``rocm`` is HIP, which torch exposes through the same ``torch.cuda`` namespace, so
+both take ``cuda:0`` as the device string, ``bfloat16``, and a real
+``memory_allocated()``. ``mps`` is Metal: no ``torch.cuda`` API exists there.
+"""
+
+
+def resolved_device() -> str:
+    """The runtime device the daemon resolved for this engine."""
+    value = (os.environ.get("AGENT_VOICE_RESOLVED_DEVICE") or "").strip().lower()
+    return value or DEFAULT_DEVICE
+
+
+def device_map_for(device: str) -> str:
+    """``device_map`` for ``from_pretrained``: one concrete device, never "auto"."""
+    if device in ACCELERATOR_DEVICES:
+        return "cuda:0"
+    return device
+
+
+def dtype_for(torch_module, device: str):
+    """Half precision only where it is a speedup, full precision elsewhere.
+
+    bfloat16 needs a fast bf16 matmul path, which a CUDA/HIP card has and a CPU
+    does not; Metal does not implement bfloat16 at all, so it would either fail
+    or be silently upcast. float32 is the honest choice on cpu and mps.
+    """
+    if device in ACCELERATOR_DEVICES:
+        return torch_module.bfloat16
+    return torch_module.float32
+
+
+def is_oom(message: str, type_name: str = "") -> bool:
+    """Whether a failure is an allocation failure, across all three backends."""
+    lowered = message.lower()
+    return (
+        "out of memory" in lowered
+        or "outofmemory" in type_name.lower()
+        or "defaultcpuallocator" in lowered
+    )
 
 # Request-level mistakes the worker can spot before touching the model. Marker ->
 # fix, so _classify can answer BAD_REQUEST with a suggestion an agent can act on
@@ -174,6 +232,7 @@ class QwenEngine:
         self._lock = threading.Lock()
         self._torch = None
         self.backend_version = _read_dist_version("qwen-tts")
+        self.device = resolved_device()
         # alias -> OrderedDict[(sha256, ref_text, xvec, backend_version)] -> [VoiceClonePromptItem]
         self.prompt_cache: OrderedDict[tuple, list] = OrderedDict()
 
@@ -192,8 +251,8 @@ class QwenEngine:
 
         model = Qwen3TTSModel.from_pretrained(
             repo,
-            device_map="cuda:0",
-            dtype=torch.bfloat16,
+            device_map=device_map_for(self.device),
+            dtype=dtype_for(torch, self.device),
             # sdpa, never flash-attn: building flash-attn on a 32 GB box is a trap
             # and the docs only ever call it a recommendation.
             attn_implementation="sdpa",
@@ -201,13 +260,40 @@ class QwenEngine:
         self.loaded[alias] = model
         return model
 
-    def _vram_mb(self) -> int:
+    def _vram_mb(self) -> int | None:
+        """This worker's device allocation in MB, or ``None`` when there is none.
+
+        ``None`` rather than 0 on cpu/mps: there is no separate pool to measure
+        there, and a 0 would read as "this worker holds nothing" instead of "this
+        worker cannot say". On cuda/rocm the number is the allocator's own, which
+        is what ``gpu_status()`` reports when NVML cannot answer.
+        """
+        if self.device not in ACCELERATOR_DEVICES:
+            return None
         try:
             import torch
 
-            return int(torch.cuda.memory_allocated() / 1024**2)
+            if torch.cuda.is_available():
+                return int(torch.cuda.memory_allocated() / 1024**2)
         except Exception:
-            return 0
+            return None
+        return None
+
+    def _empty_device_cache(self) -> None:
+        """Release cached device blocks for the device this worker actually uses."""
+        try:
+            import torch
+
+            gc.collect()
+            if self.device in ACCELERATOR_DEVICES:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            elif self.device == "mps":
+                mps = getattr(getattr(torch, "mps", None), "empty_cache", None)
+                if mps is not None:
+                    mps()
+        except Exception:
+            pass
 
     # -- rpc ------------------------------------------------------------
     def hello(self, msg: dict) -> None:
@@ -227,6 +313,7 @@ class QwenEngine:
                 },
                 "loaded_models": list(self.loaded),
                 "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
                 "pid": os.getpid(),
             }
         )
@@ -236,11 +323,17 @@ class QwenEngine:
         try:
             self._load(alias)
         except Exception as exc:
-            self._error(msg["id"], "MODEL_NOT_FOUND", f"could not load {alias}: {exc}",
-                        "Check the model is downloaded and the GPU has free VRAM.")
+            self._error(msg["id"], self._classify(exc), f"could not load {alias}: {exc}",
+                        self._suggestion(exc))
             return
         self.conn.send_json(
-            {"id": msg["id"], "model_alias": alias, "loaded_models": list(self.loaded)}
+            {
+                "id": msg["id"],
+                "model_alias": alias,
+                "loaded_models": list(self.loaded),
+                "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
+            }
         )
 
     def unload_model(self, msg: dict) -> None:
@@ -249,15 +342,15 @@ class QwenEngine:
         # Drop this model's cached prompts: they hold tensors on its device.
         for key in [k for k in self.prompt_cache if k[0] == alias]:
             self.prompt_cache.pop(key, None)
-        try:
-            import torch
-
-            gc.collect()
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
+        self._empty_device_cache()
         self.conn.send_json(
-            {"id": msg["id"], "model_alias": alias, "loaded_models": list(self.loaded)}
+            {
+                "id": msg["id"],
+                "model_alias": alias,
+                "loaded_models": list(self.loaded),
+                "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
+            }
         )
 
     def health(self, msg: dict) -> None:
@@ -267,6 +360,7 @@ class QwenEngine:
                 "ok": True,
                 "loaded_models": list(self.loaded),
                 "gpu_vram_mb": self._vram_mb(),
+                "device": self.device,
                 "in_flight": self.in_flight,
             }
         )
@@ -546,12 +640,12 @@ class QwenEngine:
                     "model_alias": msg["model_alias"],
                     "backend_name": BACKEND_NAME,
                     "backend_version": self.backend_version,
+                    "gpu_vram_mb": self._vram_mb(),
+                    "device": self.device,
                 }
             )
         except Exception as exc:
-            self._error(request_id, self._classify(exc), str(exc),
-                        _client_error_suggestion(str(exc))
-                        or "Check GPU memory and that the reference audio is valid.")
+            self._error(request_id, self._classify(exc), str(exc), self._suggestion(exc))
         finally:
             with self._lock:
                 self.in_flight -= 1
@@ -601,26 +695,55 @@ class QwenEngine:
                     "done": True,
                     "duration_sec": produced / 2 / SAMPLE_RATE,
                     "streaming_mode": "emulated",
+                    "gpu_vram_mb": self._vram_mb(),
+                    "device": self.device,
                 }
             )
         except Exception as exc:
-            self._error(request_id, self._classify(exc), str(exc),
-                        _client_error_suggestion(str(exc)))
+            self._error(request_id, self._classify(exc), str(exc), self._suggestion(exc))
         finally:
             with self._lock:
                 self.in_flight -= 1
             self.cancel_events.pop(request_id, None)
 
-    @staticmethod
-    def _classify(exc: BaseException) -> str:
+    def _classify(self, exc: BaseException) -> str:
+        """Map a failure onto the daemon's taxonomy, aware of the device in use.
+
+        ``CUDA_OOM`` is only truthful on a cuda/rocm worker. An allocation failure
+        on cpu or mps is still an allocation failure, but reporting it as CUDA
+        sends the caller to a knob that does not exist on that machine, so it is
+        an INTERNAL_ERROR whose message keeps the allocator's own text.
+        """
         message = str(exc)
-        if "out of memory" in message.lower() or "OutOfMemoryError" in type(exc).__name__:
-            return "CUDA_OOM"
+        if is_oom(message, type(exc).__name__):
+            return "CUDA_OOM" if self.device in ACCELERATOR_DEVICES else "INTERNAL_ERROR"
         if "no reference voice supplied" in message:
             return "VOICE_NOT_FOUND"
         if _client_error_suggestion(message):
             return "BAD_REQUEST"
         return "INTERNAL_ERROR"
+
+    def _suggestion(self, exc: BaseException) -> str:
+        """The one next step for this failure, phrased for the device in use."""
+        client = _client_error_suggestion(str(exc))
+        if client:
+            return client
+        if is_oom(str(exc), type(exc).__name__):
+            if self.device in ACCELERATOR_DEVICES:
+                return (
+                    "Free device memory: close other GPU processes, or use the 0.6b "
+                    "alias. `agent-voice doctor` reports free VRAM."
+                )
+            if self.device == "cpu":
+                return (
+                    "Free system RAM, or use the 0.6b alias: this model runs in "
+                    "float32 on the CPU, so the 1.7B checkpoints need several GB."
+                )
+            return (
+                "Free unified memory (quit other Apple apps), use the 0.6b alias, "
+                "or run this engine on cpu with AGENT_VOICE_DEVICES=qwen3_tts=cpu."
+            )
+        return "Check the model is downloaded and the reference audio is valid."
 
     def _error(self, request_id: str, code: str, message: str, suggestion: str) -> None:
         self.conn.send_json(

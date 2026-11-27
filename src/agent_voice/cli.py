@@ -21,13 +21,13 @@ import typer
 from pydantic import ValidationError
 from pydantic_settings import SettingsError
 
-from .config import Settings, get_settings
+from .config import Settings, default_home, get_settings
 
 # Imported eagerly, unlike the engine/model/voice modules below: Typer evaluates
 # option defaults when this module is imported, so the `voices design` sample text
 # has to be available here. `schemas` is torch-free by contract (see its module
 # docstring), so this does not break the "no torch in the CLI" rule.
-from .schemas import DEFAULT_DESIGN_SAMPLE_TEXT
+from .schemas import DEFAULT_DESIGN_SAMPLE_TEXT, DevicePreference
 
 app = typer.Typer(
     help="Headless multi-engine voice server for AI agents.", no_args_is_help=True
@@ -602,14 +602,16 @@ def dub_render(
 
 
 # ---------------------------------------------------------------------------
-# doctor / mcp-config
+# setup / doctor / mcp-config
 # ---------------------------------------------------------------------------
 
-# A check is PASS (usable), WARN (works, but degraded or unconfigured) or FAIL
-# (this checkout cannot serve requests as configured). Only FAIL exits non-zero:
-# no `.env` and a CPU-only box are both supported setups.
+# A check is PASS (usable), INFO (optional and absent, which is not a problem),
+# WARN (works, but degraded or unconfigured) or FAIL (this checkout cannot serve
+# requests as configured). Only FAIL exits non-zero: no `.env`, a CPU-only box and
+# an engine you never installed are all supported setups.
 _CHECK_COLOUR = {
     "PASS": typer.colors.GREEN,
+    "INFO": typer.colors.CYAN,
     "WARN": typer.colors.YELLOW,
     "FAIL": typer.colors.RED,
 }
@@ -621,10 +623,10 @@ McpClient = Literal["claude-code", "claude-desktop", "vscode", "cursor", "comman
 
 @dataclass
 class _Check:
-    """One doctor row. ``fix`` is the single line to act on for a WARN/FAIL."""
+    """One doctor row. ``fix`` is the single line to act on for an INFO/WARN/FAIL."""
 
     name: str
-    status: Literal["PASS", "WARN", "FAIL"]
+    status: Literal["PASS", "INFO", "WARN", "FAIL"]
     detail: str = ""
     fix: str = ""
 
@@ -678,7 +680,12 @@ def _python_check() -> _Check:
 
 
 def _probe_gpu() -> _Check:
-    """nvidia-smi presence and answer. A CPU/mock-only box is never a FAIL."""
+    """nvidia-smi presence and answer. A CPU/mock-only box is never a FAIL.
+
+    No accelerator is INFO, not WARN: every shipped CPU engine is a supported
+    setup, and a warning would tell those operators to fix something that is not
+    broken. The nudge stays in the ``fix:`` line.
+    """
     import shutil
     import subprocess
 
@@ -686,7 +693,7 @@ def _probe_gpu() -> _Check:
     if binary is None:
         return _Check(
             "gpu",
-            "WARN",
+            "INFO",
             "no nvidia-smi: mock/CPU only",
             "install the NVIDIA driver for GPU engines; `--engine mock` needs no GPU",
         )
@@ -774,23 +781,33 @@ def _check_port(host: str, port: int, base_url: str) -> _Check:
     )
 
 
-def _engine_checks(entries, engines_dir: Path, default_engine: str) -> list[_Check]:
-    """One row per discovered engine; nothing installed is a FAIL, not a warning."""
+def _engine_checks(
+    entries, engines_dir: Path, selected: set[str] | frozenset[str]
+) -> list[_Check]:
+    """One row per discovered engine.
+
+    ``selected`` is the set the configuration actually asks for
+    (``default_engine`` + ``default_asr_engine``). An engine that is installed is
+    PASS; one that is missing and *selected* is a WARN (speaking or transcribing
+    will fail); one that is missing and merely discovered is INFO — every release
+    ships more engines than a given machine needs, and calling those a problem
+    made a fresh clone look broken.
+    """
     if not any(entry.installed for entry in entries):
         discovered = [entry.engine_id for entry in entries]
-        # Suggest something that exists: the configured default when it was
-        # discovered, else the first engine there is, else the bundled mock.
-        if default_engine in discovered:
-            suggested = default_engine
-        else:
-            suggested = discovered[0] if discovered else "mock"
+        # Suggest something that exists: a configured default when it was
+        # discovered, then any selected engine, else the first one there is.
+        candidates = [engine_id for engine_id in discovered if engine_id in selected]
+        suggested = candidates[0] if candidates else (
+            discovered[0] if discovered else "mock"
+        )
         return [
             _Check(
                 "engines",
                 "FAIL",
                 f"no engine installed in {engines_dir}; "
                 f"discovered: {', '.join(discovered) or '(none)'}",
-                f"agent-voice engines install {suggested}",
+                f"agent-voice engines install {suggested}, or run `agent-voice setup`",
             )
         ]
 
@@ -805,34 +822,58 @@ def _engine_checks(entries, engines_dir: Path, default_engine: str) -> list[_Che
                 )
             )
             continue
-        checks.append(
-            _Check(
-                f"engines: {entry.engine_id}",
-                "WARN",
-                entry.why_unavailable or "not installed",
-                f"agent-voice engines install {entry.engine_id}",
+        fix = f"agent-voice engines install {entry.engine_id}"
+        if entry.engine_id in selected:
+            checks.append(
+                _Check(
+                    f"engines: {entry.engine_id}",
+                    "WARN",
+                    entry.why_unavailable or "not installed",
+                    fix,
+                )
             )
-        )
+        else:
+            checks.append(
+                _Check(
+                    f"engines: {entry.engine_id}",
+                    "INFO",
+                    f"optional, not installed ({entry.why_unavailable or 'no venv'})",
+                    fix,
+                )
+            )
     return checks
 
 
-def _model_checks(entries) -> list[_Check]:
+def _model_checks(
+    entries, installed: set[str] | frozenset[str], selected: set[str] | frozenset[str]
+) -> list[_Check]:
     """Which declared weights are actually on disk.
 
-    `local/` repos ship with the engine and count as present, exactly like the
+    ``local/`` repos ship with the engine and count as present, exactly like the
     router (`api/routing.py`) treats them — otherwise the dependency-free mock
     engine would report every model as missing.
+
+    Missing weights are a WARN only for an engine this checkout is expected to
+    use (installed, or named as the default); for an engine that is neither, they
+    collapse into one INFO row, because an engine you do not install needs no
+    weights.
     """
     present = 0
-    missing: list[tuple[str, str, str]] = []
+    required: list[tuple[str, str, str]] = []
+    optional: list[tuple[str, str, str]] = []
     for entry in entries:
+        needed = entry.installed or entry.engine_id in installed or (
+            entry.engine_id in selected
+        )
         for model in entry.models:
             if model.downloaded_locally or model.hf_repo.startswith("local/"):
                 present += 1
+            elif needed:
+                required.append((entry.engine_id, model.alias, model.hf_repo))
             else:
-                missing.append((entry.engine_id, model.alias, model.hf_repo))
+                optional.append((entry.engine_id, model.alias, model.hf_repo))
 
-    total = present + len(missing)
+    total = present + len(required) + len(optional)
     if total == 0:
         return [
             _Check(
@@ -842,17 +883,47 @@ def _model_checks(entries) -> list[_Check]:
                 "check that each engines/<id>/engine.yaml lists its models",
             )
         ]
-    if not missing:
-        return [_Check("models", "PASS", f"{present}/{total} weights present")]
-    return [
+
+    checks: list[_Check] = [
         _Check(
             f"models: {engine_id}/{alias}",
             "WARN",
             f"{hf_repo} not downloaded",
             f"agent-voice models download {engine_id} {alias}",
         )
-        for engine_id, alias, hf_repo in missing
+        for engine_id, alias, hf_repo in required
     ]
+    if optional:
+        named = ", ".join(f"{engine_id}/{alias}" for engine_id, alias, _ in optional[:3])
+        more = "" if len(optional) <= 3 else f" (+{len(optional) - 3} more)"
+        checks.append(
+            _Check(
+                "models",
+                "INFO",
+                f"{len(optional)} optional weight(s) not downloaded: {named}{more}",
+                "they are only needed if you install that engine: "
+                "`agent-voice models download <engine> <alias>`",
+            )
+        )
+    if not checks:
+        checks.append(_Check("models", "PASS", f"{present}/{total} weights present"))
+    return checks
+
+
+def _home_check(settings: Settings) -> _Check:
+    """The resolved home is what makes the CLI independent of the cwd."""
+    detail = (
+        f"home={settings.home}; data={settings.data_dir}; "
+        f"engines={settings.engines_dir}; config={settings.config_path}"
+    )
+    if not settings.engines_dir.is_dir():
+        return _Check(
+            "home",
+            "WARN",
+            detail,
+            f"create {settings.engines_dir}, or set ENGINES_DIR / AGENT_VOICE_HOME",
+        )
+    return _Check("home", "PASS", detail)
 
 
 def _inbox_check(settings) -> _Check:
@@ -869,7 +940,91 @@ def _inbox_check(settings) -> _Check:
     return _Check("inbox", "PASS", str(settings.inbox_dir))
 
 
-_STATUS_RANK = {"PASS": 0, "WARN": 1, "FAIL": 2}
+_STATUS_RANK = {"PASS": 0, "INFO": 1, "WARN": 2, "FAIL": 3}
+
+
+def _hardware_check(profile, error: str = "") -> _Check:
+    """The host the recommendations are computed from, in one row.
+
+    Always PASS when the probe answered: a CPU-only box is a supported setup, and
+    the row exists so a surprising recommendation can be traced to a measurement
+    instead of a guess.
+    """
+    if profile is None:
+        return _Check(
+            "hardware",
+            "INFO",
+            f"probe failed: {error or 'unknown error'}",
+            "agent-voice setup prints the same probe with the raw values",
+        )
+    detail = f"{profile.summary()}; accelerator={profile.accelerator}"
+    return _Check("hardware", "PASS", detail)
+
+
+def _device_check(settings, registry, entries, hardware) -> _Check:
+    """Resolved runtime device per installed engine, plus the support level.
+
+    The preference map is validated against the registry first: a typo in
+    ``AGENT_VOICE_DEVICES`` is a FAIL naming the engine and its supported devices,
+    because it fails every request for that engine at runtime.
+    """
+    from .hardware import pair_level, resolve_device, validate_device_preferences
+    from .schemas import AgentVoiceError
+
+    if registry is None or hardware is None:
+        return _Check(
+            "device",
+            "INFO",
+            "device preferences not validated (registry or hardware unavailable)",
+            "",
+        )
+    try:
+        validate_device_preferences(settings, registry)
+    except AgentVoiceError as exc:
+        return _Check(
+            "device",
+            "FAIL",
+            _one_line(exc.message),
+            _one_line(exc.suggestion),
+        )
+
+    installed = [entry for entry in entries if entry.installed]
+    if not installed:
+        return _Check(
+            "device",
+            "INFO",
+            f"AGENT_VOICE_DEVICE={settings.device}; no installed engine to resolve one for",
+            "agent-voice engines install <id> --device auto|cpu|cuda|mps|rocm",
+        )
+
+    resolved: list[str] = []
+    problems: list[str] = []
+    for entry in installed:
+        try:
+            device = resolve_device(
+                entry.engine_id, registry.get(entry.engine_id).manifest, settings, hardware
+            )
+        except AgentVoiceError as exc:
+            # A host that cannot serve an installed engine's device is a WARN, not
+            # a FAIL: every other engine still works, and the fix is one setting.
+            problems.append(f"{entry.engine_id}: {exc.message}")
+            continue
+        resolved.append(
+            f"{entry.engine_id}={device}"
+            + ("" if pair_level(entry.engine_id, device) == "verified"
+               else f"({pair_level(entry.engine_id, device)})")
+        )
+    if problems:
+        return _Check(
+            "device",
+            "WARN",
+            "; ".join(problems),
+            "point that engine at a device this host has "
+            "(AGENT_VOICE_DEVICE=cpu, or AGENT_VOICE_DEVICES=<engine>=<device>), "
+            "or install its device variant",
+        )
+    prefix = "" if settings.device == "auto" else f"global={settings.device}; "
+    return _Check("device", "PASS", prefix + ", ".join(resolved))
 
 
 def _default_engine_check(
@@ -915,21 +1070,27 @@ def _env_check(
     known: list[str],
     installed: list[str],
     engines_usable: bool = True,
+    config_path: Path | None = None,
 ) -> _Check:
     """`.env` presence, plus whether the configured default engine can serve.
 
     The two are judged independently: a checkout with no `.env` is a supported
-    setup (WARN, `cp .env.example .env`), while the *effective* engine — whichever
-    of the shell variable and the file wins — is always validated against the
-    engines that really exist. Reporting presence alone used to hide a ghost
-    `AGENT_VOICE_DEFAULT_ENGINE` in the environment behind a green run.
+    setup (WARN — `agent-voice setup` writes one), while the *effective* engine —
+    whichever of the shell variable and the file wins — is always validated
+    against the engines that really exist. Reporting presence alone used to hide a
+    ghost `AGENT_VOICE_DEFAULT_ENGINE` in the environment behind a green run.
 
     Only engine ids are ever printed: a `.env` also holds API keys, and this
     command's output is the kind of thing a user pastes into an issue.
     """
-    present = (Path.cwd() / ".env").is_file()
+    path = config_path or (Path.cwd() / ".env")
+    present = path.is_file()
     presence = "present" if present else "absent, built-in defaults apply"
-    fixes = [] if present else ["cp .env.example .env"]
+    fixes = (
+        []
+        if present
+        else [f"agent-voice setup (writes {path}); or cp .env.example {path.name}"]
+    )
 
     if not engines_usable:
         # One root cause, one row: the engines row already carries the FAIL.
@@ -1133,6 +1294,7 @@ def doctor() -> None:
     registry_error: _Check | None = None
     known: list[str] = []
     entries: list = []
+    registry = None
     try:
         registry = EngineRegistry(settings.engines_dir)
         entries = registry.list_entries()
@@ -1146,6 +1308,21 @@ def doctor() -> None:
             f"create {settings.engines_dir}, or point ENGINES_DIR at the checkout",
         )
     installed = [entry.engine_id for entry in entries if entry.installed]
+    # What the configuration asks for: the speaking default and the listening
+    # default. An uninstalled engine outside this set is optional, not broken.
+    selected = {settings.default_engine, settings.default_asr_engine}
+
+    # The hardware probe drives the `hardware` and `device` rows. It is a handful
+    # of stdlib reads and argv subprocesses, and a failure must not take doctor
+    # down with it.
+    hardware = None
+    hardware_error = ""
+    try:
+        from .hardware import detect_hardware
+
+        hardware = detect_hardware()
+    except Exception as exc:  # noqa: BLE001 - reported as an INFO row
+        hardware_error = _one_line(exc)
 
     checks: list[_Check] = [_python_check()]
 
@@ -1183,6 +1360,9 @@ def doctor() -> None:
     checks.append(_dub_filters_check())
 
     checks.append(_probe_gpu())
+    # Straight after the GPU row: the hardware profile is what `setup` recommends
+    # from, so a surprising recommendation can be traced to a measurement here.
+    checks.append(_hardware_check(hardware, hardware_error))
     # Engine-specific tool rows (`espeak-ng` for Kokoro) belong with the tool
     # probes above, before `.env` decides which engine is expected to be
     # installed. A missing optional tool is a WARN, never a FAIL.
@@ -1199,36 +1379,429 @@ def doctor() -> None:
             known=known,
             installed=installed,
             engines_usable=registry_error is None,
+            config_path=settings.config_path,
         )
     )
     if registry_error is not None:
         checks.append(registry_error)
     else:
-        checks.extend(_engine_checks(entries, settings.engines_dir, default_engine))
+        checks.extend(_engine_checks(entries, settings.engines_dir, selected))
+        # The resolved device per installed engine: a per-engine override that the
+        # manifest cannot serve, or a typo in AGENT_VOICE_DEVICES, is a FAIL here
+        # rather than a 400 on the first request.
+        checks.append(_device_check(settings, registry, entries, hardware))
         # After the engine rows and before the weights: an ASR engine is a separate
         # plugin family from the speaking default, so its own row belongs next to
         # the engines it is judged against. WARN only — a TTS-only box is fine.
         checks.append(_asr_check(entries, settings))
-        checks.extend(_model_checks(entries))
+        checks.extend(_model_checks(entries, installed, selected))
     checks.append(_inbox_check(settings))
+    checks.append(_home_check(settings))
     # Daemon health last: it is the only row that can legitimately be "in use".
     checks.append(_check_port(settings.host, settings.port, settings.base_url))
 
     _print_checks(checks)
     failures = [check for check in checks if check.status == "FAIL"]
     warnings = [check for check in checks if check.status == "WARN"]
+    optional = [check for check in checks if check.status == "INFO"]
     if failures:
         typer.secho(
-            f"doctor: {len(failures)} failed, {len(warnings)} warning(s) — "
-            "fix the FAIL rows above",
+            f"doctor: {len(failures)} failed, {len(optional)} optional, "
+            f"{len(warnings)} warning(s) — fix the FAIL rows above",
             fg=typer.colors.RED,
             err=True,
         )
         raise typer.Exit(code=1)
     typer.secho(
-        f"doctor: {len(checks)} checks, {len(warnings)} warning(s), no failures",
+        f"doctor: {len(checks)} checks, {len(optional)} optional, "
+        f"{len(warnings)} warning(s), no failures",
         fg=typer.colors.GREEN,
     )
+
+
+def doctor_exit_code() -> int:
+    """Run `doctor` and return its exit code, for callers that must not exit.
+
+    ``agent-voice setup`` runs the doctor as its last step and reports the result
+    as a line of its own; letting the doctor's ``typer.Exit`` escape would end the
+    command before the MCP snippet is printed.
+    """
+    try:
+        doctor()
+    except typer.Exit as exc:
+        return int(exc.exit_code or 0)
+    return 0
+
+
+def mcp_config_payload(client: str = "claude-code") -> dict[str, object]:
+    """The MCP snippet as data, so `setup` prints the same payload as `mcp-config`."""
+    # Home, not __file__: an editable checkout resolves to the same directory,
+    # while a wheel install no longer points the client at site-packages.
+    root = default_home()
+    server: dict[str, object] = {
+        "command": "uv",
+        "args": ["run", "--directory", str(root), "agent-voice", "mcp"],
+        "env": {"AGENT_VOICE_CLIENT_ID": client},
+    }
+
+    if client == "vscode":
+        # VS Code's `.vscode/mcp.json` uses a `servers` key and spells out the
+        # transport; the other four clients share Claude's `mcpServers` shape.
+        return {"servers": {"agent-voice": {"type": "stdio", **server}}}
+    return {"mcpServers": {"agent-voice": server}}
+
+
+# ---------------------------------------------------------------------------
+# setup
+# ---------------------------------------------------------------------------
+
+SetupProfile = Literal["auto", "cpu-only", "nvidia-gpu", "apple-silicon"]
+"""Mirrors ``setup_wizard.SetupProfile``.
+
+Duplicated rather than imported: the CLI keeps its module load light and pulls
+``setup_wizard`` inside the command bodies, the same way it defers the engine,
+model and voice modules.
+"""
+
+_DEVICE_CHOICES = ("auto", "cpu", "cuda", "mps", "rocm")
+
+
+def _fmt_gb(value: float) -> str:
+    return f"{value:.2f} GB"
+
+
+def _print_hardware(profile) -> None:
+    """The detected host, one aligned row per fact."""
+    gpu = profile.primary_gpu
+    ram = f"{profile.ram_gb:.1f} GB" if profile.ram_gb is not None else "RAM unknown"
+    if gpu is None:
+        gpu_text = "none detected"
+    else:
+        vram = f"{gpu.vram_gb:.1f} GB" if gpu.vram_gb else "VRAM unknown"
+        driver = f", driver {gpu.driver}" if gpu.driver else ""
+        gpu_text = f"{gpu.name}, {vram}{driver}"
+    tools = ", ".join(
+        (
+            "uv" if profile.has_uv else "uv MISSING",
+            "ffmpeg" if profile.has_ffmpeg else "ffmpeg MISSING",
+            "espeak-ng" if profile.has_espeak_ng else "espeak-ng missing",
+        )
+    )
+    rows = [
+        ("os", f"{profile.os}/{profile.arch}, python {profile.python_version}"),
+        ("cpu", f"{profile.cpu_cores} cores, {ram}"),
+        ("gpu", gpu_text),
+        ("accelerator", profile.accelerator),
+        ("tools", tools),
+    ]
+    width = max(len(name) for name, _ in rows)
+    typer.echo("hardware")
+    for name, value in rows:
+        typer.echo(f"  {name:<{width}}  {value}")
+
+
+def _print_choices(header: str, choices) -> None:
+    """Engine rows: device, support level, size and the models it pulls."""
+    if not choices:
+        return
+    engine_width = max(len(choice.engine_id) for choice in choices)
+    typer.echo(header)
+    for choice in choices:
+        models = ", ".join(choice.models) or "(no model declared)"
+        typer.echo(
+            f"  {choice.engine_id:<{engine_width}}  {choice.device:<5}  "
+            f"{choice.level:<12}  ~{_fmt_gb(choice.download_gb):<9}  {models}"
+        )
+
+
+def _print_setup_plan(plan, *, with_hardware: bool = True) -> None:
+    """Hardware, the recommendation, the selection and the exact `.env` diff."""
+    if with_hardware:
+        _print_hardware(plan.hardware)
+        typer.echo("")
+    _print_choices(
+        f"recommended (profile {plan.profile}, verified pairs only)", plan.recommended
+    )
+    experimental = [choice for choice in plan.optional if choice.level != "verified"]
+    if experimental:
+        _print_choices("experimental (offered, never selected by default)", experimental)
+    typer.echo("")
+    if plan.selected:
+        _print_choices("selected for install", plan.selected)
+        for install in plan.installs:
+            if install.problem:
+                typer.secho(
+                    f"  {install.engine_id}: cannot install — {install.problem}",
+                    fg=typer.colors.RED,
+                )
+                continue
+            typer.echo(
+                f"  {install.engine_id}: {install.variant or 'n/a'} project -> "
+                f"{install.project_dir or '(none)'}"
+            )
+    else:
+        typer.secho("selected for install: (none)", fg=typer.colors.YELLOW)
+    typer.echo("")
+    download_note = (
+        "weights will be downloaded"
+        if plan.download
+        else "weights skipped; pass --download to fetch them"
+    )
+    typer.echo(f"downloads: ~{_fmt_gb(plan.download_gb)} ({download_note})")
+    typer.echo(f".env: {plan.env.path}")
+    for line in plan.env.lines():
+        typer.echo(f"  {line}")
+    if not plan.env.has_changes:
+        typer.echo("  (already up to date)")
+    for warning in plan.warnings:
+        typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW)
+
+
+def _ask_device(plan) -> str:
+    """Prompt for the global device preference, defaulting to the resolved one."""
+    default = plan.device
+    answer = typer.prompt(
+        "Device preference (auto/cpu/cuda/mps/rocm)", default=default, show_default=True
+    )
+    while answer.strip().lower() not in _DEVICE_CHOICES:
+        typer.secho(
+            f"pick one of {', '.join(_DEVICE_CHOICES)}", fg=typer.colors.RED, err=True
+        )
+        answer = typer.prompt("Device preference", default=default)
+    return answer.strip().lower()
+
+
+def _ask_engines(plan) -> str:
+    """Pre-check the verified recommendation; leave the experimental pairs out.
+
+    Offering an experimental pair here would be a lie: ``plan_setup`` skips those
+    by design, so the prompt only covers what will actually be installed.
+    """
+    chosen = [
+        choice.engine_id
+        for choice in plan.recommended
+        if typer.confirm(
+            f"install {choice.engine_id} on {choice.device} "
+            f"({choice.level}, ~{_fmt_gb(choice.download_gb)})?",
+            default=True,
+        )
+    ]
+    return ",".join(chosen)
+
+
+def _uv_sync(argv, *, env, cwd) -> int:
+    """The real install: an argv list, ``shell=False``, inherited stdio."""
+    import subprocess
+
+    result = subprocess.run(
+        list(argv), env=dict(env), cwd=str(cwd), shell=False, check=False
+    )
+    return int(result.returncode)
+
+
+def _setup_run(
+    *,
+    yes: bool,
+    non_interactive: bool,
+    profile: SetupProfile,
+    device: str,
+    engines: str,
+    download: bool,
+    dry_run: bool,
+) -> None:
+    """The body of ``setup``, split out so Ctrl-C has exactly one exit path."""
+    from . import setup_wizard
+    from .hardware import detect_hardware
+
+    try:
+        settings = get_settings()
+    except (ValidationError, SettingsError) as exc:
+        typer.secho(f"config: {_validation_detail(exc)}", fg=typer.colors.RED, err=True)
+        typer.echo(
+            "fix .env (or the AGENT_VOICE_* variable overriding it), then re-run "
+            "`agent-voice setup`",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    try:
+        hardware = detect_hardware()
+    except Exception as exc:  # noqa: BLE001 - one line, never a traceback
+        typer.secho(
+            f"hardware probe failed: {_one_line(exc)}", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1) from exc
+
+    # Interactive only on a real terminal, and never for a dry run or --yes:
+    # both of those exist to be unattended.
+    interactive = (
+        not non_interactive
+        and not yes
+        and not dry_run
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    )
+
+    def build(**overrides):
+        kwargs: dict[str, object] = {
+            "profile": profile,
+            "device": device,
+            "engines": engines or None,
+            "download": download,
+            "interactive": interactive,
+            "dry_run": dry_run,
+        }
+        kwargs.update(overrides)
+        return setup_wizard.plan_setup(settings, hardware, **kwargs)
+
+    preview = build(dry_run=True)
+    if interactive:
+        _print_hardware(hardware)
+        typer.echo("")
+        device = _ask_device(preview)
+        engines = _ask_engines(preview)
+        if not engines.strip():
+            typer.secho(
+                "no engines selected: nothing to install",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        plan = build(device=device, engines=engines, dry_run=False)
+        typer.echo("")
+    else:
+        plan = build()
+
+    _print_setup_plan(plan, with_hardware=not interactive)
+    if plan.refusal:
+        typer.secho(f"setup: {plan.refusal}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    if dry_run:
+        typer.secho(
+            "dry run: nothing was installed, downloaded or written",
+            fg=typer.colors.GREEN,
+        )
+        return
+
+    if interactive and plan.download_gb and not plan.download:
+        if typer.confirm(
+            f"download ~{_fmt_gb(plan.download_gb)} of model weights now?",
+            default=False,
+        ):
+            plan = build(device=device, engines=engines, download=True, dry_run=False)
+            typer.secho(
+                f"downloads: ~{_fmt_gb(plan.download_gb)} (will download)",
+                fg=typer.colors.CYAN,
+            )
+
+    if not yes:
+        if not interactive:
+            typer.secho(
+                "nothing applied: no terminal to confirm on. Re-run with --yes "
+                "(add --download to fetch weights)",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if not typer.confirm("Apply this plan?", default=True):
+            typer.secho("nothing applied", fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(code=1)
+
+    result = setup_wizard.apply_setup(
+        plan,
+        runner=_uv_sync,
+        downloader=setup_wizard.default_downloader(plan.engines_dir),
+        yes=True,
+        doctor=doctor_exit_code,
+        mcp_config=mcp_config_payload,
+    )
+
+    typer.echo("")
+    for step in result.steps:
+        mark = typer.style(
+            f"{'PASS' if step.ok else 'FAIL':<4}",
+            fg=typer.colors.GREEN if step.ok else typer.colors.RED,
+            bold=True,
+        )
+        typer.echo(f"{step.name:<34}  {mark}  {step.detail}")
+
+    if result.mcp_config is not None:
+        typer.echo("")
+        typer.echo(
+            "MCP client snippet (`agent-voice mcp-config --client <name>` "
+            "prints the others):"
+        )
+        typer.echo(json.dumps(result.mcp_config, indent=2))
+    typer.echo("")
+    _print_choices("pairs (device, support level, weights)", plan.selected)
+
+    if not result.ok:
+        typer.secho(
+            f"setup: {result.refused or 'a step failed'}", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+    typer.secho("setup complete", fg=typer.colors.GREEN)
+
+
+@app.command()
+def setup(
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Apply without asking. Never downloads weights on its own.",
+    ),
+    non_interactive: bool = typer.Option(
+        False, "--non-interactive", help="Never prompt, even on a terminal."
+    ),
+    profile: SetupProfile = typer.Option(
+        "auto",
+        "--profile",
+        help="auto | cpu-only | nvidia-gpu | apple-silicon.",
+    ),
+    device: DevicePreference = typer.Option(
+        "auto",
+        "--device",
+        help="Global device preference: auto | cpu | cuda | mps | rocm.",
+    ),
+    engines: str = typer.Option(
+        "",
+        "--engines",
+        help="Comma-separated engine ids (default: the verified recommendation).",
+    ),
+    download: bool = typer.Option(
+        False, "--download/--no-download", help="Also download the model weights."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the plan and change nothing."
+    ),
+) -> None:
+    """Detect the hardware, install the right engines, and write `.env`.
+
+    Non-interactive by default when there is no terminal (`--yes` is then
+    required to change anything). The prompts on a real TTY are: device
+    preference, which recommended engines to install, whether to download the
+    weights, and a final confirmation.
+
+    `--dry-run` prints the detected hardware, the recommendation with support
+    levels and approximate sizes, and the exact `.env` diff — it cannot install,
+    download or write, because it never calls the apply path at all. `--yes`
+    installs engines and writes `.env` but never downloads weights: only
+    `--download` (or answering yes at the prompt) does that.
+    """
+    try:
+        _setup_run(
+            yes=yes,
+            non_interactive=non_interactive,
+            profile=profile,
+            device=device,
+            engines=engines,
+            download=download,
+            dry_run=dry_run,
+        )
+    except KeyboardInterrupt:
+        typer.secho("interrupted", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=130) from None
 
 
 @app.command("mcp-config")
@@ -1246,21 +1819,7 @@ def mcp_config(
     that client expects. `AGENT_VOICE_CLIENT_ID` becomes the `X-Agent-Id` header,
     which selects that client's per-agent binding.
     """
-    root = Path(__file__).resolve().parents[2]
-    server: dict[str, object] = {
-        "command": "uv",
-        "args": ["run", "--directory", str(root), "agent-voice", "mcp"],
-        "env": {"AGENT_VOICE_CLIENT_ID": client},
-    }
-
-    if client == "vscode":
-        # VS Code's `.vscode/mcp.json` uses a `servers` key and spells out the
-        # transport; the other four clients share Claude's `mcpServers` shape.
-        payload: dict[str, object] = {"servers": {"agent-voice": {"type": "stdio", **server}}}
-    else:
-        payload = {"mcpServers": {"agent-voice": server}}
-
-    typer.echo(json.dumps(payload, indent=2))
+    typer.echo(json.dumps(mcp_config_payload(client), indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -1279,50 +1838,120 @@ def engines_list() -> None:
 
 
 @engines_app.command("install")
-def engines_install(engine_id: str) -> None:
-    """Create the engine's isolated venv with `uv sync`."""
+def engines_install(
+    engine_id: str,
+    device: DevicePreference = typer.Option(
+        "auto",
+        "--device",
+        help="auto | cpu | cuda | mps | rocm. Picks the variant project to sync.",
+    ),
+    experimental: bool = typer.Option(
+        False,
+        "--experimental",
+        help="Allow an experimental (engine, device) pair: wired, never run here.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the resolved project and argv, then exit."
+    ),
+) -> None:
+    """Create the engine's isolated venv with `uv sync`, for one device.
+
+    A device is a dependency set, not a runtime flag: the project root is the
+    engine's canonical `pyproject.toml` when its `[tool.agent-voice] device`
+    matches, otherwise `variants/<device>/`. `--locked` means a drifted lock is a
+    refusal, never a silent rewrite of a committed file. The venv always lands at
+    the canonical `engines/<id>/.venv`, which is what `engine.yaml:venv_python`
+    already points at.
+    """
     import shutil
     import subprocess
 
-    from .engine_registry import EngineRegistry
+    from .engine_registry import EngineRegistry, clear_torch_probe_cache
+    from .hardware import describe_torch
+    from .schemas import AgentVoiceError
+    from .setup_wizard import plan_engine_install, write_variant_stamp
 
     settings = get_settings()
     registry = EngineRegistry(settings.engines_dir)
-    record = registry.get(engine_id)
+    try:
+        record = registry.get(engine_id)
+        uv = shutil.which("uv")
+        plan = plan_engine_install(
+            engine_id=engine_id,
+            directory=record.directory,
+            manifest=record.manifest,
+            device=device,
+            allow_experimental=experimental,
+            uv=uv or "uv",
+        )
+    except AgentVoiceError as exc:
+        typer.secho(f"{exc.error_code}: {exc.message}", fg=typer.colors.RED, err=True)
+        if exc.suggestion:
+            typer.echo(exc.suggestion, err=True)
+        raise typer.Exit(code=1) from exc
 
-    pyproject = record.directory / "pyproject.toml"
-    if not pyproject.is_file():
+    if not plan.installable:
+        # A dependency-free engine (mock, mock_asr) legitimately has no venv.
         typer.secho(
-            f"engine '{engine_id}' has no pyproject.toml; nothing to install",
+            f"engine '{engine_id}' has nothing to install: {plan.note}",
             fg=typer.colors.YELLOW,
         )
         return
 
-    uv = shutil.which("uv")
+    if dry_run:
+        typer.echo(f"engine   : {engine_id} ({plan.device}, {plan.level})")
+        typer.echo(f"variant  : {plan.variant} ({plan.note})")
+        typer.echo(f"project  : {plan.project_dir}")
+        typer.echo(f"venv     : {plan.venv_dir}")
+        typer.echo(f"argv     : {' '.join(plan.argv)}")
+        for name, value in plan.env_delta().items():
+            typer.echo(f"env      : {name}={value}")
+        typer.secho("dry run: uv was not run", fg=typer.colors.GREEN)
+        return
+
     if uv is None:
         typer.secho("uv is not on PATH", fg=typer.colors.RED, err=True)
+        typer.echo(
+            "install uv: https://docs.astral.sh/uv/getting-started/installation/",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
-    typer.echo(f"installing {engine_id} ...")
+    typer.echo(f"installing {engine_id} for {plan.device} from {plan.variant} ...")
     # argv list, shell=False: no string ever reaches a shell.
     result = subprocess.run(
-        [uv, "sync", "--project", str(record.directory)],
-        cwd=str(record.directory),
+        list(plan.argv),
+        env=plan.env,
+        cwd=str(plan.project_dir),
         shell=False,
+        check=False,
     )
     if result.returncode != 0:
         typer.secho("install failed", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=result.returncode)
+        raise typer.Exit(code=1)
 
+    # The venv's torch build may have changed from cpu to cu128; the registry
+    # caches one probe per interpreter, so it has to be dropped before reload.
+    clear_torch_probe_cache()
     registry.reload()
     refreshed = registry.get(engine_id)
-    if refreshed.installed:
-        typer.secho(f"{engine_id} installed", fg=typer.colors.GREEN)
-    else:
+    if not refreshed.installed:
         typer.secho(
             f"{engine_id} still uninstalled: {refreshed.why_unavailable}",
             fg=typer.colors.YELLOW,
         )
+        raise typer.Exit(code=1)
+    try:
+        stamp = write_variant_stamp(
+            record.directory, plan.device, describe_torch(refreshed.torch_info)
+        )
+    except OSError:
+        stamp = None
+    typer.secho(
+        f"{engine_id} installed for {plan.device} ({plan.level})"
+        + (f"; variant recorded in {stamp}" if stamp else ""),
+        fg=typer.colors.GREEN,
+    )
 
 
 # -- staged plugins (REQUIRE_ENGINE_APPROVAL) --------------------------------

@@ -41,6 +41,14 @@ BACKEND_VERSION = "1"
 SAMPLE_RATE = 24_000
 MODES = ("clone", "custom_voice", "voice_design")
 
+RESOLVED_DEVICE = (os.environ.get("AGENT_VOICE_RESOLVED_DEVICE") or "cpu").strip().lower()
+"""The device the daemon resolved for this engine.
+
+Read from the environment, default ``cpu``: the tone generator has no torch
+and no accelerator path (``engine.yaml`` declares cpu only), so cpu is the
+only truthful answer and the one a worker started outside the daemon gets.
+"""
+
 
 class _BadRequest(ValueError):
     """A caller mistake. Answered as BAD_REQUEST, never as an engine failure."""
@@ -150,6 +158,7 @@ class MockEngine:
         self.shutdown_event = threading.Event()
         self.in_flight = 0
         self._state_lock = threading.Lock()
+        self.device = RESOLVED_DEVICE
 
     # -- helpers --------------------------------------------------------
     @staticmethod
@@ -209,6 +218,7 @@ class MockEngine:
                 },
                 "loaded_models": self.loaded_models,
                 "gpu_vram_mb": 0,
+                "device": self.device,
                 "pid": os.getpid(),
             }
         )
@@ -218,7 +228,13 @@ class MockEngine:
         if alias not in self.loaded_models:
             self.loaded_models.append(alias)
         self.conn.send_json(
-            {"id": msg["id"], "model_alias": alias, "loaded_models": self.loaded_models}
+            {
+                "id": msg["id"],
+                "model_alias": alias,
+                "loaded_models": self.loaded_models,
+                "gpu_vram_mb": 0,
+                "device": self.device,
+            }
         )
 
     def unload_model(self, msg: dict) -> None:
@@ -226,7 +242,13 @@ class MockEngine:
         if alias in self.loaded_models:
             self.loaded_models.remove(alias)
         self.conn.send_json(
-            {"id": msg["id"], "model_alias": alias, "loaded_models": self.loaded_models}
+            {
+                "id": msg["id"],
+                "model_alias": alias,
+                "loaded_models": self.loaded_models,
+                "gpu_vram_mb": 0,
+                "device": self.device,
+            }
         )
 
     def health(self, msg: dict) -> None:
@@ -236,6 +258,7 @@ class MockEngine:
                 "ok": True,
                 "loaded_models": self.loaded_models,
                 "gpu_vram_mb": 0,
+                "device": self.device,
                 "in_flight": self.in_flight,
             }
         )
@@ -289,6 +312,8 @@ class MockEngine:
                     "model_alias": msg.get("model_alias", "mock-tone"),
                     "backend_name": BACKEND_NAME,
                     "backend_version": BACKEND_VERSION,
+                    "gpu_vram_mb": 0,
+                    "device": self.device,
                 }
             )
         finally:
@@ -333,6 +358,8 @@ class MockEngine:
                     "done": True,
                     "duration_sec": produced / 2 / SAMPLE_RATE,
                     "streaming_mode": "native",
+                    "gpu_vram_mb": 0,
+                    "device": self.device,
                 }
             )
         finally:

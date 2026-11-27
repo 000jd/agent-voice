@@ -1,0 +1,36 @@
+[project]
+name = "agent-voice-engine-qwen3-tts"
+version = "0.1.0"
+description = "Official Qwen3-TTS backend for agent-voice (ROCm variant, experimental)"
+requires-python = ">=3.11,<3.13"
+
+# Same dependency set as ../../pyproject.toml; only the torch wheel index changes.
+#
+# ROCm needs a different index shape from the CPU/CUDA variants:
+#  - the index must NOT be `explicit`, because torch's own runtime dependencies
+#    (`rocm[device-all]`, `triton-rocm`) are published on the same PyTorch index;
+#  - `environments` must be narrowed, or universal resolution backtracks to a
+#    torch 2.0.1 aarch64 wheel and writes a lock with no x86-64 wheels.
+# Proven on uv 0.9.26 in docs/phase0-devices-report.md section 4.4: torch
+# 2.15.0+rocm7.14, torchaudio 2.11.1+rocm7.14, 123 packages, zero nvidia-*.
+dependencies = [
+    "qwen-tts==0.1.1",
+    "torch",
+    "torchaudio",
+    "soundfile",
+    "numpy",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[[tool.uv.index]]
+name = "pytorch-rocm7.14"
+url = "https://download.pytorch.org/whl/rocm7.14"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-rocm7.14" }]
+torchaudio = [{ index = "pytorch-rocm7.14" }]
+
+[tool.agent-voice]
+device = "rocm"

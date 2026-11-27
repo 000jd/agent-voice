@@ -7,9 +7,9 @@ lines are supported on a best-effort basis.
 
 | Version | Supported | Notes |
 |---|---|---|
-| `0.3.x` | **Yes** | Current line; v0.3.3 contains the WebSocket guard and inbox confinement |
-| `0.2.x` | Best effort | Fixes are considered, but new releases target `0.3.x` |
-| `0.1.x` | No | v0.1 shipped unsafe defaults (mutation on, unauthenticated `/audio`, no Host/Origin guard); upgrade |
+| `0.6.x` | **Yes** | Current line; v0.6.0 adds the one-command installer, the setup wizard, hardware detection and device switching |
+| `0.5.x` | Best effort | Fixes are considered, but new releases target `0.6.x` |
+| `≤ 0.4.x` | No | `0.4.x` predates the ASR/transcription surfaces; `0.3.x` and older shipped unsafe defaults (mutation on, unauthenticated `/audio`, no Host/Origin guard). Upgrade |
 
 ## Reporting a vulnerability
 
@@ -70,6 +70,73 @@ no cloud calls except the explicit Hugging Face weight downloads you request.
 - Denial of service by someone who can already bind your loopback interface or
   exhaust your disk.
 - Impersonation enabled by **consent you failed to obtain** (see below).
+
+### Supply chain and the one-command installer
+
+v0.6.0 adds two installers, and one of them is a documented `curl | sh`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/000jd/agent-voice/main/scripts/install.sh | sh
+irm https://raw.githubusercontent.com/000jd/agent-voice/main/scripts/install.ps1 | iex   # Windows, experimental
+```
+
+**What is fetched, and from where.** The `curl`/`irm` fetches exactly one file: the
+installer script, from this repository's `main` branch on GitHub. The installer then
+fetches the project itself with `git` from `https://github.com/000jd/agent-voice`, and
+`uv` resolves the Python dependency tree from PyPI and the PyTorch wheel indexes recorded
+in the committed `uv.lock` files. Model weights are **not** fetched unless you ask for
+them (`--download`, or a yes in the setup wizard's weights prompt).
+
+**Tag pinning by default.** The installer resolves the **latest release tag** with
+`git ls-remote --tags --refs` and checks that out — it does not install `main`'s HEAD.
+`main` is used only when you pass `--ref main` explicitly, and a tag, branch or commit
+can be pinned with `--version` / `--ref`. The idea is that an installer run today
+installs something that was released, reviewed and tagged, not whatever landed an hour
+ago.
+
+**`--dry-run` is the audit path.** It prints every action and every `argv` it would run,
+and writes nothing — no clone, no `uv sync`, no `.env`, no shim. Use it before the first
+real run, and read the script itself if you want to: it is plain POSIX `sh`, `set -eu`
+(with `pipefail` only where the shell supports it), and it is short by design.
+
+**No sudo, no telemetry.** The installer never escalates privileges and does not use
+`sudo` at all; if a step would need root it stops and tells you. It installs `uv` from
+the official installer only when `uv` is missing, and only with your consent (`--yes`
+answers that prompt for you). Nothing is reported anywhere: no analytics, no crash
+upload, no version check. The installer's subprocesses are argv lists, not shell strings —
+the single documented `curl | sh` is the delivery mechanism, and the script's internals
+still obey the project's house rule.
+
+**The trust decision is yours.** `curl | sh` executes code straight from the network with
+your privileges, and no amount of option-checking changes that. If that trade is not
+acceptable — and for a production or shared machine it may not be — you have the same
+alternatives as any `curl | sh` project:
+
+- read `scripts/install.sh` first, then run it from a clone:
+  `git clone https://github.com/000jd/agent-voice && cd agent-voice && scripts/install.sh --dir …`;
+- or skip the installer entirely and use the from-source path, which is fully supported
+  and is what CI uses:
+
+  ```bash
+  git clone https://github.com/000jd/agent-voice.git agent-voice
+  cd agent-voice && uv sync --extra dev && cp .env.example .env
+  uv run agent-voice doctor && uv run agent-voice setup
+  ```
+
+- or point `--repo` at a local clone you have already reviewed; a local path is cloned
+  directly and needs no network for the source. It is what the installer's own smoke test
+  uses.
+
+**The data directory is outside the install directory**, and `--uninstall` never removes
+it. The only files the installer writes are the install directory, the shim
+(`~/.local/bin/agent-voice` on POSIX, `<install>\bin\agent-voice.cmd` on Windows), and
+`<install>/.env` — with the previous `.env` backed up to `.env.bak` or
+`.env.<UTC>.bak` first. The `.env` is written atomically with mode `0600` and never
+echoes `AGENT_VOICE_API_KEY`.
+
+**Windows is not verified.** `scripts/install.ps1` mirrors the POSIX flags and is
+parse-checked when `pwsh` is available; nobody has run it on real Windows. Treat a Windows
+install as experimental and review the script before running it.
 
 ## Security defaults, explicitly
 

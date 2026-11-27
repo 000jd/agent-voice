@@ -40,6 +40,8 @@ def _key(**overrides) -> str:
         "x_vector_only_mode": False,
         "engine_id": "mock",
         "model_alias": "mock-tone",
+        # v0.6: the same request on cpu vs cuda is not bit-identical audio.
+        "device": "cpu",
         "backend_name": "mock",
         "backend_version": "1",
         "language": "Auto",
@@ -273,6 +275,7 @@ def test_all_fields_are_covered():
         "x_vector_only_mode",
         "engine_id",
         "model_alias",
+        "device",
         "backend_name",
         "backend_version",
         "language",

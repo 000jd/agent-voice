@@ -50,8 +50,14 @@ def _spawn_daemon(settings: Settings) -> subprocess.Popen[bytes]:
     else:
         start_new_session = True
 
+    env = dict(os.environ)
+    # The daemon must not inherit the MCP client's cwd: .env, data and engines
+    # are anchored at the home, and an explicit env var makes that unambiguous.
+    env["AGENT_VOICE_HOME"] = str(settings.home)
     return subprocess.Popen(
         [sys.executable, "-m", "agent_voice.cli", "serve"],
+        env=env,
+        cwd=str(settings.home),
         stdout=logger,
         stderr=logger,
         stdin=subprocess.DEVNULL,

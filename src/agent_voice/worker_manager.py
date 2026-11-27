@@ -10,6 +10,12 @@ Design constraints that shaped this file:
   engines from ping-ponging on every interleaved request.
 * **Honest failure.** A dead worker is ``WORKER_CRASHED`` unless the exit code or
   stderr actually contains an OOM signature.
+* **The resolved device is the contract.** ``hardware.resolve_device`` picks
+  ``cpu|cuda|mps|rocm`` per engine, the manager injects it as
+  ``AGENT_VOICE_RESOLVED_DEVICE``, and the worker must report the same one in its
+  ``hello``. Scheduling uses that resolved class, never the manifest's coarse
+  ``device: gpu|cpu``, and the installed torch build is checked before a spawn
+  rather than discovered by a crash.
 * **Never buffer unbounded audio.** Each PCM stream has a bounded queue; a
   stalled consumer gets the worker cancelled rather than an ever-growing list.
 """
@@ -38,6 +44,13 @@ from .cache import CacheEntry, SynthesisCache, build_cache_key
 from .clock import Clock, get_clock
 from .config import Settings
 from .engine_registry import EngineRecord, EngineRegistry, model_revision
+from .hardware import (
+    HardwareProfile,
+    describe_torch,
+    detect_hardware,
+    resolve_device,
+    torch_build_supports,
+)
 from .ipc.transport import (
     IS_WINDOWS,
     AsyncConnection,
@@ -45,16 +58,56 @@ from .ipc.transport import (
     accept_async,
     make_transport,
 )
-from .schemas import AgentVoiceError, ErrorCode, ModelMode, SynthesisResult
+from .schemas import AgentVoiceError, ComputeDevice, ErrorCode, ModelMode, SynthesisResult
 from .voice_store import VoiceStore
 
 logger = logging.getLogger(__name__)
 
 _OOM_PATTERN = re.compile(
+    # Every backend spells it differently, and the scheduler classifies a death
+    # from stderr, so all of them have to be recognised. `out of memory` is the
+    # common tail of the CUDA/MPS/hip messages; the explicit alternatives cover
+    # the shapes that do not contain it (CUBLAS, torch's exception class name,
+    # and torch's CPU allocator, whose message is "can't allocate memory").
     r"CUDA out of memory|OutOfMemoryError|torch\.cuda\.OutOfMemoryError|"
-    r"CUBLAS_STATUS_ALLOC_FAILED|out of memory",
+    r"CUBLAS_STATUS_ALLOC_FAILED|MPS backend out of memory|hipErrorOutOfMemory|"
+    r"DefaultCPUAllocator|out of memory",
     re.IGNORECASE,
 )
+
+ACCELERATOR_DEVICES: frozenset[str] = frozenset({"cuda", "mps", "rocm"})
+"""Runtime devices that compete for the single accelerator-owner slot.
+
+Deliberately a *runtime device* set, not the manifest's coarse
+``device: gpu|cpu``: one engine can be CPU today and CUDA tomorrow, and only the
+resolved device says which. ``mps`` counts as accelerator-class even though it
+shares unified memory with the CPU: a Metal worker still loads the model onto
+the GPU, so it must not run alongside another accelerator worker.
+"""
+
+
+def is_accelerator(device: str | None) -> bool:
+    """Whether a resolved runtime device is accelerator-class."""
+    return device in ACCELERATOR_DEVICES
+
+
+def _reported_vram(reply: dict[str, Any]) -> int | None:
+    """A worker's own allocation in MB, or ``None`` when it did not report one.
+
+    ``None`` and ``0`` are different answers and are kept apart: "this worker
+    holds no device memory" (CPU, mock) versus "this worker cannot say" (an
+    engine with no allocator API). Collapsing them would invent a measurement.
+    """
+    if "gpu_vram_mb" not in reply:
+        return None
+    value = reply.get("gpu_vram_mb")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 
 _STREAM_ERROR_HISTORY = 64
 """How many crashed-stream verdicts to keep after their worker is gone.
@@ -90,6 +143,19 @@ class WorkerHandle:
     hello: dict[str, Any]
     started_at: float
     last_used_at: float
+    resolved_device: str = "cpu"
+    """The device the manager resolved and injected for this spawn.
+
+    Kept on the handle because scheduling, the OOM verdict and ``gpu_status()``
+    must all agree with the process that is actually running; re-resolving later
+    could disagree with it after a settings change.
+    """
+    gpu_vram_mb: int | None = None
+    """The worker's own last reported allocation in MB.
+
+    ``None`` means "the worker cannot say" and ``0`` means "it holds nothing" —
+    a distinction the status endpoint preserves rather than flattening into 0.
+    """
     loaded_models: list[str] = field(default_factory=list)
     model_last_used: dict[str, float] = field(default_factory=dict)
     """alias -> clock time of the last start/finish of a job using it. Drives LRU
@@ -168,6 +234,7 @@ class WorkerManager:
         voices: VoiceStore,
         clock: Clock | None = None,
         vram: VRAMProbe | None = None,
+        hardware: HardwareProfile | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -175,6 +242,10 @@ class WorkerManager:
         self.voices = voices
         self.clock = clock or get_clock()
         self.vram = vram or VRAMProbe()
+        # Probed once, not per spawn: the answer cannot change inside a daemon's
+        # life, and every probe is a subprocess (nvidia-smi/rocm-smi). Injectable
+        # so a test can own an Apple or ROCm host it does not have.
+        self.hardware = hardware if hardware is not None else detect_hardware()
 
         self._workers: dict[str, WorkerHandle] = {}
         self._queues: dict[str, list[QueuedJob]] = {}
@@ -265,6 +336,14 @@ class WorkerManager:
     def loaded_models(self) -> dict[str, list[str]]:
         return {engine_id: list(h.loaded_models) for engine_id, h in self._workers.items()}
 
+    def worker_devices(self) -> dict[str, str]:
+        """engine_id -> the device that worker actually reported."""
+        return {
+            engine_id: handle.resolved_device
+            for engine_id, handle in self._workers.items()
+            if handle.resolved_device is not None
+        }
+
     def last_used_at(self) -> float | None:
         if not self._workers:
             return None
@@ -277,8 +356,49 @@ class WorkerManager:
         remaining = self.settings.model_idle_ttl_seconds - (self.clock.now() - last)
         return max(0.0, remaining)
 
+    # -- device resolution ----------------------------------------------
+    def resolved_device(
+        self, engine_id: str, record: EngineRecord | None = None
+    ) -> ComputeDevice:
+        """The device ``engine_id`` would be spawned on right now.
+
+        Public because the answer is needed outside the spawn path: the synthesis
+        cache key must include it, and the CLI/status surface reports it per
+        engine. Raises ``BAD_REQUEST`` when the manifest, the settings and the
+        host cannot be reconciled — before any process is started.
+        """
+        target = record if record is not None else self.registry.get(engine_id)
+        return resolve_device(engine_id, target.manifest, self.settings, self.hardware)
+
+    def _require_servable_torch(self, record: EngineRecord, device: ComputeDevice) -> None:
+        """Refuse a device the *installed* torch build cannot serve.
+
+        A CPU wheel in a CUDA-resolved engine is a stale variant, not a bug in
+        the request: it is detected here, before the process starts, so the caller
+        gets 409 + the exact reinstall command instead of a crash deep inside a
+        model load (or worse, a silent fall-through to CPU).
+        """
+        if device == "cpu":
+            # Every build serves the CPU, including a CUDA wheel.
+            return
+        if torch_build_supports(record.torch_info, device):
+            return
+        installed = describe_torch(record.torch_info)
+        supported = ", ".join(record.manifest.supported_devices) or "(none)"
+        raise AgentVoiceError(
+            ErrorCode.ENGINE_NOT_INSTALLED,
+            f"engine '{record.engine_id}' cannot serve device '{device}': its "
+            f"installed torch build ({installed}) does not support it",
+            f"Run `agent-voice engines install {record.engine_id} "
+            f"--device {device}` to install that build (a device switch reinstalls "
+            "this engine's venv), or set AGENT_VOICE_DEVICES="
+            f"{record.engine_id}=<device> to one of: {supported}.",
+        )
+
     # -- spawning -------------------------------------------------------
-    def _worker_env(self, record: EngineRecord) -> dict[str, str]:
+    def _worker_env(
+        self, record: EngineRecord, resolved_device: ComputeDevice
+    ) -> dict[str, str]:
         env = dict(os.environ)
         # Workers cannot read engine.yaml themselves (they may not have PyYAML),
         # so pass the alias -> HF repo map they need to resolve a load request.
@@ -290,6 +410,10 @@ class WorkerManager:
                     {spec.alias: spec.hf_repo for spec in record.manifest.models}
                 ),
                 "PYTHONUNBUFFERED": "1",
+                # Overwritten, never setdefault: a value inherited from the
+                # daemon's own environment (or a stale unit file) must not make
+                # the worker run somewhere the scheduler did not charge it to.
+                "AGENT_VOICE_RESOLVED_DEVICE": resolved_device,
             }
         )
         return env
@@ -304,7 +428,9 @@ class WorkerManager:
         except (OSError, ValueError):
             return ""
 
-    async def _spawn_worker(self, record: EngineRecord) -> WorkerHandle:
+    async def _spawn_worker(
+        self, record: EngineRecord, resolved_device: ComputeDevice
+    ) -> WorkerHandle:
         self._spawn_count += 1
         runtime_dir = self.settings.data_dir / "runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -328,7 +454,7 @@ class WorkerManager:
         listener = SyncListener(transport)
         listener.bind()
 
-        env = self._worker_env(record)
+        env = self._worker_env(record, resolved_device)
         env.update(transport.to_env())
 
         creationflags = 0
@@ -412,6 +538,25 @@ class WorkerManager:
                 "Align worker.py with ipc/protocol.py.",
             )
 
+        # The worker is the only thing that can say what it actually loaded, so
+        # its own report is checked against what was injected. A worker that
+        # ignores AGENT_VOICE_RESOLVED_DEVICE would otherwise be scheduled as one
+        # device and measured as another (or silently fall back to CPU).
+        reported_device = hello.get("device")
+        if reported_device is not None and reported_device != resolved_device:
+            await connection.close()
+            process.kill()
+            listener.close()
+            raise AgentVoiceError(
+                ErrorCode.INTERNAL_ERROR,
+                f"worker for '{record.engine_id}' reports device "
+                f"'{reported_device}' but '{resolved_device}' was injected as "
+                "AGENT_VOICE_RESOLVED_DEVICE",
+                "The engine's worker.py does not honour AGENT_VOICE_RESOLVED_DEVICE. "
+                "Fix it, or pin the device this worker really uses with "
+                f"AGENT_VOICE_DEVICES={record.engine_id}={reported_device}.",
+            )
+
         now = self.clock.now()
         handle = WorkerHandle(
             engine_id=record.engine_id,
@@ -422,26 +567,44 @@ class WorkerManager:
             hello=hello,
             started_at=now,
             last_used_at=now,
+            resolved_device=resolved_device,
+            gpu_vram_mb=_reported_vram(hello),
             loaded_models=list(hello.get("loaded_models") or []),
         )
         self._workers[record.engine_id] = handle
         return handle
 
-    async def ensure_worker(self, engine_id: str) -> WorkerHandle:
+    async def ensure_worker(
+        self, engine_id: str, *, device: ComputeDevice | None = None
+    ) -> WorkerHandle:
+        """Return a live worker for ``engine_id``, spawning it if needed.
+
+        ``device`` lets a caller that already resolved the device (``_begin_job``,
+        which had to decide the scheduling class first) hand it in so the answer
+        cannot change between the two decisions.
+        """
         record = self.registry.require_installed(
             engine_id, allow_agent_mutation=self.settings.allow_agent_engine_mutation
         )
+        resolved = device if device is not None else self.resolved_device(engine_id, record)
         handle = self._workers.get(engine_id)
-        if handle is not None and handle.alive:
-            return handle
         if handle is not None:
-            await self._kill_worker(engine_id, reason="dead")
-        handle = await self._spawn_worker(record)
-        # Only a GPU engine can own the GPU slot. Claiming it here for a CPU
-        # engine (Kokoro, Phonon, mock_asr) would make `active_engine` name a
-        # worker that holds no VRAM — and the next GPU request would then evict
-        # that perfectly healthy CPU worker as an "engine switch".
-        if record.manifest.device == "gpu" and self._active_engine is None:
+            # A resident worker on another device cannot serve this request: the
+            # device is a spawn-time property (dtype, device_map), so recycle it
+            # rather than letting it answer from the wrong backend.
+            if handle.alive and handle.resolved_device == resolved:
+                return handle
+            await self._kill_worker(
+                engine_id, reason="device change" if handle.alive else "dead"
+            )
+        self._require_servable_torch(record, resolved)
+        handle = await self._spawn_worker(record, resolved)
+        # Only an accelerator worker can own the accelerator slot. Claiming it
+        # here for a CPU worker (Kokoro, Phonon, mock_asr) would make
+        # `active_engine` name a worker that holds no VRAM — and the next GPU
+        # request would then evict that perfectly healthy CPU worker as an
+        # "engine switch".
+        if is_accelerator(resolved) and self._active_engine is None:
             self._active_engine = engine_id
             self._active_since = self.clock.now()
         return handle
@@ -671,14 +834,18 @@ class WorkerManager:
 
         self._dequeue(job)
         try:
-            # Only a GPU engine competes for the single GPU-owner slot. A CPU
-            # engine (Kokoro, Phonon, the mock ASR) must never take, block on or
-            # evict that slot: doing so would make a transcription signal "the
-            # GPU is busy" and could unload a resident GPU render for no reason.
+            # Only an accelerator-class engine competes for the single owner
+            # slot. A CPU-resolved engine (Kokoro, Phonon, the mock ASR) must
+            # never take, block on or evict that slot: doing so would make a
+            # transcription signal "the GPU is busy" and could unload a resident
+            # GPU render for no reason. The class comes from the *resolved*
+            # device, never from the manifest's coarse device: gpu|cpu, because
+            # the same engine can be cpu today and cuda tomorrow.
             record = self.registry.get(engine_id)
-            if record.manifest.device == "gpu":
+            resolved = self.resolved_device(engine_id, record)
+            if is_accelerator(resolved):
                 await self._acquire_gpu(engine_id)
-            handle = await self.ensure_worker(engine_id)
+            handle = await self.ensure_worker(engine_id, device=resolved)
             await self._ensure_model_loaded(handle, model_alias)
         except BaseException:
             self._retire_job(job)
@@ -752,6 +919,7 @@ class WorkerManager:
                 {"id": uuid.uuid4().hex, "method": "unload_model", "model_alias": lru},
                 timeout=120.0,
             )
+            self._record_worker_numbers(handle, reply)
             reported = reply.get("loaded_models")
             handle.loaded_models = (
                 list(reported)
@@ -769,8 +937,20 @@ class WorkerManager:
             {"id": uuid.uuid4().hex, "method": "load_model", "model_alias": model_alias},
             timeout=600.0,
         )
+        self._record_worker_numbers(handle, reply)
         handle.loaded_models = list(reply.get("loaded_models") or [model_alias])
         handle.model_last_used[model_alias] = self.clock.now()
+
+    @staticmethod
+    def _record_worker_numbers(handle: WorkerHandle, reply: dict[str, Any]) -> None:
+        """Pick up a worker's own device-memory figure from a reply that carries it.
+
+        ``hello`` is only the first report: a worker that has just loaded a model
+        reports its real allocation there, and that is the number ``gpu_status()``
+        should show — not the 0 MB that was true before anything was loaded.
+        """
+        if "gpu_vram_mb" in reply:
+            handle.gpu_vram_mb = _reported_vram(reply)
 
     # -- public synthesis ----------------------------------------------
     @staticmethod
@@ -961,6 +1141,7 @@ class WorkerManager:
                         reply.get("message", "synthesis failed"),
                         reply.get("suggestion", ""),
                     )
+                self._record_worker_numbers(handle, reply)
                 segment_paths.append(Path(reply["wav_path"]))
                 replies.append(reply)
 
@@ -1194,6 +1375,7 @@ class WorkerManager:
                     reply.get("message", "transcription failed"),
                     reply.get("suggestion", ""),
                 )
+            self._record_worker_numbers(handle, reply)
 
         return reply
 
@@ -1485,7 +1667,11 @@ class WorkerManager:
                         None, process.wait, 3.0
                     )
         handle.listener.close()
-        if reason == "engine switch" and self._active_engine == engine_id:
+        # The accelerator slot has no owner once its process is gone, whatever the
+        # reason: a stale name would make the next accelerator request think the
+        # slot is taken and ask to "switch" away from a worker that no longer
+        # exists.
+        if self._active_engine == engine_id:
             self._active_engine = None
 
     def _record_stream_error(
@@ -1529,17 +1715,49 @@ class WorkerManager:
                 "Resubmit once the daemon is running again.",
             )
         if _OOM_PATTERN.search(stderr) or _OOM_PATTERN.search(str(exc)):
-            return AgentVoiceError(
-                ErrorCode.CUDA_OOM,
-                "the worker ran out of GPU memory",
-                "Unload other GPU applications, use the 0.6b model, or raise MIN_FREE_VRAM_GB.",
-                details={"stderr_tail": stderr},
-            )
+            return self._oom_error(handle, stderr)
         return AgentVoiceError(
             ErrorCode.WORKER_CRASHED,
             f"worker for '{handle.engine_id}' died: {exc}",
             "Retry; the worker is respawned lazily on the next request.",
             details={"stderr_tail": stderr},
+        )
+
+    @staticmethod
+    def _oom_error(handle: WorkerHandle, stderr: str) -> AgentVoiceError:
+        """An out-of-memory verdict that names the memory that actually ran out.
+
+        ``CUDA_OOM`` is only honest for a CUDA/ROCm worker. A Metal worker that
+        exhausts unified memory and a CPU worker that exhausts system RAM are
+        real failures, but reporting them as "CUDA OOM" sends a caller to the
+        wrong knob (``nvidia-smi`` on a Mac), so they keep an existing code and
+        a device-qualified message instead.
+        """
+        device = handle.resolved_device
+        details = {"stderr_tail": stderr, "device": device}
+        if device in {"cuda", "rocm"}:
+            return AgentVoiceError(
+                ErrorCode.CUDA_OOM,
+                f"the worker ran out of {device.upper()} memory",
+                "Unload other GPU applications, use the smaller model alias, or "
+                "raise MIN_FREE_VRAM_GB.",
+                details=details,
+            )
+        if device == "cpu":
+            return AgentVoiceError(
+                ErrorCode.WORKER_CRASHED,
+                "the worker ran out of system memory (device: cpu)",
+                "Free RAM or use the smaller model alias; MAX_RESIDENT_MODELS=1 "
+                "keeps a single model resident.",
+                details=details,
+            )
+        return AgentVoiceError(
+            ErrorCode.WORKER_CRASHED,
+            "the worker ran out of unified memory (device: mps)",
+            "Quit other apps holding unified memory, use the smaller model "
+            "alias, or run this engine on cpu with "
+            f"AGENT_VOICE_DEVICES={handle.engine_id}=cpu.",
+            details=details,
         )
 
     async def _handle_worker_death(
@@ -1596,10 +1814,18 @@ class WorkerManager:
             free = self.vram.free_gb()
             if free is not None and free < self.settings.min_free_vram_gb:
                 for engine_id, handle in list(self._workers.items()):
-                    # Only GPU workers hold VRAM, so only they can give any back.
-                    # Killing a CPU worker because a game wants memory would throw
-                    # away a warm transcription model and free not one byte.
-                    if handle.record.manifest.device != "gpu":
+                    # Only accelerator workers hold device memory, so only they
+                    # can give any back. Killing a CPU worker because a game
+                    # wants memory would throw away a warm transcription model
+                    # and free not one byte.
+                    if not is_accelerator(handle.resolved_device):
+                        continue
+                    if handle.resolved_device == "mps":
+                        # NVML cannot see Metal memory, so this branch is only
+                        # reachable through a stale NVML reading on a Mac-like
+                        # host. There is no measurement to act on and unified
+                        # memory is shared with the CPU, so the idle TTL is the
+                        # only reclamation path that is not a guess.
                         continue
                     await self._kill_worker(engine_id, reason="vram pressure")
                     if self._active_engine == engine_id:
@@ -1675,6 +1901,10 @@ class WorkerManager:
             model_alias=model_alias,
             backend_name=record.manifest.backend_name,
             backend_version=record.manifest.backend_version,
+            # Resolved, not declared: the same request on cpu and on cuda is a
+            # different render (different kernels, sometimes a different dtype),
+            # so a device switch must miss rather than serve the old file.
+            device=self.resolved_device(engine_id, record),
             language=language,
             seed=seed,
             speed=speed,
@@ -1700,27 +1930,57 @@ class WorkerManager:
             return 0.0
 
     async def gpu_status(self) -> dict[str, Any]:
+        """What every worker is running on, and what memory it actually holds.
+
+        Two measurements are reported side by side instead of one blended number:
+        ``gpu_vram_mb`` (NVML, whole-device, when a driver answers) and
+        ``worker_vram_mb`` (each worker's own allocator, which is the only number
+        left on MPS and ROCm). ``vram_source`` says which one
+        ``vram_used_mb`` came from, so a caller never has to guess.
+        """
         loaded = self.loaded_models()
+        worker_devices = {
+            engine_id: handle.resolved_device for engine_id, handle in self._workers.items()
+        }
+        worker_vram_mb = {
+            engine_id: handle.gpu_vram_mb for engine_id, handle in self._workers.items()
+        }
+        nvml_used = self.vram.used_mb()
+        nvml_free = self.vram.free_gb()
+        reported = [value for value in worker_vram_mb.values() if value is not None]
+        if nvml_used is not None or nvml_free is not None:
+            vram_source = "nvml"
+        elif reported:
+            vram_source = "worker"
+        else:
+            vram_source = "none"
+        used_mb = nvml_used
+        if used_mb is None and reported:
+            # No driver to ask: the sum of what the workers themselves allocated
+            # is the honest device total we can compute. It is a lower bound if
+            # an unrelated process shares the device, so `vram_source` labels it.
+            used_mb = sum(reported)
         return {
-            # `active_engine` keeps its original meaning: the GPU owner. CPU
-            # workers are reported separately in `cpu_engines` so a caller can see
-            # a resident Phonon/Kokoro worker without mistaking it for one that
-            # holds VRAM.
+            # `active_engine` keeps its original meaning: the accelerator owner.
+            # CPU workers are reported separately in `cpu_engines` so a caller can
+            # see a resident Phonon/Kokoro worker without mistaking it for one
+            # that holds device memory.
             "active_engine": self._active_engine,
             "cpu_engines": [
                 engine_id
                 for engine_id, handle in self._workers.items()
-                if handle.alive and handle.record.manifest.device == "cpu"
+                if handle.alive and not is_accelerator(handle.resolved_device)
             ],
+            "worker_devices": worker_devices,
+            "worker_vram_mb": worker_vram_mb,
+            "vram_source": vram_source,
             "loaded_models": [f"{k}:{m}" for k, v in loaded.items() for m in v],
             "workers": {
                 engine_id: ("alive" if handle.alive else "dead")
                 for engine_id, handle in self._workers.items()
             },
-            "vram_used_mb": self.vram.used_mb(),
-            "vram_free_mb": (
-                int(self.vram.free_gb() * 1024) if self.vram.free_gb() is not None else None
-            ),
+            "vram_used_mb": used_mb,
+            "vram_free_mb": (int(nvml_free * 1024) if nvml_free is not None else None),
             "queue_depth": self.queue_depth(),
             "in_flight": self.in_flight_count(),
             "unload_in_seconds": self.unload_in_seconds(),

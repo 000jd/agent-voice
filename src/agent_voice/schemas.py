@@ -96,8 +96,16 @@ EngineDevice = Literal["gpu", "cpu"]
 
 ``gpu`` engines compete for the single GPU owner slot (``MAX_ACTIVE_ENGINES``);
 ``cpu`` engines do not, so a CPU transcription can run while a GPU render is
-resident instead of evicting it.
+resident instead of evicting it. This is the *default* scheduling class; the
+resolved runtime device (``ComputeDevice``) is what actually decides.
 """
+
+ComputeDevice = Literal["cpu", "cuda", "mps", "rocm"]
+"""The concrete backend a worker runs on. ``mps`` also covers Fermion's MLX
+path on Apple silicon; the operator-facing spelling stays ``mps``."""
+
+DevicePreference = Literal["auto", "cpu", "cuda", "mps", "rocm"]
+"""Operator preference: ``auto`` resolves per engine from the manifest and host."""
 
 MAX_HOTWORDS = 25
 """Ceiling on ``hotwords`` — the decoder's own vocabulary-bias bound.
@@ -254,7 +262,16 @@ class EngineManifest(BaseModel):
     kind: EngineKind = "tts"
     """``tts`` speaks, ``asr`` transcribes. Default keeps v0.4 manifests valid."""
     device: EngineDevice = "gpu"
-    """``cpu`` engines are exempt from the single-GPU-owner slot."""
+    """Default scheduling class; ``cpu`` is exempt from the GPU owner slot."""
+    default_device: ComputeDevice | None = None
+    """The engine's preferred runtime device for ``auto``. ``None`` lets the
+    resolver pick from the host (cuda -> mps -> rocm -> cpu)."""
+    supported_devices: list[ComputeDevice] = Field(default_factory=lambda: ["cpu"])
+    """Devices this engine's code and dependency variants can actually attempt.
+
+    Conservative by default: an old manifest that never mentions the key is
+    treated as CPU-only rather than promised a GPU path it lacks.
+    """
     capabilities: EngineCapabilities = Field(default_factory=EngineCapabilities)
     models: list[ModelSpec] = Field(default_factory=list)
 
@@ -298,6 +315,11 @@ class EngineEntry(BaseModel):
     instruct_control: bool = False
     kind: EngineKind = "tts"
     device: EngineDevice = "gpu"
+    default_device: ComputeDevice | None = None
+    supported_devices: list[ComputeDevice] = Field(default_factory=list)
+    resolved_device: str | None = None
+    """What a running worker actually reports (``cuda``, ``cpu``, ...); None
+    until this engine has been spawned in this process."""
     word_timestamps: bool = False
     hotwords: bool = False
     multilingual: bool = False
@@ -843,6 +865,14 @@ class GpuStatus(BaseModel):
     loaded_models: list[str] = Field(default_factory=list)
     workers: dict[str, str] = Field(default_factory=dict)
     """engine_id -> alive|starting|dead"""
+    cpu_engines: list[str] = Field(default_factory=list)
+    """CPU workers that are alive but deliberately do not hold the GPU slot."""
+    worker_devices: dict[str, str] = Field(default_factory=dict)
+    """engine_id -> the device the worker itself reported."""
+    worker_vram_mb: dict[str, int | None] = Field(default_factory=dict)
+    """engine_id -> the worker's own allocation, None when it cannot say."""
+    vram_source: Literal["nvml", "worker", "none"] = "none"
+    """Where `vram_used_mb`/`vram_free_mb` came from; ``worker`` means no NVML."""
     vram_used_mb: int | None = None
     vram_free_mb: int | None = None
     queue_depth: int = 0

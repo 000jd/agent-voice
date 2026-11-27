@@ -31,7 +31,10 @@ router = APIRouter(tags=["engines"])
 @router.get("/v1/engines")
 async def list_engines(request: Request) -> dict:
     ctx = request.app.state.ctx
-    entries = ctx.registry.list_entries(loaded=ctx.workers.loaded_models())
+    entries = ctx.registry.list_entries(
+        loaded=ctx.workers.loaded_models(),
+        devices=ctx.workers.worker_devices(),
+    )
     return {"engines": [EngineEntry(**e.model_dump()).model_dump(mode="json") for e in entries]}
 
 
@@ -73,7 +76,7 @@ async def register_engine(payload: RegisterEngineRequest, request: Request):
 
 
 @router.post("/v1/engines/{engine_id}/install")
-async def install_engine(engine_id: str, request: Request):
+async def install_engine(engine_id: str, request: Request, device: str = "auto"):
     ctx = request.app.state.ctx
     require_agent_mutation(ctx, request)
     record = ctx.registry.get(engine_id)
@@ -86,7 +89,8 @@ async def install_engine(engine_id: str, request: Request):
     )
     job = ctx.jobs.create("install_engine")
     ctx.jobs.register_task(
-        job.job_id, asyncio.create_task(_run_install(ctx, engine_id, job.job_id))
+        job.job_id,
+        asyncio.create_task(_run_install(ctx, engine_id, job.job_id, device=device)),
     )
     return JobStartedResponse(job_id=job.job_id, kind="install_engine").model_dump(mode="json")
 
@@ -170,18 +174,44 @@ async def unload_models(request: Request, force: bool = False):
 # ---------------------------------------------------------------------------
 
 
-async def _run_install(ctx, engine_id: str, job_id: str) -> None:
-    ctx.jobs.mark_running(job_id, f"installing {engine_id}")
+async def _run_install(ctx, engine_id: str, job_id: str, *, device: str = "auto") -> None:
+    """Install one engine for one device, as a job.
+
+    The exact argv/env/project resolution lives in
+    :func:`setup_wizard.plan_engine_install`, the same function the CLI's
+    ``engines install`` uses — a device is a dependency set, so the two surfaces
+    must not drift.
+    """
+    suffix = "" if device == "auto" else f" for {device}"
+    ctx.jobs.mark_running(job_id, f"installing {engine_id}{suffix}")
     try:
+        from ..engine_registry import clear_torch_probe_cache
+        from ..hardware import describe_torch
+        from ..setup_wizard import plan_engine_install, write_variant_stamp
+
         record = ctx.registry.get(engine_id)
-        if not (record.directory / "pyproject.toml").is_file():
+        uv = shutil.which("uv")
+        # `--experimental` is deliberately not reachable from the API: an
+        # unproven device is an operator decision, made at a terminal.
+        plan = plan_engine_install(
+            engine_id=engine_id,
+            directory=record.directory,
+            manifest=record.manifest,
+            device=device,
+            allow_experimental=False,
+            uv=uv or "uv",
+        )
+
+        if not plan.installable:
+            # Dependency-free engines (like mock) need no install step.
             raise AgentVoiceError(
                 ErrorCode.MANIFEST_INVALID,
-                f"engine '{engine_id}' has no pyproject.toml",
-                "Dependency-free engines (like mock) need no install step.",
+                plan.problem or f"engine '{engine_id}' has no pyproject.toml",
+                "Dependency-free engines (like mock) need no install step."
+                if not plan.problem
+                else "Pick a device the engine publishes a variant project for.",
             )
 
-        uv = shutil.which("uv")
         if uv is None:
             raise AgentVoiceError(
                 ErrorCode.INTERNAL_ERROR,
@@ -193,22 +223,26 @@ async def _run_install(ctx, engine_id: str, job_id: str) -> None:
         result = await loop.run_in_executor(
             None,
             lambda: subprocess.run(
-                [uv, "sync", "--project", str(record.directory)],
+                list(plan.argv),
+                env=plan.env,
                 capture_output=True,
                 timeout=3600,
                 shell=False,
-                cwd=str(record.directory),
+                cwd=str(plan.project_dir),
             ),
         )
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", "replace")[-1500:]
             raise AgentVoiceError(
                 ErrorCode.ENGINE_NOT_INSTALLED,
-                f"uv sync failed for '{engine_id}'",
+                f"uv sync failed for '{engine_id}' ({plan.variant})",
                 "Inspect the engine pyproject.toml; the full error is in the job result.",
-                details={"stderr_tail": stderr},
+                details={"stderr_tail": stderr, "argv": list(plan.argv), "device": plan.device},
             )
 
+        # Switching a device swaps the venv's torch build, and the registry caches
+        # one probe per interpreter; drop it before reload or the old build wins.
+        clear_torch_probe_cache()
         ctx.registry.reload()
         refreshed = ctx.registry.get(engine_id)
         if not refreshed.installed:
@@ -217,8 +251,23 @@ async def _run_install(ctx, engine_id: str, job_id: str) -> None:
                 f"'{engine_id}' still reports uninstalled after sync",
                 refreshed.why_unavailable or "Check the venv path in engine.yaml.",
             )
+        try:
+            write_variant_stamp(
+                refreshed.directory, plan.device, describe_torch(refreshed.torch_info)
+            )
+        except OSError:
+            pass  # metadata only: a read-only engines dir must not fail the job
 
-        ctx.jobs.succeeded(job_id, {"engine_id": engine_id, "installed": True})
+        ctx.jobs.succeeded(
+            job_id,
+            {
+                "engine_id": engine_id,
+                "installed": True,
+                "device": plan.device,
+                "level": plan.level,
+                "variant": plan.variant,
+            },
+        )
     except AgentVoiceError as exc:
         ctx.jobs.failed(job_id, exc.to_response())
     except Exception as exc:
