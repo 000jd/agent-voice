@@ -11,7 +11,7 @@ given for every release so a tag can be verified against the history.
 
 No unreleased changes.
 
-## [0.6.0] — 2026-11-27 — `<commit>`
+## [0.6.0] — 2026-11-27 — `fd3ec50`
 
 "Install in one command, let setup detect the hardware, and switch an engine between
 CPU, CUDA, MPS and ROCm — with a support matrix that says which pairs were actually
