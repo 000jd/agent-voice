@@ -1,0 +1,108 @@
+name: Frontend CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: SvelteKit static SPA
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.22.3"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.5"
+
+      - name: Assert the runtime
+        run: |
+          node -e "if (!process.versions.node.startsWith('24.')) { console.error('Node 24 required, got ' + process.versions.node); process.exit(1) }"
+          bun -v
+
+      - name: Install (frozen)
+        run: bun ci
+
+      - name: Typecheck
+        run: bun run check
+
+      - name: Svelte 5 blocklist
+        run: bun run check:svelte5
+
+      - name: Lint and format
+        run: bun run lint
+
+      - name: Unit and component tests
+        run: bun run test
+
+      - name: Production build
+        run: bun run build
+
+      - name: Install Chromium
+        run: bunx playwright install --with-deps chromium
+
+      - name: Browser smoke
+        run: bunx playwright test
+
+      - name: Dependency audit
+        run: bun audit --audit-level=high
+
+  api-contract:
+    name: OpenAPI drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.22.3"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.5"
+
+      - name: Sync Python
+        working-directory: .
+        run: uv sync --extra dev --python 3.12
+
+      - name: Install frontend (frozen)
+        run: bun ci
+
+      - name: Export and compare the API contract
+        run: bun run check:api
