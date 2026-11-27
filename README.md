@@ -507,8 +507,11 @@ client of the same daemon, built for a future `/ui` mount. The daemon, CLI and M
 server stay headless, and Python users never need Node or Bun to install or run
 `agent-voice`.
 
-The scaffold has a dashboard that reads `/health` and `/v1/engines`; the other routes
-are explicit placeholders. The daemon does not serve `/ui` yet. Development only:
+The preview now has working **Speak**, **Voices**, **Models & Engines**, **Transcribe**,
+**Dashboard**, **History** and **Settings** screens, plus a global docked audio player with a
+real decoded waveform. Voice design auditions then saves a chosen take; transcription
+uploads multipart audio/video and exports SRT/VTT. The daemon does not serve `/ui` yet.
+Development only:
 
 ```bash
 cd frontend
@@ -518,8 +521,10 @@ bun run dev             # http://127.0.0.1:5173/ui/ (proxies to :8000)
 ```
 
 See [frontend/README.md](frontend/README.md) for the dev-key proxy rule, scripts and
-the static serving contract, and [docs/frontend/architecture.md](docs/frontend/architecture.md)
-for the future `/ui` mount and package-data plan.
+the static serving contract; [docs/frontend/design-system.md](docs/frontend/design-system.md)
+for the visual system and anti-slop rules; and
+[docs/frontend/architecture.md](docs/frontend/architecture.md) for the future `/ui`
+mount and package-data plan.
 
 ## Security & consent
 
@@ -551,7 +556,7 @@ for the future `/ui` mount and package-data plan.
 | [docs/troubleshooting.md](docs/troubleshooting.md) | espeak-ng, Phonon install, `sidechaincompress`, spaCy model, CPU wheels, CUDA capture, tokenizer pin, ffmpeg, `doctor`, `PATH_OUTSIDE_BASE`, stale device variants, `AGENT_VOICE_HOME`, common errors |
 | [docs/install/one-command.md](docs/install/one-command.md) | The `curl \| sh` / `irm \| iex` installers, every flag, `agent-voice setup`, uninstall, where your data lives |
 | [docs/install/agent.md](docs/install/agent.md) | MCP client configs, HTTP MCP, LangChain/OpenAI, systemd and Windows autostart, home anchoring |
-| [docs/frontend/phase0-research.md](docs/frontend/phase0-research.md) · [docs/frontend/architecture.md](docs/frontend/architecture.md) | The frontend dependency/version research and measured probes · the static SPA, `/ui` serving contract, guard interaction and future package-data plan |
+| [docs/frontend/phase0-research.md](docs/frontend/phase0-research.md) · [docs/frontend/design-system.md](docs/frontend/design-system.md) · [docs/frontend/architecture.md](docs/frontend/architecture.md) | The frontend dependency/version research and measured probes · the obsidian/cobalt design system, component rules and visual QA · the static SPA, `/ui` serving contract, guard interaction and future package-data plan |
 | [docs/phase0-report.md](docs/phase0-report.md) / [phase0-kokoro-report.md](docs/phase0-kokoro-report.md) / [phase0-asr-report.md](docs/phase0-asr-report.md) / [phase0-devices-report.md](docs/phase0-devices-report.md) | Measured GPU performance, the Kokoro CPU spike, the Phonon ASR CPU spike, and the device-variant measurements behind the support matrix |
 | [CHANGELOG.md](CHANGELOG.md) | Release history, v0.1.0 → v0.6.0 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) | Dev setup and gates · supported versions and threat model |
@@ -575,6 +580,9 @@ For the preview UI (Node 24.22.3 + Bun 1.4.5, development only):
 cd frontend
 bun ci
 bun run check && bun run check:svelte5 && bun run lint && bun run test && bun run build
+bun run check:spa
+# live mock-daemon browser suite; needs uv + ffmpeg, no GPU
+bun run test:e2e
 ```
 
 CI runs the same gates on Python 3.12 with no GPU and no secrets; see

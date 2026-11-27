@@ -115,12 +115,13 @@ Sources: `https://openapi-ts.dev/`, `https://registry.npmjs.org/openapi-typescri
   1. the method-based `api.GET('/health')` inferred `never` (generic constraint);
   2. `/health` and `/v1/engines` have no response models, so their error branch is
      `never` and a naive `result.error` guard narrows to `never`.
-  The scaffold uses openapi-fetch's **path-based** client
-  (`createPathBasedClient<paths>`) and a narrow `RawResult` cast only at those two
-  unmodelled endpoints; `src/lib/api/dashboard.ts` parses the unknown payload with
+  The studio uses openapi-fetch's **path-based** client
+  (`createPathBasedClient<paths>`) and a narrow `RawResult` cast only at the
+  unmodelled endpoints; `src/lib/api/guards.ts` parses the unknown payload with
   explicit guards. The backend follow-up is to add `response_model` to those routes.
 - Browser audio: `/audio/<id>` is bearer-protected. `<audio src>` cannot send
-  `Authorization`; a future player must `fetch` + `URL.createObjectURL`.
+  `Authorization`; the player fetches the blob, plays `URL.createObjectURL`, and
+  shows a clear 401 when the daemon has a key the static UI cannot store.
 - SSE uses `fetch` + `eventsource-parser` (EventSource cannot set headers). WebSocket
   auth uses `Sec-WebSocket-Protocol: bearer, <key>`. Neither is implemented here.
 
@@ -143,8 +144,10 @@ Sources: `https://bun.com/docs/`, `https://vitest.dev/`, `https://playwright.dev
   upgrade for layout/focus tests, not used here.
 - Browser tests: **@playwright/test 1.65.0** (21.2d). Measured: Chromium headless
   shell downloaded and launched without sudo on this host (Playwright warns the OS is
-  not officially supported; the fallback build works). Three smoke tests pass:
-  every stub route, dark-mode toggle/persistence, and the dashboard error state.
+  not officially supported; the fallback build works). Three smoke tests passed at
+  the scaffold gate: every route, dark-mode toggle/persistence, and the dashboard
+  error state. The studio preview later added live Speak/voice/transcription and
+  visual E2E; see `docs/frontend/architecture.md`.
 - Lint/format: **ESLint 10.14.0** + `eslint-plugin-svelte@3.24.1` +
   `typescript-eslint@8.72.2`; **Prettier 3.10.1** + `prettier-plugin-svelte@4.1.1` +
   `prettier-plugin-tailwindcss@0.8.1`. Measured clean. The generated shadcn primitives
@@ -297,7 +300,7 @@ Install-time scripts and telemetry:
 | Icons | `@lucide/svelte@0.561.0` | shadcn target; avoids the same-day 1.82.0. |
 | Dark mode | Hand-rolled theme + inline pre-paint script | Avoids stale mode-watcher; no FOUC. |
 | Unit tests | Vitest 5 + happy-dom + Testing Library | Browser-free gate; 4 tests passed. |
-| E2E | Playwright 1.65.0 + Chromium shell | 3 smoke tests passed locally; CI uses `--with-deps`. |
+| E2E | Playwright 1.65.0 + Chromium shell | Live mock-daemon suite: navigation, playback, design/save, transcription and visual captures; CI uses `--with-deps`. |
 | API types | openapi-typescript 7.13 + openapi-fetch 0.17 path-based | Generated schema; method form infers `never` under TS 6. |
 | Dev auth | Vite proxy rewrites Origin + injects key | Guard unchanged; key never public. |
 | Dist | Not committed in this scaffold | UI-readiness release builds in CI and ships package data; no Node at install. |

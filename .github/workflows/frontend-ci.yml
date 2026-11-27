@@ -16,7 +16,7 @@ jobs:
   frontend:
     name: SvelteKit static SPA
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: frontend
@@ -40,6 +40,21 @@ jobs:
           node -e "if (!process.versions.node.startsWith('24.')) { console.error('Node 24 required, got ' + process.versions.node); process.exit(1) }"
           bun -v
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync Python for the live daemon
+        working-directory: .
+        run: uv sync --extra dev --python 3.12
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Install (frozen)
         run: bun ci
 
@@ -58,11 +73,22 @@ jobs:
       - name: Production build
         run: bun run build
 
+      - name: Static /ui fallback
+        run: bun run check:spa
+
       - name: Install Chromium
         run: bunx playwright install --with-deps chromium
 
-      - name: Browser smoke
+      - name: Live browser tests and visual capture
         run: bunx playwright test
+
+      - name: Upload studio screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-voice-studio-screens
+          path: /tmp/agent-voice-qa
+          if-no-files-found: ignore
 
       - name: Dependency audit
         run: bun audit --audit-level=high

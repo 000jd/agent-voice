@@ -1,11 +1,12 @@
 # agent-voice web UI
 
-A blank, production-grade Svelte 5 + SvelteKit 3 scaffold for the local `agent-voice`
-daemon. It is a **static SPA** built for `/ui`, with no server-side rendering and no
-backend logic. The daemon, CLI, MCP server and Python package are unchanged.
+A crafted dark studio for the local `agent-voice` daemon. It is a **static SPA** built
+for `/ui`, with no server-side rendering and no backend logic. The daemon, CLI, MCP
+server and Python package are unchanged.
 
-This is a preview, not a feature release. The dashboard reads `/health` and
-`/v1/engines`; the other routes are explicit placeholders.
+The current preview has working Speak, Voices, Models & Engines, Transcribe,
+Dashboard, History and Settings screens. The daemon does **not** mount `/ui` yet; see
+the serving contract in `docs/frontend/architecture.md`.
 
 ## Requirements
 
@@ -14,6 +15,8 @@ This is a preview, not a feature release. The dashboard reads `/health` and
 - **Bun 1.4.5** for installs and scripts. Bun never runs the toolchain itself; the
   binaries still use Node (`bun run`/`bunx`, never `--bun`).
 - The daemon for live data: `uv run agent-voice serve` from the repository root.
+- For live browser tests only: `uv` and `ffmpeg` on the machine. Playwright starts an
+  isolated mock daemon itself, so no GPU is needed.
 
 ## Run it
 
@@ -29,9 +32,10 @@ bun run dev        # http://127.0.0.1:5173/ui/
 ```
 
 The Vite dev server binds `127.0.0.1` and proxies only `/health`, `/v1` and `/audio`
-to `http://127.0.0.1:8000`. It rewrites `Origin` to the daemon's own loopback origin
-and injects `Authorization` when a dev key is configured, so the unchanged guard
-accepts the request. A browser cannot use the proxy to widen the guard.
+to `AGENT_VOICE_DEV_URL` (default `http://127.0.0.1:8000`). It rewrites `Origin` to
+the daemon's own loopback origin and injects `Authorization` when a dev key is
+configured, so the unchanged guard accepts the request. A browser cannot use the
+proxy to widen the guard.
 
 If the daemon has `AGENT_VOICE_API_KEY` set, create `frontend/.env` (gitignored):
 
@@ -42,23 +46,56 @@ AGENT_VOICE_DEV_API_KEY=the-same-value
 Restart Vite after changing it. Never use a `VITE_*` or `PUBLIC_*` spelling: those
 are exposed to the browser bundle. The value stays in the Vite process.
 
+## Screens
+
+| Screen           | What it does                                                                       |
+| ---------------- | ---------------------------------------------------------------------------------- |
+| Speak            | Markup-aware composer, clone/preset/design inspector, session takes, global player |
+| Voices           | Cloned/designed library, grouped engine preset speakers, design/clone drawers      |
+| Models & Engines | Live install/device/downloaded/loaded/VRAM state; unload all                       |
+| Transcribe       | Multipart upload, transcript, timed segments, SRT/VTT download                     |
+| Dashboard        | Live daemon/GPU state and session renders                                          |
+| History          | Session-local renders; durable job history is not exposed by REST                  |
+| Settings         | Read-only runtime/security view and theme                                          |
+
+The visual system and anti-slop rules are in
+[`docs/frontend/design-system.md`](../docs/frontend/design-system.md). Read it with
+`AGENTS.md` before changing a token or screen.
+
 ## Scripts
 
-| Command                 | What it does                                          |
-| ----------------------- | ----------------------------------------------------- |
-| `bun run dev`           | Vite dev server at `/ui/`, with the guard-safe proxy  |
-| `bun run build`         | static build in `build/`, entry `200.html`            |
-| `bun run check`         | `svelte-kit sync` + `svelte-check --fail-on-warnings` |
-| `bun run check:svelte5` | rejects Svelte 4 syntax and Kit 2 aliases             |
-| `bun run lint`          | Prettier check + ESLint                               |
-| `bun run format`        | Prettier write                                        |
-| `bun run test`          | Vitest component tests (happy-dom)                    |
-| `bun run test:e2e`      | Playwright smoke tests (Chromium)                     |
-| `bun run gen:api`       | export OpenAPI, regenerate `schema.d.ts`              |
-| `bun run check:api`     | fail if either generated file is stale                |
-| `bun run preview`       | Vite preview of the production build                  |
+| Command                 | What it does                                                |
+| ----------------------- | ----------------------------------------------------------- |
+| `bun run dev`           | Vite dev server at `/ui/`, with the guard-safe proxy        |
+| `bun run build`         | static build in `build/`, entry `200.html`                  |
+| `bun run check`         | Kit sync + `svelte-check --fail-on-warnings` + scoped `tsc` |
+| `bun run check:types`   | scoped TypeScript-only gate                                 |
+| `bun run check:svelte5` | rejects Svelte 4 syntax and Kit 2 aliases                   |
+| `bun run check:spa`     | serves `build/` and asserts the `/ui/` fallback contract    |
+| `bun run lint`          | Prettier check + ESLint                                     |
+| `bun run format`        | Prettier write                                              |
+| `bun run test`          | Vitest unit/component tests (happy-dom)                     |
+| `bun run test:e2e`      | Playwright live tests + screenshots (Chromium)              |
+| `bun run gen:api`       | export OpenAPI, regenerate `schema.d.ts`                    |
+| `bun run check:api`     | fail if either generated file is stale                      |
+| `bun run preview`       | Vite preview of the production build                        |
 
-## API types
+`bun run check` includes a scoped `tsc` because `tsc` cannot model named exports from
+generated shadcn `.svelte` modules. `svelte-check` owns those components. Do not remove
+the TS-only gate to make a component compile.
+
+## Live browser tests and screenshots
+
+`bun run test:e2e` starts a real `agent-voice serve` on `127.0.0.1:8765` with
+`mock` + `mock_asr`, `AGENT_VOICE_DATA_DIR=/tmp/agent-voice-qa-data`, and the real
+plugin manifests from `engines/`. It tests navigation, theme, the offline state, live
+Speak playback, design/save, transcription and SRT download, then captures desktop
+and mobile screens in `/tmp/agent-voice-qa/`.
+
+The QA daemon is isolated: no user voices, cache or GPU state are touched. Delete
+`/tmp/agent-voice-qa-data` to reset it. The screenshots are not committed.
+
+## API types and guards
 
 `openapi.json` is produced by `scripts/export_openapi.py` from the real FastAPI app,
 using a temporary home/data/engines directory and `mount_mcp=False`. The exporter is
@@ -75,11 +112,13 @@ const result = await api['/health'].GET();
 ```
 
 The method-based `api.GET('/health')` form collapses to `never` under TypeScript 6
-with this generated schema. The path-based form stays fully typed. `/health` and
-`/v1/engines` currently return bare dicts without response models, so
-`src/lib/api/dashboard.ts` casts the raw envelope and restores a checked shape with
-local guards. Adding `response_model` to those backend routes is the follow-up that
-removes the cast; it is a backend change, not part of this scaffold.
+with this generated schema. Most read routes return bare dicts without response
+models, so `src/lib/api/guards.ts` casts the raw envelope and restores a checked
+shape. Components consume the domain types, not `unknown`.
+
+`/v1/agent/speak` is the studio synthesis path. `/v1/audio/transcriptions` is
+multipart and returns the canonical `verbose_json` result when asked. Audio is
+fetched with `fetch` + object URL, never a bare `<audio src>`.
 
 ## Build and serving contract
 
@@ -96,8 +135,8 @@ The host serves `/ui/*` from `build/`, but:
   `build/200.html`;
 - `/ui` redirects to `/ui/`.
 
-The daemon currently does not mount `/ui`; that is the next backend release. See
-`docs/frontend/architecture.md` for the exact contract and packaging plan.
+`bun run check:spa` proves this locally against the built output. The daemon currently
+does not mount `/ui`; that is the next backend release.
 
 ## Security and offline behaviour
 
@@ -107,10 +146,14 @@ The daemon currently does not mount `/ui`; that is the next backend release. See
 - No external runtime requests: Inter is self-hosted via Fontsource, icons are
   bundled from `@lucide/svelte`, and the only network traffic is to the daemon.
 - No telemetry, analytics, service worker or CDN.
-- `/audio/<id>` is bearer-protected. A future player must `fetch` it with the key and
-  use `URL.createObjectURL`; a bare `<audio src="/audio/x">` cannot send `Authorization`.
+- `/audio/<id>` is bearer-protected. The player fetches it with same-origin
+  credentials and uses `URL.createObjectURL`; on a keyed daemon it shows the 401
+  explanation instead of a fake player. It never stores the key.
 - WebSocket auth uses `Sec-WebSocket-Protocol: bearer, <key>`; SSE needs `fetch` +
   `eventsource-parser` because `EventSource` cannot set headers. Neither is wired yet.
+- The clone drawer cannot show an exact inbox path: REST has no `server_info`.
+  It shows `<DATA_DIR>/inbox/` and the `agent-voice doctor` hint, and surfaces the
+  daemon's own rejection suggestion.
 
 ## Svelte 5 rules
 

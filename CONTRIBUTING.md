@@ -80,14 +80,20 @@ nvm use
 bun ci
 bun run check && bun run check:svelte5 && bun run lint
 bun run test
-bun run build
+bun run build && bun run check:spa
 bun run check:api
-bunx playwright test          # needs: bunx playwright install --only-shell chromium
+bun run test:e2e              # starts mock+mock_asr; needs uv + ffmpeg
 bun audit --audit-level=high
 ```
 
 - Svelte 5 runes + SvelteKit 3 only. No `svelte.config.js`, no `$lib`, no Svelte 4
   syntax. Kit 3 config lives in `vite.config.ts`.
+- Read [`docs/frontend/design-system.md`](docs/frontend/design-system.md). Dark is
+  default; cobalt is action/playhead only; no glowing gradients, emoji labels, fake
+  KPIs or invented metadata. The voice library is a dense row-card list.
+- `bun run test:e2e` starts an isolated daemon on port 8765 with
+  `AGENT_VOICE_DATA_DIR=/tmp/agent-voice-qa-data`; it never touches your real voices.
+  Screenshots land in `/tmp/agent-voice-qa/`.
 - The UI is a REST client. Do not add a UI-only backend route, auth/login, CORS, a
   tunnel, telemetry, or an external font/CDN. Tier-A settings stay read-only.
 - `openapi.json` and `src/lib/api/schema.d.ts` are generated and committed; run

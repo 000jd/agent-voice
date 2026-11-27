@@ -11,23 +11,37 @@ given for every release so a tag can be verified against the history.
 
 ### Added
 
-- **Frontend preview scaffold.** A static Svelte 5 + SvelteKit 3 SPA in `frontend/`,
-  built for a future `/ui` mount: `adapter-static` with `200.html`, `ssr = false`,
-  `/ui` base, Tailwind CSS 4, shadcn-svelte/Bits UI, Inter/Fontsource, a hand-rolled
-  theme and a responsive shell. The dashboard reads `/health` and `/v1/engines`;
-  Speak, Voices, Transcribe, Models, History and Settings are explicit placeholders.
-  The daemon, CLI, MCP server, installers and Python package are unchanged, and
-  Python users never need Node or Bun.
+- **Frontend studio preview.** A crafted obsidian/cobalt static Svelte 5 + SvelteKit 3
+  SPA in `frontend/`, built for a future `/ui` mount: `adapter-static` with `200.html`,
+  `ssr = false`, `/ui` base, Tailwind CSS 4, shadcn-svelte/Bits UI, Inter/Fontsource,
+  a hand-rolled token system and a responsive three-zone shell. Working **Speak**
+  (markup composer, Clone/Preset/Design inspector, session takes), **Voices**
+  (cloned/designed library, grouped engine presets, two-stage design audition/save,
+  clone drawer), **Models & Engines**, **Transcribe** (multipart upload, timed
+  segments, SRT/VTT), **Dashboard**, session-local **History** and read-only
+  **Settings**. A global docked player uses `fetch` + Web Audio-decoded SVG peaks,
+  speed, volume, download and a clear 401 path. The daemon, CLI, MCP server, installers
+  and Python package are unchanged, and Python users never need Node or Bun.
+- **Studio design system.** `docs/frontend/design-system.md` records the exact dark and
+  light surface ladders, typography/tabular-number rules, geometry, component
+  restraint, accessibility and the anti-AI-slop checklist. The voice library is a
+  dense row-card/table with one grouped preset row per engine/model, not a fake KPI
+  grid. No Dribbble assets are committed.
 - **Typed API boundary.** `scripts/export_openapi.py` writes a deterministic
   `frontend/openapi.json` from a temporary app context (`mount_mcp=False`, no workers,
   no torch); `openapi-typescript` generates the committed TypeScript schema and
   `openapi-fetch`'s path-based client reads it. `/health` and `/v1/engines` are
   locally type-guarded because those routes still lack response models.
-- **Frontend quality gates.** Vitest + happy-dom component tests, Playwright Chromium
-  smoke tests, ESLint 10 + Prettier, a Svelte 5 blocklist checker, a separate
-  `frontend-ci.yml` with OpenAPI drift and `bun audit --audit-level=high`, and the
-  Phase 0 research/architecture docs. Exact pins, a committed `bun.lock`, and Bun's
-  14-day release-age/install-script policy apply. No version bump or tag.
+- **Frontend quality gates.** Vitest + happy-dom unit/component tests for design
+  tokens, formatting, markup, player state, Speak capability/composer/inspector,
+  voices, transcription requests and the shell; a live Playwright suite that starts an
+  isolated `mock` + `mock_asr` daemon, generates and plays a real render, designs/saves
+  a voice, uploads a clip and downloads SRT, and captures desktop/mobile screens in
+  `/tmp/agent-voice-qa/`; ESLint 10 + Prettier; a Svelte 5 blocklist checker; a
+  scoped `tsc` gate alongside `svelte-check`; a static `/ui` fallback check; a separate
+  `frontend-ci.yml` with OpenAPI drift and `bun audit --audit-level=high`; and the
+  Phase 0 research/architecture/design docs. Exact pins, a committed `bun.lock`, and
+  Bun's 14-day release-age/install-script policy apply. No version bump or tag.
 
 ## [0.6.0] — 2026-11-27 — `fd3ec50`
 
