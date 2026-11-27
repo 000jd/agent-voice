@@ -1,15 +1,14 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="dark">
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<meta name="color-scheme" content="light dark" />
+		<meta name="color-scheme" content="dark light" />
 		<script>
 			try {
-				const stored = localStorage.getItem('agent-voice-theme');
-				const dark =
-					stored === 'dark' || (!stored && matchMedia('(prefers-color-scheme: dark)').matches);
-				document.documentElement.classList.toggle('dark', dark);
+				if (localStorage.getItem('agent-voice-theme') === 'light') {
+					document.documentElement.classList.remove('dark');
+				}
 			} catch {}
 		</script>
 		%sveltekit.head%

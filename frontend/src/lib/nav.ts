@@ -14,12 +14,34 @@ export type NavItem = {
 	icon: Component;
 };
 
-export const NAV_ITEMS: readonly NavItem[] = [
-	{ label: 'Dashboard', href: '', icon: LayoutDashboard },
-	{ label: 'Speak', href: 'speak', icon: AudioLines },
-	{ label: 'Voices', href: 'voices', icon: Mic },
-	{ label: 'Transcribe', href: 'transcribe', icon: FileMusic },
-	{ label: 'Models', href: 'models', icon: Boxes },
-	{ label: 'History', href: 'history', icon: History },
-	{ label: 'Settings', href: 'settings', icon: Settings }
+export type NavGroup = {
+	label: string;
+	items: readonly NavItem[];
+};
+
+export const NAV_GROUPS: readonly NavGroup[] = [
+	{
+		label: 'Studio',
+		items: [
+			{ label: 'Speak', href: 'speak', icon: AudioLines },
+			{ label: 'Transcribe', href: 'transcribe', icon: FileMusic }
+		]
+	},
+	{
+		label: 'Library',
+		items: [
+			{ label: 'Voices', href: 'voices', icon: Mic },
+			{ label: 'Models & Engines', href: 'models', icon: Boxes }
+		]
+	},
+	{
+		label: 'Workspace',
+		items: [
+			{ label: 'Dashboard', href: '', icon: LayoutDashboard },
+			{ label: 'History', href: 'history', icon: History },
+			{ label: 'Settings', href: 'settings', icon: Settings }
+		]
+	}
 ];
+
+export const NAV_ITEMS: readonly NavItem[] = NAV_GROUPS.flatMap((group) => group.items);

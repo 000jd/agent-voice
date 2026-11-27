@@ -3,7 +3,7 @@ const STORAGE_KEY = 'agent-voice-theme';
 export type ThemeMode = 'light' | 'dark';
 
 function initialMode(): ThemeMode {
-	if (typeof document === 'undefined') return 'light';
+	if (typeof document === 'undefined') return 'dark';
 	return document.documentElement.classList.contains('dark') ? 'dark' : 'light';
 }
 

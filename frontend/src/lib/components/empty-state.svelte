@@ -15,16 +15,14 @@
 </script>
 
 <div
-	class="flex flex-col items-center justify-center rounded-xl border border-dashed px-6 py-14 text-center"
+	class="flex flex-col items-center justify-center rounded-xl border border-border bg-elevated/40 px-6 py-12 text-center"
 >
-	<span
-		class="mb-4 flex size-12 items-center justify-center rounded-full bg-muted text-muted-foreground"
-	>
-		<Icon class="size-6" aria-hidden="true" />
+	<span class="mb-3 flex size-10 items-center justify-center rounded-lg bg-panel text-text-muted">
+		<Icon class="size-5" aria-hidden="true" />
 	</span>
-	<h2 class="text-sm font-semibold">{title}</h2>
-	<p class="mt-1 max-w-md text-sm text-muted-foreground">{description}</p>
+	<h2 class="text-[14px] font-medium">{title}</h2>
+	<p class="mt-1 max-w-md text-[12px] leading-5 text-text-secondary">{description}</p>
 	{#if children}
-		<div class="mt-5">{@render children()}</div>
+		<div class="mt-4">{@render children()}</div>
 	{/if}
 </div>

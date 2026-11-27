@@ -8,7 +8,7 @@
 
 <button
 	type="button"
-	class="inline-flex size-9 items-center justify-center rounded-lg border border-border bg-background text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+	class="flex size-8 items-center justify-center rounded-lg border border-transparent text-text-secondary transition-colors hover:bg-elevated-hover hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/40 focus-visible:outline-none"
 	aria-label={label}
 	title={label}
 	onclick={() => theme.toggle()}
