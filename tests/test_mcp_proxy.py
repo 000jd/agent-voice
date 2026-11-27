@@ -49,6 +49,12 @@ def _unwrap(data):
     if isinstance(data, dict):
         return {key: _unwrap(value) for key, value in data.items()}
     if isinstance(data, str):
+        # Only unwrap a serialized object/array. A plain string must stay a string:
+        # json.loads("3469177413594335") is an int, and uuid4().hex[:16] produces
+        # an all-digit job id about once in 1,300 runs, which would turn the id
+        # the test feeds back into get_job into a type error.
+        if data.lstrip()[:1] not in {"{", "["}:
+            return data
         try:
             return json.loads(data)
         except json.JSONDecodeError:
@@ -65,6 +71,13 @@ def _unwrap(data):
     if hasattr(data, "__dict__") and data.__dict__:
         return {key: _unwrap(value) for key, value in vars(data).items()}
     return data
+
+
+def test_payload_keeps_a_digit_only_string_a_string():
+    """A job id that happens to be all digits must not become an int."""
+    assert _unwrap("1234567890123456") == "1234567890123456"
+    assert _unwrap('{"a": 1}') == {"a": 1}
+    assert _unwrap("[1, 2]") == [1, 2]
 
 
 async def call_expecting_error(client, name: str, arguments: dict) -> dict:
