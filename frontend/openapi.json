@@ -1,0 +1,2286 @@
+{
+  "components": {
+    "schemas": {
+      "BeatSpec": {
+        "properties": {
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "fit_mode": {
+            "default": "none",
+            "enum": [
+              "none",
+              "pad",
+              "atempo"
+            ],
+            "title": "Fit Mode",
+            "type": "string"
+          },
+          "instruct": {
+            "default": "",
+            "title": "Instruct",
+            "type": "string"
+          },
+          "language": {
+            "default": "Auto",
+            "title": "Language",
+            "type": "string"
+          },
+          "markup": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Markup"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "paragraph_gap_ms": {
+            "anyOf": [
+              {
+                "maximum": 5000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paragraph Gap Ms"
+          },
+          "pause_after_sec": {
+            "default": 0.0,
+            "maximum": 10.0,
+            "minimum": 0.0,
+            "title": "Pause After Sec",
+            "type": "number"
+          },
+          "quality": {
+            "anyOf": [
+              {
+                "enum": [
+                  "high",
+                  "fast"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality"
+          },
+          "speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker"
+          },
+          "speed": {
+            "default": 1.0,
+            "maximum": 2.0,
+            "minimum": 0.5,
+            "title": "Speed",
+            "type": "number"
+          },
+          "spell_identifiers": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spell Identifiers"
+          },
+          "take": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Take"
+          },
+          "target_duration_sec": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Duration Sec"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "BeatSpec",
+        "type": "object"
+      },
+      "Body_transcriptions_v1_audio_transcriptions_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language"
+          },
+          "model": {
+            "default": "phonon-2.5",
+            "title": "Model",
+            "type": "string"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "response_format": {
+            "default": "json",
+            "title": "Response Format",
+            "type": "string"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temperature"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_transcriptions_v1_audio_transcriptions_post",
+        "type": "object"
+      },
+      "CloneVoiceRequest": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "ref_audio_path": {
+            "title": "Ref Audio Path",
+            "type": "string"
+          },
+          "ref_text": {
+            "default": "",
+            "title": "Ref Text",
+            "type": "string"
+          },
+          "x_vector_only": {
+            "default": false,
+            "title": "X Vector Only",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "ref_audio_path"
+        ],
+        "title": "CloneVoiceRequest",
+        "type": "object"
+      },
+      "DesignVoiceRequest": {
+        "properties": {
+          "candidates": {
+            "default": 1,
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Candidates",
+            "type": "integer"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "instruct": {
+            "title": "Instruct",
+            "type": "string"
+          },
+          "language": {
+            "default": "English",
+            "title": "Language",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "title": "Overwrite",
+            "type": "boolean"
+          },
+          "quality": {
+            "default": "high",
+            "enum": [
+              "high",
+              "fast"
+            ],
+            "title": "Quality",
+            "type": "string"
+          },
+          "sample_text": {
+            "default": "Welcome! Today we are going to break down this concept step by step, clearly and intuitively.",
+            "title": "Sample Text",
+            "type": "string"
+          },
+          "save_as_clone": {
+            "default": true,
+            "title": "Save As Clone",
+            "type": "boolean"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "take": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Take"
+          }
+        },
+        "required": [
+          "name",
+          "instruct"
+        ],
+        "title": "DesignVoiceRequest",
+        "type": "object"
+      },
+      "DubPrepareRequest": {
+        "properties": {
+          "asr_engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Asr Engine"
+          },
+          "asr_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Asr Model"
+          },
+          "extract_speaker_ref": {
+            "default": true,
+            "title": "Extract Speaker Ref",
+            "type": "boolean"
+          },
+          "hotwords": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hotwords"
+          },
+          "media_path": {
+            "title": "Media Path",
+            "type": "string"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project"
+          },
+          "source_language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Language"
+          }
+        },
+        "required": [
+          "media_path"
+        ],
+        "title": "DubPrepareRequest",
+        "type": "object"
+      },
+      "DubRenderRequest": {
+        "properties": {
+          "auto_clone_source": {
+            "default": false,
+            "title": "Auto Clone Source",
+            "type": "boolean"
+          },
+          "bed_duck_db": {
+            "default": -18.0,
+            "maximum": 0.0,
+            "minimum": -40.0,
+            "title": "Bed Duck Db",
+            "type": "number"
+          },
+          "burn_subtitles": {
+            "default": false,
+            "title": "Burn Subtitles",
+            "type": "boolean"
+          },
+          "dub_id": {
+            "title": "Dub Id",
+            "type": "string"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "export_srt": {
+            "default": true,
+            "title": "Export Srt",
+            "type": "boolean"
+          },
+          "keep_original_bed": {
+            "default": true,
+            "title": "Keep Original Bed",
+            "type": "boolean"
+          },
+          "max_atempo": {
+            "default": 1.35,
+            "maximum": 2.0,
+            "minimum": 1.0,
+            "title": "Max Atempo",
+            "type": "number"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project"
+          },
+          "quality": {
+            "default": "high",
+            "enum": [
+              "high",
+              "fast"
+            ],
+            "title": "Quality",
+            "type": "string"
+          },
+          "segments": {
+            "items": {
+              "$ref": "#/components/schemas/DubSegmentSpec"
+            },
+            "title": "Segments",
+            "type": "array"
+          },
+          "speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
+          }
+        },
+        "required": [
+          "dub_id",
+          "segments"
+        ],
+        "title": "DubRenderRequest",
+        "type": "object"
+      },
+      "DubSegmentSpec": {
+        "description": "One translated line, placed at the source segment's slot.",
+        "properties": {
+          "end_sec": {
+            "title": "End Sec",
+            "type": "number"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "instruct": {
+            "default": "",
+            "title": "Instruct",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker"
+          },
+          "start_sec": {
+            "title": "Start Sec",
+            "type": "number"
+          },
+          "take": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Take"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
+          }
+        },
+        "required": [
+          "index",
+          "start_sec",
+          "end_sec",
+          "text"
+        ],
+        "title": "DubSegmentSpec",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "RegisterEngineRequest": {
+        "properties": {
+          "engine_id": {
+            "title": "Engine Id",
+            "type": "string"
+          },
+          "engine_yaml_content": {
+            "title": "Engine Yaml Content",
+            "type": "string"
+          },
+          "install_venv": {
+            "default": true,
+            "title": "Install Venv",
+            "type": "boolean"
+          },
+          "pyproject_toml_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pyproject Toml Content"
+          },
+          "worker_py_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Py Content"
+          }
+        },
+        "required": [
+          "engine_id",
+          "engine_yaml_content"
+        ],
+        "title": "RegisterEngineRequest",
+        "type": "object"
+      },
+      "RegisterModelRequest": {
+        "properties": {
+          "download": {
+            "default": true,
+            "title": "Download",
+            "type": "boolean"
+          },
+          "engine_id": {
+            "title": "Engine Id",
+            "type": "string"
+          },
+          "est_vram_gb": {
+            "default": 4.4,
+            "title": "Est Vram Gb",
+            "type": "number"
+          },
+          "hf_repo": {
+            "title": "Hf Repo",
+            "type": "string"
+          },
+          "model_alias": {
+            "title": "Model Alias",
+            "type": "string"
+          },
+          "quality_tier": {
+            "default": "high",
+            "enum": [
+              "high",
+              "fast"
+            ],
+            "title": "Quality Tier",
+            "type": "string"
+          }
+        },
+        "required": [
+          "engine_id",
+          "model_alias",
+          "hf_repo"
+        ],
+        "title": "RegisterModelRequest",
+        "type": "object"
+      },
+      "ScriptRequest": {
+        "properties": {
+          "beats": {
+            "items": {
+              "$ref": "#/components/schemas/BeatSpec"
+            },
+            "title": "Beats",
+            "type": "array"
+          },
+          "default_voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Voice"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "export_srt": {
+            "default": true,
+            "title": "Export Srt",
+            "type": "boolean"
+          },
+          "format": {
+            "default": "wav",
+            "enum": [
+              "wav",
+              "mp3",
+              "opus",
+              "flac",
+              "pcm"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "markup": {
+            "default": true,
+            "title": "Markup",
+            "type": "boolean"
+          },
+          "paragraph_gap_ms": {
+            "default": 0,
+            "maximum": 5000.0,
+            "minimum": 0.0,
+            "title": "Paragraph Gap Ms",
+            "type": "integer"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project"
+          },
+          "pronunciations": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pronunciations"
+          },
+          "quality": {
+            "default": "high",
+            "enum": [
+              "high",
+              "fast"
+            ],
+            "title": "Quality",
+            "type": "string"
+          },
+          "spell_identifiers": {
+            "default": false,
+            "title": "Spell Identifiers",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "beats"
+        ],
+        "title": "ScriptRequest",
+        "type": "object"
+      },
+      "SetBindingRequest": {
+        "properties": {
+          "engine_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine Id"
+          },
+          "model_alias": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Alias"
+          },
+          "voice_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice Id"
+          }
+        },
+        "title": "SetBindingRequest",
+        "type": "object"
+      },
+      "SpeakRequest": {
+        "properties": {
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "format": {
+            "default": "wav",
+            "enum": [
+              "wav",
+              "mp3",
+              "opus",
+              "flac",
+              "pcm"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "instruct": {
+            "default": "",
+            "title": "Instruct",
+            "type": "string"
+          },
+          "language": {
+            "default": "Auto",
+            "title": "Language",
+            "type": "string"
+          },
+          "markup": {
+            "default": true,
+            "title": "Markup",
+            "type": "boolean"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "paragraph_gap_ms": {
+            "default": 0,
+            "maximum": 5000.0,
+            "minimum": 0.0,
+            "title": "Paragraph Gap Ms",
+            "type": "integer"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project"
+          },
+          "pronunciations": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pronunciations"
+          },
+          "quality": {
+            "default": "high",
+            "enum": [
+              "high",
+              "fast"
+            ],
+            "title": "Quality",
+            "type": "string"
+          },
+          "seed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seed"
+          },
+          "speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speaker"
+          },
+          "speed": {
+            "default": 1.0,
+            "title": "Speed",
+            "type": "number"
+          },
+          "spell_identifiers": {
+            "default": false,
+            "title": "Spell Identifiers",
+            "type": "boolean"
+          },
+          "take": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Take"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "SpeakRequest",
+        "type": "object"
+      },
+      "SpeechRequest": {
+        "description": "Canonical OpenAI /v1/audio/speech body.",
+        "properties": {
+          "input": {
+            "title": "Input",
+            "type": "string"
+          },
+          "model": {
+            "default": "tts-1",
+            "title": "Model",
+            "type": "string"
+          },
+          "response_format": {
+            "default": "wav",
+            "enum": [
+              "wav",
+              "mp3",
+              "opus",
+              "flac",
+              "pcm"
+            ],
+            "title": "Response Format",
+            "type": "string"
+          },
+          "speed": {
+            "default": 1.0,
+            "title": "Speed",
+            "type": "number"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
+          }
+        },
+        "required": [
+          "input"
+        ],
+        "title": "SpeechRequest",
+        "type": "object"
+      },
+      "TranscribeRequest": {
+        "description": "A local-path transcription. Used by /v1/agent/transcribe and transcribe().",
+        "properties": {
+          "audio_path": {
+            "title": "Audio Path",
+            "type": "string"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "export_srt": {
+            "default": false,
+            "title": "Export Srt",
+            "type": "boolean"
+          },
+          "hotwords": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hotwords"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project"
+          },
+          "word_timestamps": {
+            "default": false,
+            "title": "Word Timestamps",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "audio_path"
+        ],
+        "title": "TranscribeRequest",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Headless multi-engine voice server for AI agents",
+    "title": "agent-voice",
+    "version": "0.6.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/audio/{artifact_id}": {
+      "get": {
+        "operationId": "get_audio_audio__artifact_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Audio"
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Health Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      }
+    },
+    "/v1/agent/dub/jobs": {
+      "post": {
+        "description": "Start a dub render as a background job; poll ``GET /v1/jobs/{job_id}``.\n\nSame runner shape as the script job: progress is reported per translated line,\nso a long mux is observable instead of appearing stuck until it lands.",
+        "operationId": "start_dub_job_v1_agent_dub_jobs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DubRenderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Dub Job",
+        "tags": [
+          "asr"
+        ]
+      }
+    },
+    "/v1/agent/dub/prepare": {
+      "post": {
+        "description": "Stage a video for dubbing: transcribe it and extract a speaker reference.\n\nDeliberately not gated by ``require_agent_mutation``. Dubbing reads a confined\nmedia path and writes artifacts, exactly like ``speak``: it installs nothing\nand executes no new code, so the mutation opt-in does not apply.",
+        "operationId": "agent_dub_prepare_v1_agent_dub_prepare_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DubPrepareRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Agent Dub Prepare",
+        "tags": [
+          "asr"
+        ]
+      }
+    },
+    "/v1/agent/dub/render": {
+      "post": {
+        "description": "Synthesize translated lines onto the timeline and mux the dubbed video.\n\nSynchronous: a long dub should be started through ``POST /v1/agent/dub/jobs``\nso it can be polled. ``overflow_warnings`` names every line that still overran\nits slot at ``max_atempo`` — shorten those and render again.",
+        "operationId": "agent_dub_render_v1_agent_dub_render_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DubRenderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Agent Dub Render",
+        "tags": [
+          "asr"
+        ]
+      }
+    },
+    "/v1/agent/script": {
+      "post": {
+        "description": "Render a multi-beat script.\n\n``?async=true`` returns a ``job_id`` immediately; poll ``GET /v1/jobs/{id}``.\n``?async_=true`` still works: it was this parameter's de-facto name (Python\ncannot declare an argument called ``async``), and clients already use it.",
+        "operationId": "agent_script_v1_agent_script_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "async",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Async",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "async_",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Async ",
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Agent Script",
+        "tags": [
+          "agent"
+        ]
+      }
+    },
+    "/v1/agent/speak": {
+      "post": {
+        "description": "Agent-facing synthesis returning compact JSON with a file path.",
+        "operationId": "agent_speak_v1_agent_speak_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeakRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Agent Speak",
+        "tags": [
+          "speech"
+        ]
+      }
+    },
+    "/v1/agent/transcribe": {
+      "post": {
+        "description": "Transcribe a confined local audio/video path into timed segments.\n\nUnlike the OpenAI surface this returns the canonical result, including the\npath to the full transcript when the segments inline were truncated.",
+        "operationId": "agent_transcribe_v1_agent_transcribe_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TranscribeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Agent Transcribe",
+        "tags": [
+          "asr"
+        ]
+      }
+    },
+    "/v1/agents/bindings": {
+      "delete": {
+        "operationId": "delete_binding_v1_agents_bindings_delete",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Delete Binding",
+        "tags": [
+          "bindings"
+        ]
+      },
+      "get": {
+        "operationId": "list_bindings_v1_agents_bindings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Bindings",
+        "tags": [
+          "bindings"
+        ]
+      },
+      "put": {
+        "description": "Set the binding for the calling agent.\n\nThe agent is identified by ``X-Agent-Id``. That header is convenience routing\non a local single-user box, not an authorization boundary.",
+        "operationId": "set_binding_v1_agents_bindings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetBindingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Binding",
+        "tags": [
+          "bindings"
+        ]
+      }
+    },
+    "/v1/audio/speech": {
+      "post": {
+        "description": "OpenAI-compatible endpoint.\n\nAccepts ``tts-1`` / ``tts-1-hd`` or an explicit ``engine:model`` selector.\n\nDeliberately strict: an OpenAI client cannot opt into v0.4 markup or a scoped\nlexicon project, so brackets are spoken as written and only the global plus\nresolved-voice lexicon layers apply. Anything else would change what an\nexisting client hears without it asking.",
+        "operationId": "openai_speech_v1_audio_speech_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeechRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Openai Speech",
+        "tags": [
+          "speech"
+        ]
+      }
+    },
+    "/v1/audio/speech/pcm-stream": {
+      "post": {
+        "description": "Stream 24 kHz mono int16 LE PCM as it is generated.\n\nBody fields mirror ``/v1/agent/speak`` where they can: ``markup`` (default\ntrue), ``spell_identifiers``, ``paragraph_gap_ms`` and ``project`` all apply.",
+        "operationId": "pcm_stream_v1_audio_speech_pcm_stream_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Pcm Stream",
+        "tags": [
+          "stream"
+        ]
+      }
+    },
+    "/v1/audio/transcriptions": {
+      "post": {
+        "description": "OpenAI-compatible transcription: multipart upload in, text or subtitles out.\n\n``json`` is the OpenAI shape (``text``, ``language``, ``duration``,\n``segments``, ``segments_count``, ``transcript_json_path``); ``verbose_json``\nis the full :class:`~agent_voice.schemas.TranscribeResult` including engine,\nmodel and timing metadata. ``temperature`` is accepted and ignored: sampling\nis not exposed by the ASR engines, and rejecting it would break real clients.",
+        "operationId": "transcriptions_v1_audio_transcriptions_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_transcriptions_v1_audio_transcriptions_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Transcriptions",
+        "tags": [
+          "asr"
+        ]
+      }
+    },
+    "/v1/clone": {
+      "post": {
+        "description": "Alias kept for clients that POST /v1/clone rather than /v1/voices.",
+        "operationId": "clone_voice_shortcut_v1_clone_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Voice Shortcut",
+        "tags": [
+          "speech"
+        ]
+      }
+    },
+    "/v1/engines": {
+      "get": {
+        "operationId": "list_engines_v1_engines_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Engines V1 Engines Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Engines",
+        "tags": [
+          "engines"
+        ]
+      },
+      "post": {
+        "operationId": "register_engine_v1_engines_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterEngineRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Engine",
+        "tags": [
+          "engines"
+        ]
+      }
+    },
+    "/v1/engines/{engine_id}/install": {
+      "post": {
+        "operationId": "install_engine_v1_engines__engine_id__install_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "engine_id",
+            "required": true,
+            "schema": {
+              "title": "Engine Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "device",
+            "required": false,
+            "schema": {
+              "default": "auto",
+              "title": "Device",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Install Engine",
+        "tags": [
+          "engines"
+        ]
+      }
+    },
+    "/v1/gpu": {
+      "get": {
+        "operationId": "gpu_status_v1_gpu_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Gpu Status",
+        "tags": [
+          "agent"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "operationId": "get_job_v1_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Job",
+        "tags": [
+          "agent"
+        ]
+      }
+    },
+    "/v1/jobs/{job_id}/cancel": {
+      "post": {
+        "operationId": "cancel_job_v1_jobs__job_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Job",
+        "tags": [
+          "agent"
+        ]
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "operationId": "list_models_v1_models_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "engine_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Engine Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Models",
+        "tags": [
+          "engines"
+        ]
+      },
+      "post": {
+        "operationId": "register_model_v1_models_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Model",
+        "tags": [
+          "engines"
+        ]
+      }
+    },
+    "/v1/models/unload": {
+      "post": {
+        "operationId": "unload_models_v1_models_unload_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unload Models",
+        "tags": [
+          "engines"
+        ]
+      }
+    },
+    "/v1/models/{engine_id}/{model_alias}/download": {
+      "post": {
+        "operationId": "download_model_v1_models__engine_id___model_alias__download_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "engine_id",
+            "required": true,
+            "schema": {
+              "title": "Engine Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "model_alias",
+            "required": true,
+            "schema": {
+              "title": "Model Alias",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Model",
+        "tags": [
+          "engines"
+        ]
+      }
+    },
+    "/v1/voices": {
+      "get": {
+        "operationId": "list_voices_v1_voices_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Voices",
+        "tags": [
+          "voices"
+        ]
+      },
+      "post": {
+        "description": "Create a voice.\n\n``?overwrite=true`` replaces an existing voice registered under the same name\nwhen its reference audio differs. Without it, a retry with identical audio is\nidempotent and a differing clip is rejected. ``overwrite`` is a query parameter\nrather than a body field because ``CloneVoiceRequest`` is a frozen contract.",
+        "operationId": "create_voice_v1_voices_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "overwrite",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Overwrite",
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneVoiceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Voice",
+        "tags": [
+          "voices"
+        ]
+      }
+    },
+    "/v1/voices/design": {
+      "post": {
+        "description": "Design a voice from a natural-language description.\n\nNo reference clip is needed: the engine renders ``sample_text`` in the\ndescribed timbre and, with ``save_as_clone``, registers that render as a\nnormal voice. The preview is an ordinary artifact, so its path is playable\nimmediately and ``voice_id`` can be passed as ``voice`` to any later call.",
+        "operationId": "design_voice_v1_voices_design_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesignVoiceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Design Voice",
+        "tags": [
+          "voices"
+        ]
+      }
+    },
+    "/v1/voices/{voice_id}": {
+      "delete": {
+        "operationId": "delete_voice_v1_voices__voice_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "voice_id",
+            "required": true,
+            "schema": {
+              "title": "Voice Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Voice",
+        "tags": [
+          "voices"
+        ]
+      }
+    }
+  }
+}

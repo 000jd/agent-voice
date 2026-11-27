@@ -1,0 +1,20 @@
+# Package managers
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+bun.lock
+bun.lockb
+
+# Build output
+/.svelte-kit/
+/build/
+/coverage/
+/playwright-report/
+/test-results/
+
+# Generated API artifacts
+/openapi.json
+/src/lib/api/schema.d.ts
+
+# Static assets
+/static/

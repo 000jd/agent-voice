@@ -87,6 +87,9 @@ agent-voice = "agent_voice.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_voice"]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["/frontend", "/frontend/**"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # tests/conftest.py imports `tests._fake_clock`; the repo root must be on
@@ -103,6 +106,7 @@ timeout = 300
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["frontend"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
