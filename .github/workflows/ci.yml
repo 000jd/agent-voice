@@ -30,11 +30,6 @@ jobs:
       # loud so a stray value in the environment cannot turn them on.
       AGENT_VOICE_RUN_GPU_TESTS: "0"
       PYTHONUNBUFFERED: "1"
-      # tests/conftest.py does `from tests._fake_clock import ...` and there is
-      # no tests/__init__.py, so the repo root must be importable. pytest's
-      # rootdir insertion only covers `python -m pytest`, not the `pytest`
-      # console script, hence PYTHONPATH here.
-      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Check out

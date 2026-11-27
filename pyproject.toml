@@ -89,6 +89,9 @@ packages = ["src/agent_voice"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests/conftest.py imports `tests._fake_clock`; the repo root must be on
+# sys.path for the `pytest` console script too, not just `python -m pytest`.
+pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [

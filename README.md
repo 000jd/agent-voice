@@ -360,9 +360,8 @@ uv run agent-voice engines test mock                 # IPC v1 conformance
 uv run agent-voice pronunciations check "HTTPServer"  # lexicon/code preview
 ```
 
-(If you call the `pytest` console script directly, prefix `PYTHONPATH=.` —
-`tests/conftest.py` imports `tests._fake_clock`.) CI runs the same gates on Python
-3.12 with no GPU and no secrets; see [CONTRIBUTING.md](CONTRIBUTING.md).
+CI runs the same gates on Python 3.12 with no GPU and no secrets; see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

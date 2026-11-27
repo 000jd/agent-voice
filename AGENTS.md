@@ -66,9 +66,6 @@ the rest of the time.
 .venv/bin/pytest -v                       # or: uv run pytest -v
 .venv/bin/pytest -v -m "not gpu"          # explicit; same thing (addopts already excludes gpu)
 
-# for the pytest console script, make the repo root importable:
-PYTHONPATH=. .venv/bin/pytest -v          # conftest does `from tests._fake_clock import ...`
-
 # real GPU gate (opt-in, needs a CUDA GPU + downloaded weights)
 AGENT_VOICE_RUN_GPU_TESTS=1 uv run pytest -v -m gpu -o addopts=""
 

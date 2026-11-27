@@ -47,20 +47,13 @@ structural guarantee instead of a promise. Consequences:
 
 ```bash
 uv run ruff check .                    # must stay clean
-uv run python -m pytest -v             # mock + contract suite; no GPU, no torch
-PYTHONPATH=. uv run pytest -v          # console-script form, root importable
+uv run pytest -v                       # mock + contract suite; no GPU, no torch
+.venv/bin/pytest -v                    # same, via the console script
 uv run pytest -v -m "not gpu"          # explicit; addopts already excludes gpu
 ```
 
-If you invoke the `pytest` console script directly rather than through
-`python -m pytest`, make the repo root importable — `tests/conftest.py` does
-`from tests._fake_clock import …` and there is no `tests/__init__.py`:
-
-```bash
-PYTHONPATH=. .venv/bin/pytest -v
-```
-
-CI sets `PYTHONPATH` for exactly this reason.
+`[tool.pytest.ini_options]` sets `pythonpath = ["."]`, so the repo root is
+importable for the console script too; no `PYTHONPATH` workaround is needed.
 
 Guidelines for tests:
 
