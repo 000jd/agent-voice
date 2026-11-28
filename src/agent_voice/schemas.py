@@ -13,7 +13,7 @@ import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .pronunciations import validate_pronunciation_map
 
@@ -126,6 +126,7 @@ class ErrorCode(StrEnum):
     ENGINE_NOT_FOUND = "ENGINE_NOT_FOUND"
     ENGINE_NOT_INSTALLED = "ENGINE_NOT_INSTALLED"
     VOICE_NOT_FOUND = "VOICE_NOT_FOUND"
+    RECORD_NOT_FOUND = "RECORD_NOT_FOUND"
     VOICE_REQUIRED = "VOICE_REQUIRED"
     """No voice exists or was selected, and the engine cannot synthesise without
     one. Distinct from VOICE_NOT_FOUND so an agent can tell "clone a voice first"
@@ -138,6 +139,16 @@ class ErrorCode(StrEnum):
     MANIFEST_INVALID = "MANIFEST_INVALID"
     TIMEOUT = "TIMEOUT"
     BACKPRESSURE = "BACKPRESSURE"
+    UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE"
+    MEDIA_TOO_LARGE = "MEDIA_TOO_LARGE"
+    MEDIA_TOO_LONG = "MEDIA_TOO_LONG"
+    MEDIA_LIMIT_EXCEEDED = "MEDIA_LIMIT_EXCEEDED"
+    DRAFT_EXPIRED = "DRAFT_EXPIRED"
+    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
+    INSUFFICIENT_STORAGE = "INSUFFICIENT_STORAGE"
+    ARCHIVE_UNSAFE = "ARCHIVE_UNSAFE"
+    ARCHIVE_TOO_LARGE = "ARCHIVE_TOO_LARGE"
+    FORBIDDEN_SETTING = "FORBIDDEN_SETTING"
     DAEMON_RESTARTED = "DAEMON_RESTARTED"
     """A job was pending or running when the daemon stopped. It cannot be resumed,
     so it is reconciled to failed on the next startup rather than lying as
@@ -155,6 +166,7 @@ HTTP_STATUS_BY_ERROR: dict[ErrorCode, int] = {
     ErrorCode.ENGINE_NOT_FOUND: 404,
     ErrorCode.ENGINE_NOT_INSTALLED: 409,
     ErrorCode.VOICE_NOT_FOUND: 404,
+    ErrorCode.RECORD_NOT_FOUND: 404,
     ErrorCode.VOICE_REQUIRED: 422,
     ErrorCode.INVALID_REF_AUDIO: 422,
     ErrorCode.TEXT_TOO_LONG: 413,
@@ -164,6 +176,16 @@ HTTP_STATUS_BY_ERROR: dict[ErrorCode, int] = {
     ErrorCode.MANIFEST_INVALID: 422,
     ErrorCode.TIMEOUT: 504,
     ErrorCode.BACKPRESSURE: 429,
+    ErrorCode.UNSUPPORTED_MEDIA_TYPE: 415,
+    ErrorCode.MEDIA_TOO_LARGE: 413,
+    ErrorCode.MEDIA_TOO_LONG: 422,
+    ErrorCode.MEDIA_LIMIT_EXCEEDED: 422,
+    ErrorCode.DRAFT_EXPIRED: 410,
+    ErrorCode.QUOTA_EXCEEDED: 429,
+    ErrorCode.INSUFFICIENT_STORAGE: 507,
+    ErrorCode.ARCHIVE_UNSAFE: 400,
+    ErrorCode.ARCHIVE_TOO_LARGE: 413,
+    ErrorCode.FORBIDDEN_SETTING: 403,
     ErrorCode.DAEMON_RESTARTED: 410,
     ErrorCode.BAD_REQUEST: 400,
     ErrorCode.INTERNAL_ERROR: 500,
@@ -236,6 +258,13 @@ class EngineCapabilities(BaseModel):
     voice_clone: bool = True
     voice_design: bool = False
     custom_voice: bool = False
+    max_ref_samples: int = Field(default=1, ge=1)
+    """Reference clips an engine can actually consume for one voice.
+
+    The current IPC contract carries one ``ref_wav_path``, so every shipped engine
+    keeps the default. The voice store may retain more samples for provenance and
+    future engines; the UI must not claim they are mixed when this is 1.
+    """
     instruct_control: bool = False
     languages: list[str] = Field(default_factory=list)
     word_timestamps: bool = False
@@ -333,6 +362,21 @@ class EngineEntry(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class VoiceSample(BaseModel):
+    """One stored reference clip behind a voice.
+
+    ``ref.wav`` mirrors the primary sample because IPC v1 carries exactly one
+    reference path. Extra samples are retained for provenance and future engines;
+    they are never silently mixed into an engine that declares one reference.
+    """
+
+    sample_id: str
+    duration_sec: float
+    ref_text: str = ""
+    is_primary: bool = False
+    created_at: float
+
+
 class VoiceMetadata(BaseModel):
     voice_id: str
     name: str
@@ -346,6 +390,11 @@ class VoiceMetadata(BaseModel):
     """Where the reference came from: a user clip or a VoiceDesign render."""
     design_instruct: str = ""
     """The natural-language description used when source == "designed"."""
+    language: str = "Auto"
+    notes: str = ""
+    samples: list[VoiceSample] = Field(default_factory=list)
+    consent_recorded_at: float | None = None
+    consent_version: str = ""
 
     @field_validator("name")
     @classmethod
@@ -353,20 +402,360 @@ class VoiceMetadata(BaseModel):
         return validate_voice_name(value)
 
 
-class CloneVoiceRequest(BaseModel):
+class VoiceEngineSupport(BaseModel):
+    engine_id: str
+    model_alias: str
+    max_ref_samples: int = 1
+
+
+class VoiceSummary(BaseModel):
+    """A row in the voice library: a voice, never an engine checkpoint."""
+
+    voice_id: str
     name: str
-    ref_audio_path: str
+    kind: Literal["cloned", "designed"] = "cloned"
+    language: str = "Auto"
+    notes: str = ""
+    duration_sec: float = 0.0
+    created_at: float = 0.0
+    sample_count: int = 1
     ref_text: str = ""
-    x_vector_only: bool = False
+    x_vector_only_mode: bool = False
+    warnings: list[str] = Field(default_factory=list)
+    source: Literal["cloned", "designed"] = "cloned"
+    design_instruct: str = ""
+    consent_recorded_at: float | None = None
+    has_preview: bool = False
+    engine_support: list[VoiceEngineSupport] = Field(default_factory=list)
 
-    @field_validator("name")
-    @classmethod
-    def _name(cls, value: str) -> str:
-        return validate_voice_name(value)
+
+class VoiceDetail(BaseModel):
+    voice: VoiceSummary
+    samples: list[VoiceSample] = Field(default_factory=list)
 
 
 class VoiceListResponse(BaseModel):
-    voices: list[VoiceMetadata]
+    voices: list[VoiceSummary]
+
+
+class VoiceMCPItem(BaseModel):
+    """Compact agent-facing voice row, keeping the core tools/list schema small."""
+
+    voice_id: str
+    name: str
+    ref_text: str = ""
+    x_vector_only_mode: bool = False
+    duration_sec: float
+    created_at: float
+    warnings: list[str] = Field(default_factory=list)
+    source: Literal["cloned", "designed"] = "cloned"
+    design_instruct: str = ""
+
+
+class VoiceMCPListResponse(BaseModel):
+    voices: list[VoiceMCPItem]
+
+
+class DraftTrim(BaseModel):
+    start_sec: float = Field(default=0.0, ge=0.0)
+    end_sec: float = Field(gt=0.0)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> DraftTrim:
+        if self.end_sec <= self.start_sec:
+            raise ValueError("end_sec must be greater than start_sec")
+        return self
+
+
+class CloneVoiceRequest(BaseModel):
+    """Create a voice from a draft or, for agents/CLI, a confined local path."""
+
+    name: str
+    ref_audio_path: str | None = None
+    draft_id: str | None = None
+    trim: DraftTrim | None = None
+    ref_text: str = ""
+    x_vector_only: bool = False
+    language: str = "Auto"
+    notes: str = ""
+    consent: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return validate_voice_name(value)
+
+    @field_validator("draft_id")
+    @classmethod
+    def _draft_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if re.fullmatch(r"[0-9a-f]{16}", value) is None:
+            raise ValueError("draft_id must be 16 lowercase hex characters")
+        return value
+
+    @model_validator(mode="after")
+    def _source(self) -> CloneVoiceRequest:
+        sources = [self.ref_audio_path is not None, self.draft_id is not None]
+        if sum(sources) != 1:
+            raise ValueError("provide exactly one of ref_audio_path or draft_id")
+        if self.trim is not None and self.draft_id is None:
+            raise ValueError("trim is accepted only with draft_id")
+        if self.draft_id is not None and not self.consent:
+            raise ValueError("consent is required to create a voice from a draft")
+        return self
+
+
+class VoiceSampleRequest(BaseModel):
+    draft_id: str | None = None
+    ref_audio_path: str | None = None
+    trim: DraftTrim | None = None
+    ref_text: str = ""
+    x_vector_only: bool = False
+    make_primary: bool = False
+    consent: bool = False
+
+    @field_validator("draft_id")
+    @classmethod
+    def _draft_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if re.fullmatch(r"[0-9a-f]{16}", value) is None:
+            raise ValueError("draft_id must be 16 lowercase hex characters")
+        return value
+
+    @model_validator(mode="after")
+    def _source(self) -> VoiceSampleRequest:
+        sources = [self.ref_audio_path is not None, self.draft_id is not None]
+        if sum(sources) != 1:
+            raise ValueError("provide exactly one of ref_audio_path or draft_id")
+        if self.trim is not None and self.draft_id is None:
+            raise ValueError("trim is accepted only with draft_id")
+        if self.draft_id is not None and not self.consent:
+            raise ValueError("consent is required to add a sample from a draft")
+        return self
+
+
+class VoicePatchRequest(BaseModel):
+    name: str | None = None
+    notes: str | None = None
+    language: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str | None) -> str | None:
+        return validate_voice_name(value) if value is not None else None
+
+
+class PresetVoice(BaseModel):
+    preset_id: str
+    engine_id: str
+    model_alias: str
+    speaker: str
+    display_name: str
+    languages: list[str] = Field(default_factory=list)
+    kind: Literal["preset"] = "preset"
+
+
+class PresetListResponse(BaseModel):
+    presets: list[PresetVoice]
+
+
+class PreviewRequest(BaseModel):
+    text: str = "This is a preview of the selected voice."
+    engine: str | None = None
+    model: str | None = None
+
+
+class PresetPreviewRequest(PreviewRequest):
+    engine: str
+    model: str
+    speaker: str
+
+
+class VoicePreviewResult(BaseModel):
+    artifact_id: str
+    download_url: str
+    duration_sec: float
+    engine_id: str
+    model_alias: str
+    voice_id: str | None = None
+    speaker: str | None = None
+    cached: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Voice drafts, history, captures and settings (v0.7)
+# ---------------------------------------------------------------------------
+
+
+class QualityWarning(BaseModel):
+    code: str
+    severity: Literal["info", "warning", "error"] = "warning"
+    message: str
+    suggestion: str = ""
+
+
+class ClippingReport(BaseModel):
+    detected: bool = False
+    clipped_samples: int = 0
+    first_at_sec: float | None = None
+
+
+class DraftQuality(BaseModel):
+    duration_sec: float
+    peak_dbfs: float
+    rms_dbfs: float
+    true_peak_dbtp: float | None = None
+    integrated_lufs: float | None = None
+    silence_ratio: float = 0.0
+    clipping: ClippingReport = Field(default_factory=ClippingReport)
+    warnings: list[QualityWarning] = Field(default_factory=list)
+
+
+class VoiceDraft(BaseModel):
+    draft_id: str
+    created_at: float
+    expires_at: float
+    duration_sec: float
+    sample_rate: int = SAMPLE_RATE
+    channels: int = 1
+    peaks: list[float] = Field(default_factory=list)
+    quality: DraftQuality
+    suggested_transcript: str | None = None
+    suggested_transcript_language: str | None = None
+    suggested_transcript_engine: str | None = None
+    suggested_transcript_error: ErrorResponse | None = None
+
+
+class HistoryItem(BaseModel):
+    id: str
+    created_at: float
+    kind: Literal["speak", "script", "design", "transcribe"]
+    status: Literal["succeeded", "failed"] = "succeeded"
+    favorite: bool = False
+    text: str = ""
+    voice_id: str | None = None
+    voice_name: str = ""
+    speaker: str | None = None
+    engine_id: str = ""
+    model_alias: str = ""
+    device: str | None = None
+    seed: int | None = None
+    take: int | None = None
+    duration_sec: float = 0.0
+    format: str = "wav"
+    artifact_id: str | None = None
+    audio_url: str = ""
+    capture_id: str | None = None
+    rerenderable: bool = False
+    error: ErrorResponse | None = None
+
+
+class HistoryListResponse(BaseModel):
+    items: list[HistoryItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class RerenderRequest(BaseModel):
+    take: int | None = Field(default=None, ge=1)
+    seed: int | None = None
+
+
+class CaptureSummary(BaseModel):
+    id: str
+    created_at: float
+    title: str = ""
+    transcript: str = ""
+    language: str = ""
+    duration_sec: float = 0.0
+    segments_count: int = 0
+    engine_id: str = ""
+    model_alias: str = ""
+    source: Literal["upload", "path"] = "upload"
+    audio_url: str = ""
+    truncated: bool = False
+    segments_omitted: int = 0
+
+
+class CaptureDetail(CaptureSummary):
+    segments: list[TranscribeSegment] = Field(default_factory=list)
+    full_segments_available: bool = False
+
+
+class CaptureListResponse(BaseModel):
+    items: list[CaptureSummary] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class CapturePatchRequest(BaseModel):
+    transcript: str | None = None
+    title: str | None = None
+
+
+class SettingEntry(BaseModel):
+    key: str
+    value: Any = None
+    kind: Literal["bool", "int", "float", "str", "select", "readonly"] = "str"
+    group: str = "General"
+    label: str = ""
+    description: str = ""
+    editable: bool = False
+    restart_required: bool = True
+    choices: list[str] = Field(default_factory=list)
+    source: Literal["env", "file", "default", "readonly"] = "default"
+    shadowed_by_env: bool = False
+
+
+class SettingsResponse(BaseModel):
+    settings: list[SettingEntry] = Field(default_factory=list)
+    values: dict[str, Any] = Field(default_factory=dict)
+    config_path: str = ""
+    restart_required: bool = False
+
+
+class SettingsPatchRequest(BaseModel):
+    values: dict[str, Any]
+
+
+class AuthCheckResponse(BaseModel):
+    authenticated: Literal[True] = True
+    auth_required: bool = False
+
+
+class ServerInfoResponse(BaseModel):
+    version: str
+    protocol_version: int = PROTOCOL_VERSION
+    toolset: str = "auto"
+    ui_enabled: bool = True
+    web_available: bool = False
+    home: str = ""
+    data_dir: str = ""
+    inbox_dir: str = ""
+    artifacts_dir: str = ""
+    engines_dir: str = ""
+    default_engine: str = ""
+    default_asr_engine: str = ""
+    default_voice_id: str = ""
+    voices_count: int = 0
+    history_count: int = 0
+    captures_count: int = 0
+    limits: dict[str, Any] = Field(default_factory=dict)
+    engines: list[dict[str, Any]] = Field(default_factory=list)
+    gpu: dict[str, Any] = Field(default_factory=dict)
+    next_steps: list[str] = Field(default_factory=list)
+
+
+class DiagnosticCheck(BaseModel):
+    name: str
+    status: Literal["PASS", "INFO", "WARN", "FAIL"] = "INFO"
+    detail: str = ""
+    fix: str = ""
+
+
+class DiagnosticsResponse(BaseModel):
+    checked_at: float
+    checks: list[DiagnosticCheck] = Field(default_factory=list)
 
 
 DEFAULT_DESIGN_SAMPLE_TEXT = (
@@ -719,6 +1108,8 @@ class TranscribeResult(BaseModel):
     transcript_json_path: str | None = None
     srt_path: str | None = None
     vtt_path: str | None = None
+    capture_id: str | None = None
+    """The durable capture created for this transcription, when persistence is on."""
 
 
 # ---------------------------------------------------------------------------
@@ -845,7 +1236,9 @@ JobStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 
 class Job(BaseModel):
     job_id: str
-    kind: Literal["script", "download_model", "install_engine", "dub"]
+    kind: Literal[
+        "script", "download_model", "install_engine", "dub", "speak", "rerender"
+    ]
     status: JobStatus = "pending"
     progress: float = 0.0
     message: str = ""

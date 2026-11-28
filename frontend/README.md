@@ -1,12 +1,14 @@
 # agent-voice web UI
 
-A crafted dark studio for the local `agent-voice` daemon. It is a **static SPA** built
-for `/ui`, with no server-side rendering and no backend logic. The daemon, CLI, MCP
-server and Python package are unchanged.
+A local studio for the `agent-voice` daemon. It is a **static SPA** served at `/ui`,
+with no server-side rendering and no backend logic. The v0.7 daemon ships the built
+assets under `src/agent_voice/web/`; Node and Bun remain development-only.
 
 The current preview has working Speak, Voices, Models & Engines, Transcribe,
-Dashboard, History and Settings screens. The daemon does **not** mount `/ui` yet; see
-the serving contract in `docs/frontend/architecture.md`.
+History and Settings screens. The backend now supplies drafts, durable history and
+captures, SSE, previews and settings. The original **Graphite & Brass** visual system
+and the new information architecture are the Part 2 rewrite; see
+`docs/frontend/architecture.md` and the design-system document before changing UI.
 
 ## Requirements
 

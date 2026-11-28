@@ -18,7 +18,9 @@ from typing import Any, Literal
 from .clock import Clock, get_clock
 from .schemas import ErrorCode, ErrorResponse, Job, JobStatus
 
-JobKind = Literal["script", "download_model", "install_engine", "dub"]
+JobKind = Literal[
+    "script", "download_model", "install_engine", "dub", "speak", "rerender"
+]
 
 _INTERRUPTIBLE_STATUSES: frozenset[str] = frozenset({"pending", "running"})
 """A job in one of these states cannot survive a daemon restart: its work lived in
@@ -30,13 +32,28 @@ _RESTART_SUGGESTION = "Daemon restarted; resubmit this job"
 
 
 class JobStore:
-    def __init__(self, jobs_dir: Path, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        jobs_dir: Path,
+        clock: Clock | None = None,
+        *,
+        on_change: Any = None,
+    ) -> None:
         self.jobs_dir = Path(jobs_dir)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._clock = clock or get_clock()
         self._jobs: dict[str, Job] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
+        self.on_change = on_change
+
+    def _notify(self, job: Job) -> None:
+        if self.on_change is None:
+            return
+        try:
+            self.on_change(job)
+        except Exception:
+            pass
 
     # -- persistence ----------------------------------------------------
     def _path(self, job_id: str) -> Path:
@@ -77,6 +94,7 @@ class JobStore:
         self._jobs[job.job_id] = job
         self._cancel_events[job.job_id] = asyncio.Event()
         self._persist(job)
+        self._notify(job)
         return job
 
     def cancel_event(self, job_id: str) -> asyncio.Event:
@@ -119,6 +137,7 @@ class JobStore:
             job.error = error
         job.updated_at = self._clock.now()
         self._persist(job)
+        self._notify(job)
         return job
 
     def succeeded(self, job_id: str, result: dict[str, Any]) -> Job:

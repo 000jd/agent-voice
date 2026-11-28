@@ -194,6 +194,9 @@ async def transcribe_media(
     export_srt: bool = False,
     agent_id: str | None = None,
     already_16k: bool = False,
+    capture: bool = True,
+    capture_source: str = "path",
+    capture_title: str = "",
 ) -> TranscribeResult:
     """Transcribe one local media file on ``target``'s engine.
 
@@ -314,8 +317,9 @@ async def transcribe_media(
 
         # S6 persist. The id is derived from the request, so a retry re-uses its
         # own file rather than leaving a trail of near-identical transcripts.
+        media_sha256 = _audio_digest(audio_path)
         transcript_id = _transcript_id(
-            media_sha256=_audio_digest(audio_path),
+            media_sha256=media_sha256,
             engine_id=target.engine_id,
             model_alias=target.model_alias,
             language=language,
@@ -340,6 +344,29 @@ async def transcribe_media(
         }
         json_path.write_text(json.dumps(full, indent=2), encoding="utf-8")
         result = result.model_copy(update={"transcript_json_path": str(json_path)})
+
+        captures = getattr(ctx, "captures", None)
+        if capture and captures is not None:
+            try:
+                capture_summary = captures.save(
+                    audio_path=asr_source,
+                    media_sha256=media_sha256,
+                    transcript=result.text,
+                    language=result.language,
+                    duration_sec=result.duration_sec,
+                    segments=all_segments,
+                    engine_id=target.engine_id,
+                    model_alias=target.model_alias,
+                    source=capture_source if capture_source in {"upload", "path"} else "path",
+                    truncated=result.truncated,
+                    segments_omitted=result.segments_omitted,
+                    title=capture_title,
+                )
+                result = result.model_copy(update={"capture_id": capture_summary.id})
+            except (AgentVoiceError, OSError):
+                logger.warning(
+                    "could not persist capture for %s", Path(audio_path).name, exc_info=True
+                )
 
         if export_srt:
             cues = _cues(all_segments)

@@ -168,6 +168,25 @@ topology: the Host/Origin guard is designed for loopback, and a proxy must pass
 the correct headers, terminate auth itself, and be added to
 `AGENT_VOICE_ALLOWED_HOSTS`. Do not expose the port directly to the internet.
 
+## Uploaded media
+
+`POST /v1/voice-drafts` and `POST /v1/audio/transcriptions` accept caller media,
+so they are treated as hostile bytes. The daemon sniffs a 16 KiB header into a
+closed demuxer table, forces `-f`, and uses `-protocol_whitelist file` plus a
+server-side `-format_whitelist`; playlists, concat scripts, archives and unknown
+signatures are `415`. ffprobe/ffmpeg run with `-max_streams`, input `-t`, output
+`-fs`, `stdin=DEVNULL`, a sanitized environment, a short timeout and process-group
+TERM→KILL. Uploads are streamed into 0700/O_EXCL staging at 0600 with a counted
+byte cap. Drafts have a TTL and quota; history/capture retention never deletes an
+artifact still referenced by a live record.
+
+The import/export zip path rejects traversal, absolute/drive/backslash names,
+symlinks, encrypted members, duplicate case-folded names, excessive entries/bytes
+and extreme compression ratios.
+
+If the installed ffmpeg lacks a required whitelist option, the daemon must not
+silently fall back to auto-demuxing. Upgrade ffmpeg instead.
+
 ## Voice cloning: consent is the operator's responsibility
 
 Only clone voices you have permission to use.

@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 
 from ..pronunciations import check_pronunciation_map
-from ..schemas import AgentVoiceError, ErrorCode, SpeakRequest, SpeechRequest, SynthesisResult
+from ..schemas import (
+    AgentVoiceError,
+    ErrorCode,
+    ErrorResponse,
+    JobStartedResponse,
+    SpeakRequest,
+    SpeechRequest,
+    SynthesisResult,
+)
 from ..services.utterance_service import speak_utterance
 from .routing import ResolvedTarget, parse_model_selector, resolve_target
 
@@ -243,6 +253,9 @@ async def openai_speech(payload: SpeechRequest, request: Request):
         markup=False,
         project=None,
     )
+    from ..services.history_service import record_speak
+
+    record_speak(request.app.state.ctx, result=result, text=payload.input)
     media = {
         "wav": "audio/wav",
         "mp3": "audio/mpeg",
@@ -294,7 +307,72 @@ async def agent_speak(payload: SpeakRequest, request: Request):
         paragraph_gap_ms=payload.paragraph_gap_ms,
         project=payload.project,
     )
+    from ..services.history_service import record_speak
+
+    record_speak(request.app.state.ctx, result=result, text=payload.text, request=payload)
     return result.model_dump(mode="json")
+
+
+@router.post("/v1/agent/speak/jobs")
+async def agent_speak_job(payload: SpeakRequest, request: Request):
+    """Queue one synthesis and report progress over SSE / GET /v1/jobs."""
+    ctx = request.app.state.ctx
+    job = ctx.jobs.create("speak")
+
+    async def runner() -> None:
+        from ..services.history_service import record_failure, record_speak
+
+        ctx.jobs.mark_running(job.job_id, "generating speech")
+        try:
+            result = await run_synthesis(
+                request,
+                text=payload.text,
+                voice=payload.voice,
+                engine=payload.engine,
+                model=payload.model,
+                quality=payload.quality,
+                language=payload.language,
+                response_format=payload.format,
+                seed=payload.seed,
+                speed=payload.speed,
+                take=payload.take,
+                speaker=payload.speaker,
+                instruct=payload.instruct,
+                pronunciations=payload.pronunciations,
+                markup=payload.markup,
+                spell_identifiers=payload.spell_identifiers,
+                paragraph_gap_ms=payload.paragraph_gap_ms,
+                project=payload.project,
+            )
+            item = record_speak(ctx, result=result, text=payload.text, request=payload)
+            ctx.jobs.succeeded(
+                job.job_id,
+                {**result.model_dump(mode="json"), "history_id": item.id},
+            )
+        except AgentVoiceError as exc:
+            record_failure(
+                ctx,
+                kind="speak",
+                error=exc,
+                request=payload.model_dump(mode="json"),
+                text=payload.text,
+            )
+            ctx.jobs.failed(job.job_id, exc.to_response())
+        except asyncio.CancelledError:
+            ctx.jobs.update(job.job_id, status="cancelled")
+            raise
+        except Exception as exc:  # noqa: BLE001
+            ctx.jobs.failed(
+                job.job_id,
+                ErrorResponse(
+                    error_code=ErrorCode.INTERNAL_ERROR,
+                    message=str(exc),
+                    suggestion="Check the daemon logs for a traceback.",
+                ),
+            )
+
+    ctx.jobs.register_task(job.job_id, asyncio.create_task(runner()))
+    return JobStartedResponse(job_id=job.job_id, kind="speak").model_dump(mode="json")
 
 
 @router.post("/v1/clone")

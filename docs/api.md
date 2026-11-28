@@ -11,7 +11,7 @@
   (`agent-voice mcp`) for clients that cannot speak HTTP.
 
 The wire contract lives in `src/agent_voice/schemas.py` and is treated as frozen:
-fields are added, never silently repurposed. This document describes v0.6.0.
+fields are added, never silently repurposed. This document describes v0.7.0.
 
 Default base URL: `http://127.0.0.1:8000`. Interactive schema: `/docs`, `/redoc`
 and `/openapi.json`.
@@ -106,7 +106,11 @@ A request-body validation failure is a `422` whose `error_code` is also
 | `GET` | `/health` | Liveness, version, protocol version, `torch_loaded` (open, no auth) |
 | `POST` | `/v1/audio/speech` | OpenAI-compatible synthesis, returns audio bytes |
 | `POST` | `/v1/audio/transcriptions` | OpenAI-compatible transcription (multipart), returns JSON/text/SRT/VTT |
+| `POST` | `/v1/voice-drafts` | Upload/recorded sample → peaks, quality, suggested transcript |
+| `GET` | `/v1/voice-drafts/{draft_id}` | Read a draft; `GET …/audio` previews it |
+| `DELETE` | `/v1/voice-drafts/{draft_id}` | Delete a draft |
 | `POST` | `/v1/agent/speak` | Agent synthesis, returns `SynthesisResult` JSON |
+| `POST` | `/v1/agent/speak/jobs` | Queue synthesis, then follow `/v1/jobs` or `/v1/events` |
 | `POST` | `/v1/agent/transcribe` | Agent transcription of a confined local path, returns `TranscribeResult` |
 | `POST` | `/v1/agent/dub/prepare` | Dub stage 1: transcribe, extract bed + speaker reference |
 | `POST` | `/v1/agent/dub/render` | Dub stage 2: speak translated lines into their slots |
@@ -114,11 +118,33 @@ A request-body validation failure is a `422` whose `error_code` is also
 | `POST` | `/v1/audio/speech/pcm-stream` | Chunked 24 kHz mono int16 LE PCM |
 | `WS` | `/v1/audio/ws` | Bidirectional PCM with barge-in and `cancel` |
 | `POST` | `/v1/voices` | Clone a reference clip (`?overwrite=true` to replace) |
-| `GET` | `/v1/voices` | List registered voices |
+| `GET` | `/v1/voices` | List stored voices only (never engine checkpoints) |
+| `GET` | `/v1/voices/{voice_id}` | Voice detail and samples |
+| `PATCH` | `/v1/voices/{voice_id}` | Rename, notes, language |
 | `DELETE` | `/v1/voices/{voice_id}` | Delete a voice |
+| `POST` | `/v1/voices/{voice_id}/samples` | Add a sample; `make_primary` mirrors it to `ref.wav` |
+| `DELETE` | `/v1/voices/{voice_id}/samples/{sample_id}` | Remove a non-last sample |
+| `POST` | `/v1/voices/{voice_id}/preview` | Short cached voice preview |
 | `POST` | `/v1/voices/design` | Design a voice from a description |
 | `POST` | `/v1/clone` | Alias for `POST /v1/voices` with a free-form body |
-| `POST` | `/v1/agent/script` | Render a multi-beat script (`?async=true` → job id) |
+| `GET` | `/v1/presets` | One row per built-in preset speaker |
+| `POST` | `/v1/presets/preview` | Preview a preset speaker |
+| `GET` | `/v1/voices/{voice_id}/export` | Voice bundle `.zip` |
+| `POST` | `/v1/voices/import` | Import a hardened voice bundle |
+| `GET` | `/v1/history` | Persistent generation history (cursor/filter) |
+| `POST` | `/v1/history/{id}/rerender` | New take/seed as a job |
+| `GET` | `/v1/captures` | Persistent transcription captures |
+| `GET` | `/v1/captures/{id}/export?format=srt\|vtt\|txt\|json` | Server subtitle/transcript export |
+| `POST` | `/v1/captures/{id}/voice-draft` | Promote a capture into a clone draft |
+| `GET` | `/v1/events` | Job/history/worker SSE (bearer header via fetch) |
+| `GET` | `/v1/server_info` | Read-only REST twin of the MCP info tool |
+| `GET/PATCH` | `/v1/settings` | Redacted, whitelisted settings |
+| `GET/PUT/DELETE` | `/v1/lexicon` | Scoped pronunciation CRUD |
+| `GET/DELETE` | `/v1/cache` | Cache stats/clear |
+| `GET` | `/v1/auth/check` | Validate the browser session key |
+| `GET` | `/v1/mcp-config?client=` | Copyable MCP client snippet |
+| `GET` | `/v1/diagnostics` | Read-only runtime checks |
+| `GET` | `/v1/jobs` | List jobs (`?kind=&status=`) |
 | `GET` | `/v1/jobs/{job_id}` | Poll a job |
 | `POST` | `/v1/jobs/{job_id}/cancel` | Cancel a job |
 | `GET` | `/v1/gpu` | GPU/worker/queue state |
@@ -133,7 +159,45 @@ A request-body validation failure is a `422` whose `error_code` is also
 | `PUT` | `/v1/agents/bindings` | Set the calling agent's binding (`X-Agent-Id` required) |
 | `DELETE` | `/v1/agents/bindings` | Delete the calling agent's binding |
 | `GET` | `/audio/{artifact_id}` | Fetch an artifact (bearer-protected when a key is set) |
+| `GET` | `/ui/` | Built Studio SPA; Host/Origin guarded, API still bearer-guarded |
 | `*` | `/mcp/` | Streamable HTTP MCP (trailing slash required) |
+
+### v0.7 studio flow
+
+`POST /v1/voice-drafts` accepts any audio/video container ffmpeg can demux after
+signature sniffing and forced-demuxer validation. It returns the canonical
+duration, 240 waveform peaks, a quality report and an optional ASR transcript. The
+draft is temporary and quota-bounded. Commit it with
+`POST /v1/voices {"draft_id", "name", "consent": true, "trim": {...}}`; the
+browser never sends a server path. `POST /v1/voices/{id}/samples` adds more
+references and `make_primary` mirrors one to `ref.wav`. Current engines declare
+`max_ref_samples: 1`, so extra samples are retained but not mixed.
+
+`POST /v1/agent/speak/jobs` runs the same synthesis service as
+`/v1/agent/speak` and returns a job id. `GET /v1/events` is a bearer-guarded SSE
+stream of `job`, `history` and `worker` events; its `Last-Event-ID` replay ring is
+in-memory. A browser cannot use `EventSource` with an Authorization header, so the
+Studio uses authenticated `fetch` streaming. Never put the token in the URL.
+
+`GET /v1/voices` returns stored voices with `kind`, `language`, sample count and
+installed-engine support. Presets are a separate flattened list at
+`GET /v1/presets`; the two lists are not engine/model checkpoints.
+
+`GET /v1/voices/{id}/export` produces a zip containing `manifest.json`, the primary
+`ref.wav`, `samples/*.wav` and the voice lexicon. Import validates traversal,
+symlinks, duplicate names, entry counts and decompressed bytes before creating a
+voice.
+
+`GET /v1/settings` returns typed, redacted entries. Editable keys are defaults,
+device preferences, limits and the UI toggle. The API key, bind address, allowed
+hosts, path confinement, mutation/approval and paths are read-only over REST. A
+write preserves comments, leaves `.env.bak`, uses mode 0600 and returns
+`restart_required: true`.
+
+`GET /v1/server_info` exposes the exact display paths and counts the Studio needs.
+`GET /v1/diagnostics` is read-only and cached; it never loads a model. `/ui` serves
+the packaged SPA with a strict CSP; missing `_app` assets are genuine 404s, while
+deep links return `200.html`.
 
 ### `GET /health`
 

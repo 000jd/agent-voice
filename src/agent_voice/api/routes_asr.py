@@ -20,13 +20,14 @@ only the HTTP transport: parse, confine, delegate.
 from __future__ import annotations
 
 import asyncio
-import uuid
-from contextlib import suppress
+import shutil
+import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 
+from ..ingest import persist_upload
 from ..schemas import (
     AgentVoiceError,
     DubPrepareRequest,
@@ -43,9 +44,6 @@ router = APIRouter(tags=["asr"])
 
 TRANSCRIPTION_FORMATS = ("json", "text", "srt", "vtt", "verbose_json")
 """What ``response_format`` accepts, in the OpenAI order plus ``verbose_json``."""
-
-UPLOAD_CHUNK_BYTES = 1 << 20
-"""Read the upload 1 MB at a time: a two-hour video must never sit in RAM twice."""
 
 SUBTITLE_MEDIA_TYPES = {
     "srt": "application/x-subrip",
@@ -91,29 +89,6 @@ def _hotwords_from_prompt(prompt: str | None, cap: int) -> list[str] | None:
     return usable[:cap] or None
 
 
-def _staged_upload_path(ctx, filename: str | None) -> Path:
-    """Pick the inbox name for a staged upload.
-
-    Only the suffix is taken from the client's filename: everything else is
-    generated, so a hostile ``../../cron.d/x`` cannot choose where the bytes land.
-    """
-    suffix = Path(filename or "").suffix or ".wav"
-    if len(suffix) > 8:
-        raise AgentVoiceError(
-            ErrorCode.BAD_REQUEST,
-            f"upload filename has an unusable extension: {suffix!r}",
-            "Send a file named like `audio.wav` or `clip.mp4`: an extension of up to "
-            "8 characters. The rest of the name is generated, never taken from you.",
-        )
-    return ctx.settings.inbox_dir / f"upload-{uuid.uuid4().hex[:8]}{suffix}"
-
-
-async def _persist_upload(file: UploadFile, destination: Path) -> None:
-    """Stream the upload to ``destination`` one chunk at a time."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("wb") as handle:
-        while chunk := await file.read(UPLOAD_CHUNK_BYTES):
-            handle.write(chunk)
 
 
 @router.post("/v1/audio/transcriptions")
@@ -145,9 +120,10 @@ async def transcriptions(
 
     ctx = request.app.state.ctx
     stages_subtitles = response_format in SUBTITLE_MEDIA_TYPES
-    destination = _staged_upload_path(ctx, file.filename)
+    stage = Path(tempfile.mkdtemp(dir=str(ctx.settings.data_dir), prefix=".upload-"))
+    destination = stage / "upload.bin"
     try:
-        await _persist_upload(file, destination)
+        await persist_upload(file, destination, max_bytes=ctx.settings.ingest_max_bytes)
         target = resolve_asr_target(
             settings=ctx.settings,
             registry=ctx.registry,
@@ -166,12 +142,16 @@ async def transcriptions(
             project=None,
             export_srt=stages_subtitles,
             agent_id=request.headers.get("x-agent-id"),
+            capture=True,
+            capture_source="upload",
+            capture_title="Uploaded audio",
         )
     finally:
-        # An upload is a transport detail, not an artifact: leaving multi-GB
-        # videos in the inbox would fill the disk one retry at a time.
-        with suppress(OSError):
-            destination.unlink()
+        shutil.rmtree(stage, ignore_errors=True)
+
+    from ..services.history_service import record_transcribe
+
+    record_transcribe(ctx, result=result)
 
     if response_format == "text":
         return PlainTextResponse(result.text)
@@ -194,6 +174,7 @@ async def transcriptions(
         "segments": [segment.model_dump(mode="json") for segment in result.segments],
         "segments_count": result.segments_count,
         "transcript_json_path": result.transcript_json_path,
+        "capture_id": result.capture_id,
     }
 
 
@@ -224,7 +205,13 @@ async def agent_transcribe(payload: TranscribeRequest, request: Request):
         project=payload.project,
         export_srt=payload.export_srt,
         agent_id=request.headers.get("x-agent-id"),
+        capture=True,
+        capture_source="path",
+        capture_title=audio_path.stem[:100],
     )
+    from ..services.history_service import record_transcribe
+
+    record_transcribe(ctx, result=result)
     return result.model_dump(mode="json")
 
 

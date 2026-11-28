@@ -30,14 +30,36 @@ TARGET_LUFS = -16.0
 
 
 def _run(argv: list[str], *, timeout: float = 120.0) -> subprocess.CompletedProcess[bytes]:
-    """Run an external tool with an argv list. Never a shell string."""
-    return subprocess.run(
-        argv,
-        capture_output=True,
-        check=False,
-        timeout=timeout,
-        shell=False,
-    )
+    """Run an external tool with an argv list. Never a shell string.
+
+    stdin is closed and the child is its own session so a malformed input cannot
+    consume the daemon's stdin or leave an orphan. The ingest module owns the
+    stricter untrusted-input path; this helper covers daemon-owned conversions.
+    """
+    import os
+
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    try:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AgentVoiceError(
+            ErrorCode.TIMEOUT,
+            f"{Path(argv[0]).name} exceeded {timeout:.0f}s",
+            "Use a shorter or simpler file; the daemon enforces a hard timeout.",
+        ) from exc
 
 
 _BANNER_PREFIXES = (
@@ -143,13 +165,20 @@ def canonicalise_ref_audio(
         filters.append("silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.1")
         filters.append("areverse")
 
+    from .ingest import input_options, sniff_demuxer
+
+    demuxer = sniff_demuxer(source)
     result = _run(
         [
             "ffmpeg",
             "-nostdin",
             "-y",
+            *input_options(demuxer, 60.0),
             "-i",
             str(source),
+            "-vn",
+            "-sn",
+            "-dn",
             "-ac",
             "1",
             "-ar",
@@ -158,8 +187,11 @@ def canonicalise_ref_audio(
             "s16",
             "-af",
             ",".join(filters),
+            "-fs",
+            str(256 * 1024**2),
             str(destination),
-        ]
+        ],
+        timeout=120.0,
     )
     if result.returncode != 0:
         raise AgentVoiceError(
@@ -614,66 +646,24 @@ def probe_media(path: Path) -> MediaInfo:
     the same one the clone path asks for: supply something ffmpeg understands.
     """
     _require_ffmpeg()
-    result = _run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_streams",
-            "-show_format",
-            "-of",
-            "json",
-            str(path),
-        ]
+    from .ingest import probe_untrusted
+
+    info = probe_untrusted(
+        Path(path),
+        max_seconds=24 * 3600,
+        max_streams=8,
+        max_channels=8,
+        max_sample_rate=192_000,
+        timeout=5.0,
+        require_audio=False,
     )
-    if result.returncode != 0:
-        raise AgentVoiceError(
-            ErrorCode.INVALID_REF_AUDIO,
-            f"could not probe {Path(path).name}: {_ffmpeg_error_tail(result.stderr)}",
-            "Provide a file ffmpeg can demux (mp4, mkv, mov, wav, mp3, ...). If the "
-            "file is fine, check that ffmpeg/ffprobe are installed and on PATH.",
-        )
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise AgentVoiceError(
-            ErrorCode.INVALID_REF_AUDIO,
-            f"could not parse ffprobe output for {Path(path).name}: {exc}",
-            "Provide a file ffmpeg can demux; a truncated or non-media file is the "
-            "usual cause.",
-        ) from exc
-
-    streams = payload.get("streams") or []
-    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
-
-    duration = 0.0
-    try:
-        duration = float((payload.get("format") or {}).get("duration") or 0.0)
-    except (TypeError, ValueError):
-        duration = 0.0
-    if duration <= 0:
-        # Some containers carry the duration only on the stream (a raw segment, an
-        # mpeg-ts off an encoder). The longest stream is the honest answer.
-        for stream in streams:
-            try:
-                duration = max(duration, float(stream.get("duration") or 0.0))
-            except (TypeError, ValueError):
-                continue
-
-    def _int(value: object) -> int:
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
-
     return MediaInfo(
         path=Path(path),
-        duration_sec=duration,
-        has_audio=audio is not None,
-        has_video=video is not None,
-        sample_rate=_int((audio or {}).get("sample_rate")),
-        channels=_int((audio or {}).get("channels")),
+        duration_sec=info.duration_sec,
+        has_audio=info.has_audio,
+        has_video=info.has_video,
+        sample_rate=info.sample_rate,
+        channels=info.channels,
     )
 
 
@@ -689,21 +679,31 @@ def extract_asr_wav(source: Path, destination: Path) -> float:
     Returns the extracted duration in seconds.
     """
     _require_ffmpeg()
+    from .ingest import input_options, sniff_demuxer
+
     destination.parent.mkdir(parents=True, exist_ok=True)
+    demuxer = sniff_demuxer(source)
     result = _run(
         [
             "ffmpeg",
             "-nostdin",
             "-y",
+            *input_options(demuxer, 3600.0),
             "-i",
             str(source),
+            "-map",
+            "0:a:0",
             "-vn",
+            "-sn",
+            "-dn",
             "-ac",
             "1",
             "-ar",
             "16000",
             "-sample_fmt",
             "s16",
+            "-fs",
+            str(256 * 1024**2),
             str(destination),
         ],
         timeout=600.0,
@@ -727,21 +727,31 @@ def extract_bed(source: Path, destination: Path) -> float:
     decision would be made as a side effect of the filter graph.
     """
     _require_ffmpeg()
+    from .ingest import input_options, sniff_demuxer
+
     destination.parent.mkdir(parents=True, exist_ok=True)
+    demuxer = sniff_demuxer(source)
     result = _run(
         [
             "ffmpeg",
             "-nostdin",
             "-y",
+            *input_options(demuxer, 3600.0),
             "-i",
             str(source),
+            "-map",
+            "0:a:0",
             "-vn",
+            "-sn",
+            "-dn",
             "-ac",
             "2",
             "-ar",
             str(SAMPLE_RATE),
             "-sample_fmt",
             "s16",
+            "-fs",
+            str(256 * 1024**2),
             str(destination),
         ],
         timeout=600.0,
@@ -775,18 +785,29 @@ def slice_clip(
     final reference format.
     """
     _require_ffmpeg()
+    from .ingest import input_options, sniff_demuxer
+
     destination.parent.mkdir(parents=True, exist_ok=True)
+    demuxer = sniff_demuxer(source)
     result = _run(
         [
             "ffmpeg",
             "-nostdin",
             "-y",
+            *input_options(demuxer, max(0.0, start_sec) + max(0.0, duration_sec)),
             "-ss",
             f"{max(0.0, start_sec):.3f}",
             "-t",
             f"{max(0.0, duration_sec):.3f}",
             "-i",
             str(source),
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-fs",
+            str(256 * 1024**2),
             str(destination),
         ],
         timeout=600.0,
@@ -1057,7 +1078,7 @@ def _escape_filter_path(path: Path) -> str:
     backslash must be escaped first so the escapes added below survive.
     """
     text = str(Path(path).expanduser().resolve())
-    for char in ("\\", ":", "'", ",", "[", "]"):
+    for char in ("\\", ":", "'", ",", ";", "[", "]", "\n", "\r"):
         text = text.replace(char, "\\" + char)
     return text
 

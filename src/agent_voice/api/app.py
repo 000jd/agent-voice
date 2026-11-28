@@ -40,8 +40,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .. import __version__
 from ..bindings import BindingStore
 from ..cache import SynthesisCache
+from ..capture_store import CaptureStore
 from ..config import Settings, get_settings
 from ..engine_registry import EngineRegistry
+from ..event_bus import EventBus
+from ..history_store import HistoryStore
 from ..job_store import JobStore
 from ..pronunciations import PronunciationStore, ScopedLexicon
 from ..schemas import (
@@ -51,6 +54,7 @@ from ..schemas import (
     ErrorResponse,
 )
 from ..security import is_loopback_client
+from ..voice_drafts import VoiceDraftStore
 from ..voice_store import VoiceStore
 from ..worker_manager import WorkerManager
 from .guard import (
@@ -118,7 +122,27 @@ class AppContext:
             settings.voices_dir,
             global_path=settings.pronunciations_path,
         )
-        self.jobs = JobStore(settings.jobs_dir)
+        self.events = EventBus()
+        self.drafts = VoiceDraftStore(
+            settings.drafts_dir,
+            ttl_seconds=settings.voice_draft_ttl_seconds,
+            max_count=settings.voice_draft_max_count,
+            max_bytes=settings.voice_draft_max_bytes,
+            quota_bytes=settings.voice_draft_quota_bytes,
+        )
+        self.history = HistoryStore(settings.history_dir, max_items=settings.history_max_items)
+        self.captures = CaptureStore(
+            settings.captures_dir,
+            max_items=settings.capture_max_items,
+            max_total_bytes=settings.capture_max_total_bytes,
+            max_transcript_chars=settings.capture_max_transcript_chars,
+        )
+        self.jobs = JobStore(
+            settings.jobs_dir,
+            on_change=lambda job: self.events.publish(
+                "job", {"job": job.model_dump(mode="json")}
+            ),
+        )
         self.workers = WorkerManager(
             settings=settings,
             registry=self.registry,
@@ -223,6 +247,9 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
             logger.info("reconciled %d interrupted job(s) to DAEMON_RESTARTED", reconciled)
         if pruned:
             logger.info("pruned %d stale job record(s)", pruned)
+        ctx.drafts.prune()
+        ctx.captures.prune()
+        ctx.history.prune()
         ctx.workers.on_reaper_tick = ctx.jobs.prune
         try:
             yield
@@ -253,6 +280,12 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
     app.state.ctx = ctx
 
     allowed_hosts = allowed_host_names(settings)
+
+    from .body_limit import RequestBodyLimitMiddleware
+
+    # Added before the guard so the guard remains the outermost middleware: an
+    # unauthenticated oversized request must still get 401, not a body-size hint.
+    app.add_middleware(RequestBodyLimitMiddleware, max_bytes=settings.ingest_max_bytes)
 
     # One guard for HTTP *and* WebSocket. It rejects a forged Host/Origin and a
     # missing credential before the WebSocket handshake is accepted, and the
@@ -329,9 +362,14 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
         routes_agent,
         routes_asr,
         routes_bindings,
+        routes_captures,
         routes_engines,
+        routes_events,
+        routes_history,
         routes_openai,
+        routes_settings,
         routes_stream,
+        routes_voice_drafts,
         routes_voices,
     )
 
@@ -340,6 +378,11 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
         routes_agent,
         routes_asr,
         routes_voices,
+        routes_voice_drafts,
+        routes_history,
+        routes_captures,
+        routes_events,
+        routes_settings,
         routes_engines,
         routes_bindings,
         routes_stream,
@@ -389,6 +432,11 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
             )
         media_type = ARTIFACT_MEDIA_TYPES.get(path.suffix, "application/octet-stream")
         return FileResponse(path, media_type=media_type)
+
+    if settings.ui_enabled:
+        from .routes_ui import register_ui
+
+        register_ui(app, settings)
 
     if mcp_app is not None:
         app.mount("/mcp", mcp_app)

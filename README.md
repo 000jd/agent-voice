@@ -2,15 +2,15 @@
 
 # agent-voice
 
-**Headless, local-first, multi-engine voice cloning, speech synthesis and transcription server for AI agents.** A static Svelte preview UI lives in [`frontend/`](frontend/); the daemon remains headless.
+**Headless, local-first, multi-engine voice cloning, speech synthesis and transcription server for AI agents.** An optional static Studio SPA ships at `/ui`; the core daemon remains headless and Node-free.
 
-[![Release](https://img.shields.io/badge/release-v0.6.0-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v0.7.0-blue)](CHANGELOG.md)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 </div>
 
-> **Status: Beta (v0.6.0).** Install with one command, then let `agent-voice setup`
+> **Status: Beta (v0.7.0).** Install with one command, then let `agent-voice setup`
 > detect the hardware. Linux + NVIDIA CUDA is verified on an RTX 4060 Ti 16 GB (driver
 > 580.178.04, torch 2.11.0+cu128); the CPU engines are verified everywhere. Apple-silicon
 > MPS, AMD ROCm and Windows are **experimental/unverified** — see the
@@ -502,16 +502,15 @@ answer `transcribe`; `device: cpu` engines skip the GPU slot entirely. See
 
 ## Web UI (preview)
 
-A static Svelte 5 + SvelteKit 3 SPA lives in [`frontend/`](frontend/). It is a REST
-client of the same daemon, built for a future `/ui` mount. The daemon, CLI and MCP
-server stay headless, and Python users never need Node or Bun to install or run
-`agent-voice`.
+The packaged Svelte 5 + SvelteKit 3 Studio lives in [`frontend/`](frontend/) and is
+served by the daemon at `/ui` from release package data. It is a REST client of the
+same daemon; Python users never need Node or Bun to install or run `agent-voice`.
+`agent-voice serve --no-ui` or `AGENT_VOICE_UI=off` disables it.
 
-The preview now has working **Speak**, **Voices**, **Models & Engines**, **Transcribe**,
-**Dashboard**, **History** and **Settings** screens, plus a global docked audio player with a
-real decoded waveform. Voice design auditions then saves a chosen take; transcription
-uploads multipart audio/video and exports SRT/VTT. The daemon does not serve `/ui` yet.
-Development only:
+The current preview has working **Speak**, **Voices**, **Models & Engines**,
+**Transcribe**, **History** and **Settings** screens, plus a docked audio player with a
+real decoded waveform. The v0.7 backend adds voice drafts, persistent history/captures,
+voice previews, SSE job progress and settings. Development only:
 
 ```bash
 cd frontend

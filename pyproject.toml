@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-voice"
-version = "0.6.0"
-description = "Headless, UI-free, multi-engine voice cloning and speech synthesis server for AI agents"
+version = "0.7.0"
+description = "Headless-first multi-engine voice cloning, speech synthesis and transcription server for AI agents, with a packaged local Studio"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = "MIT"

@@ -51,7 +51,8 @@ from .schemas import (
     SpeakRequest,
     SynthesisResult,
     TranscribeRequest,
-    VoiceListResponse,
+    VoiceMCPItem,
+    VoiceMCPListResponse,
 )
 from .security import is_loopback_client, resolve_media_path, resolve_ref_audio_path
 from .services.script_service import render_script
@@ -774,9 +775,14 @@ def build_mcp_server(ctx) -> FastMCP:
             _raise_tool_error(exc)
 
     @tool(annotations=read_only)
-    async def list_voices() -> VoiceListResponse:
+    async def list_voices() -> VoiceMCPListResponse:
         """List every registered voice with id, name, duration, source and warnings."""
-        return VoiceListResponse(voices=ctx.voices.list())
+        return VoiceMCPListResponse(
+            voices=[
+                VoiceMCPItem(**voice.model_dump(include=set(VoiceMCPItem.model_fields)))
+                for voice in ctx.voices.list()
+            ]
+        )
 
     @tool(annotations=destructive)
     async def delete_voice(voice_id: str) -> dict[str, str]:

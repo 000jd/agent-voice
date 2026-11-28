@@ -88,6 +88,8 @@ class Settings(BaseSettings):
     host: str = Field(default="127.0.0.1", alias="AGENT_VOICE_HOST")
     port: int = Field(default=8000, alias="AGENT_VOICE_PORT")
     api_key: str = Field(default="", alias="AGENT_VOICE_API_KEY")
+    ui_enabled: bool = Field(default=True, alias="AGENT_VOICE_UI")
+    """Serve the built Studio SPA at ``/ui``. ``serve --no-ui`` overrides this."""
 
     # --- Defaults -------------------------------------------------------
     default_engine: str = Field(default="mock", alias="AGENT_VOICE_DEFAULT_ENGINE")
@@ -152,6 +154,47 @@ class Settings(BaseSettings):
     """
     max_dub_segments: int = Field(default=500, ge=1, alias="MAX_DUB_SEGMENTS")
     """Cap on translated lines in one dub_render, checked before synthesis."""
+
+    # --- Ingest / drafts / durable studio ---------------------------------
+    ingest_max_bytes: int = Field(default=512 * 1024**2, ge=1024, alias="INGEST_MAX_BYTES")
+    ingest_max_channels: int = Field(default=8, ge=1, le=32, alias="INGEST_MAX_CHANNELS")
+    ingest_max_sample_rate: int = Field(
+        default=192_000, ge=8_000, le=768_000, alias="INGEST_MAX_SAMPLE_RATE"
+    )
+    ingest_max_streams: int = Field(default=8, ge=1, le=64, alias="INGEST_MAX_STREAMS")
+    ingest_max_decoded_bytes: int = Field(
+        default=256 * 1024**2, ge=1024, alias="INGEST_MAX_DECODED_BYTES"
+    )
+    ingest_probe_timeout_seconds: float = Field(
+        default=5.0, gt=0, le=120, alias="INGEST_PROBE_TIMEOUT_SECONDS"
+    )
+    ingest_concurrency: int = Field(default=2, ge=1, le=16, alias="INGEST_CONCURRENCY")
+    voice_draft_ttl_seconds: float = Field(
+        default=3600.0, ge=60, le=86400, alias="VOICE_DRAFT_TTL_SECONDS"
+    )
+    voice_draft_max_count: int = Field(
+        default=8, ge=1, le=1000, alias="VOICE_DRAFT_MAX_COUNT"
+    )
+    voice_draft_max_bytes: int = Field(
+        default=512 * 1024**2, ge=1024, alias="VOICE_DRAFT_MAX_BYTES"
+    )
+    voice_draft_quota_bytes: int = Field(
+        default=2 * 1024**3, ge=1024, alias="VOICE_DRAFT_QUOTA_BYTES"
+    )
+    voice_draft_max_duration_seconds: float = Field(
+        default=60.0, gt=0, le=600, alias="VOICE_DRAFT_MAX_DURATION_SECONDS"
+    )
+    history_max_items: int = Field(default=2000, ge=1, alias="HISTORY_MAX_ITEMS")
+    capture_max_items: int = Field(default=500, ge=1, alias="CAPTURE_MAX_ITEMS")
+    capture_max_total_bytes: int = Field(
+        default=5 * 1024**3, ge=1024, alias="CAPTURE_MAX_TOTAL_BYTES"
+    )
+    capture_max_transcript_chars: int = Field(
+        default=200_000, ge=1000, alias="CAPTURE_MAX_TRANSCRIPT_CHARS"
+    )
+    artifact_ttl_seconds: float = Field(
+        default=7 * 24 * 3600, ge=60, alias="ARTIFACT_TTL_SECONDS"
+    )
 
     # --- Streaming ------------------------------------------------------
     stream_queue_maxsize: int = Field(default=32, ge=1, alias="STREAM_QUEUE_MAXSIZE")
@@ -234,6 +277,17 @@ class Settings(BaseSettings):
         """
         if isinstance(value, str):
             return value.strip()
+        return value
+
+    @field_validator("ui_enabled", mode="before")
+    @classmethod
+    def _parse_ui_enabled(cls, value: object) -> object:
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"on", "true", "yes", "1"}:
+                return True
+            if text in {"off", "false", "no", "0"}:
+                return False
         return value
 
     @field_validator("allowed_hosts", mode="before")
@@ -337,6 +391,23 @@ class Settings(BaseSettings):
         return self.data_dir / "jobs"
 
     @property
+    def drafts_dir(self) -> Path:
+        return self.data_dir / "drafts"
+
+    @property
+    def history_dir(self) -> Path:
+        return self.data_dir / "history"
+
+    @property
+    def captures_dir(self) -> Path:
+        return self.data_dir / "captures"
+
+    @property
+    def web_dir(self) -> Path:
+        """Built SPA package data, never the ``frontend/`` source tree."""
+        return Path(__file__).resolve().parent / "web"
+
+    @property
     def dubs_dir(self) -> Path:
         """Per-dub working directories: ``<data>/dubs/<dub_id>/``.
 
@@ -417,6 +488,9 @@ class Settings(BaseSettings):
             self.inbox_dir,
             self.cache_dir,
             self.jobs_dir,
+            self.drafts_dir,
+            self.history_dir,
+            self.captures_dir,
             self.dubs_dir,
             self.artifacts_dir,
             self.pronunciations_dir,

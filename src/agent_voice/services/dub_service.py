@@ -369,6 +369,7 @@ async def prepare_dub(ctx: Any, payload: DubPrepareRequest) -> DubPrepareResult:
         hotwords=payload.hotwords,
         project=payload.project,
         already_16k=True,
+        capture=False,
     )
     segments = _full_segments(transcript.segments, transcript.transcript_json_path)
 

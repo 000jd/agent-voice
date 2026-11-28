@@ -1,8 +1,11 @@
 # Frontend architecture and `/ui` serving contract
 
-Status: **studio preview**. `frontend/` builds a crafted static SPA with working Speak,
-Voices, Models, Transcribe, Dashboard, History and Settings screens. The daemon still
-does not mount the build; no Python route, guard rule, installer or engine was changed.
+Status: **v0.7 backend wired, studio visual rewrite pending**. `frontend/` builds the
+static SPA and the daemon now serves the packaged copy at `/ui`; `AGENT_VOICE_UI` and
+`serve --no-ui` disable it. The v0.7 backend adds drafts, persistent history/captures,
+SSE, settings and previews. The original Graphite & Brass visual system and the new
+information architecture are Part 2 work; the current preview shell is not the final
+design.
 
 ## Boundaries
 
@@ -169,23 +172,15 @@ path is mandatory.
 
 ## Distribution at release time
 
-This preview keeps `frontend/build/` ignored. A tagged source clone still installs
-with `uv sync` and needs no Node.
-
-The UI-readiness release will:
-
-1. build `frontend/` in CI on a pinned Node/Bun;
-2. copy `frontend/build/` into package data under `src/agent_voice/web/` (or an
-   equivalent shipped directory) in the release commit;
-3. mount that directory with the serving contract above;
-4. verify `uv build` contains the built assets and still excludes source `frontend/`.
-
-That is a backend change and must be reviewed as one. Until then, the only supported
-way to see the UI is `bun run dev` from `frontend/`, or serving `frontend/build/`
-with a host that implements the contract.
+`frontend/build/` remains ignored. `scripts/build_web.py` builds it on pinned
+Node/Bun and copies the result to `src/agent_voice/web/` with a content manifest;
+`scripts/check_web_build.py` fails if the committed package data is stale. The daemon
+mounts that directory with the serving contract above. `uv build` includes the assets
+and excludes frontend source; a tagged clone + `uv sync` needs no Node.
 
 ## Deferred screens
 
-Not implemented: `/script`, `/lexicon`, `/dub`, `/agents`, `/diagnostics`, WebSocket
-streaming, a durable job history, microphone capture, a token-entry/login flow, and
-engine install/download mutation UI. Do not add them by inventing an endpoint.
+The v0.7 backend now supplies drafts, durable history/captures, SSE, diagnostics,
+lexicon/cache, settings and auth-check. Still deferred: a microphone capture flow,
+the token-entry UI, a real WebSocket studio stream, and any UI-only backend route.
+Do not add them by inventing an endpoint.

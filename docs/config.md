@@ -41,6 +41,7 @@ cp .env.example .env
 | `AGENT_VOICE_HOST` | `127.0.0.1` | Bind address. A non-loopback value without an API key refuses to start. IPv6 literals (`::1`) work and are bracketed in generated URLs |
 | `AGENT_VOICE_PORT` | `8000` | Bind port, and the base for every generated `download_url` |
 | `AGENT_VOICE_API_KEY` | *(empty)* | When set, `/v1/*`, `/audio/*` and `/mcp/*` require `Authorization: Bearer <key>`; `/health`, `/docs`, `/redoc` and `/openapi.json` stay open. `/audio` artifacts need the header too, so a `download_url` is not a capability. WebSockets accept the same header or `Sec-WebSocket-Protocol: bearer, <key>`. A whitespace-only value counts as unset |
+| `AGENT_VOICE_UI` | `on` | Serve the packaged Studio SPA at `/ui`. `agent-voice serve --no-ui` overrides it. `off` registers no UI route and imports no UI module. The API remains bearer-guarded; UI assets are public on the allowed loopback origin |
 
 ## Defaults
 
@@ -154,6 +155,38 @@ output rather than serving a stale file.
 The four input caps are enforced at admission — before routing, before a worker
 is spawned and before any GPU time is spent. A rejected request creates no cache
 entry and no scratch directory.
+
+## Studio ingestion and retention
+
+| Variable | Default | Effect |
+|---|---|---|
+| `INGEST_MAX_BYTES` | `536870912` | Maximum accepted upload body before parsing and while staging. Oversized is `413 MEDIA_TOO_LARGE` |
+| `INGEST_MAX_CHANNELS` | `8` | Reject a media stream above this channel count |
+| `INGEST_MAX_SAMPLE_RATE` | `192000` | Reject a stream above this rate |
+| `INGEST_MAX_STREAMS` | `8` | `-max_streams` and probe admission |
+| `INGEST_MAX_DECODED_BYTES` | `268435456` | Decoded WAV output cap; `ffmpeg -fs` plus a post-stat |
+| `INGEST_PROBE_TIMEOUT_SECONDS` | `5` | Hard ffprobe deadline |
+| `INGEST_CONCURRENCY` | `2` | Reserved for the global ingest semaphore |
+| `VOICE_DRAFT_TTL_SECONDS` | `3600` | Draft lifetime; expired drafts are pruned on startup and access |
+| `VOICE_DRAFT_MAX_COUNT` | `8` | Global live-draft count quota |
+| `VOICE_DRAFT_MAX_BYTES` | `536870912` | One draft's stored byte cap |
+| `VOICE_DRAFT_QUOTA_BYTES` | `2147483648` | Global draft storage quota |
+| `VOICE_DRAFT_MAX_DURATION_SECONDS` | `60` | Draft acceptance duration; commit still clamps 1–30 s |
+| `HISTORY_MAX_ITEMS` | `2000` | Persistent generation history retention |
+| `CAPTURE_MAX_ITEMS` | `500` | Persistent transcription capture retention |
+| `CAPTURE_MAX_TOTAL_BYTES` | `5368709120` | Capture audio/metadata budget |
+| `CAPTURE_MAX_TRANSCRIPT_CHARS` | `200000` | Inline transcript edit cap |
+| `ARTIFACT_TTL_SECONDS` | `604800` | Reserved for unreferenced-artifact pruning |
+
+Untrusted media is sniffed and forced through a closed demuxer table
+(`wav`, `flac`, `ogg`, `matroska`, `mov`, `mp3`, `aac`, `mpegts`), with
+`-protocol_whitelist file`, `-format_whitelist`, bounded probe/decode time,
+`-max_streams`, input `-t`, output `-fs`, `stdin=DEVNULL`, sanitized environment
+and process-group kill. Playlists, concat scripts, archives and unknown
+signatures are `415`. The daemon refuses to fall back to auto-demuxing.
+
+`agent-voice serve --no-ui` is the command-line override for
+`AGENT_VOICE_UI=off`; it takes effect before the app factory reads settings.
 
 ## Markup and lexicon limits
 

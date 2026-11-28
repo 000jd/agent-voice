@@ -129,9 +129,14 @@ export type DesignVoiceRequest = {
 
 export type CloneVoiceRequest = {
 	name: string;
-	ref_audio_path: string;
+	ref_audio_path?: string | null;
+	draft_id?: string | null;
+	trim?: { start_sec: number; end_sec: number } | null;
 	ref_text: string;
 	x_vector_only: boolean;
+	language: string;
+	notes: string;
+	consent: boolean;
 };
 
 export type SpeakResult = {

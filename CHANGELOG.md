@@ -7,6 +7,53 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Dates are the commit dates (`git log --format='%h %cs %s'`); short hashes are
 given for every release so a tag can be verified against the history.
 
+## [0.7.0] — 2026-11-28 — unreleased branch
+
+"Give the daemon a real studio: safe uploads, durable takes, live progress, and a
+packaged UI without making Python users install Node."
+
+### Added
+
+- **Safe media ingestion.** A new `ingest.py` sniffs a closed demuxer table, forces
+  `-f`, applies `-protocol_whitelist file` and `-format_whitelist`, bounds probe and
+  decode time, stream caps and output bytes, sanitizes the child environment, kills
+  process groups and rejects playlists/concat/archives with `415`. Existing
+  transcription and clone paths use it too. Upload bodies are capped while streaming
+  and by early Content-Length admission.
+- **Voice drafts and the clone workflow.** `POST /v1/voice-drafts` accepts browser
+  recordings and files, returns 240 waveform peaks, a quality report and an optional
+  ASR transcript; drafts are TTL- and quota-bounded. `POST /v1/voices` accepts
+  `draft_id` + trim + consent, while the original confined path route remains for
+  agents. Multi-sample voices, primary promotion, detail, preview, export/import,
+  `PATCH`, and a flattened `/v1/presets` list are included. Current engines honestly
+  declare one reference (`max_ref_samples=1`).
+- **Persistent history and captures.** Atomic per-record stores for speak, script,
+  design and transcribe history (filters, cursor, favourites, rerender) and for
+  capture audio + transcripts (inline edit, server SRT/VTT/TXT/JSON export,
+  capture→draft). History survives a daemon restart.
+- **Jobs and SSE.** `GET /v1/jobs`, `POST /v1/agent/speak/jobs`,
+  `GET /v1/events` with bounded replay/heartbeat, and a callback-driven job event
+  fan-out. Browser clients use authenticated fetch streaming, never a token URL.
+- **Studio backend surfaces.** `/v1/server_info`, whitelisted/redacted
+  `/v1/settings` (atomic `.env`, `.env.bak`, 0600), scoped `/v1/lexicon`,
+  `/v1/cache`, `/v1/auth/check`, `/v1/mcp-config`, `/v1/diagnostics`, and
+  `GET /v1/jobs`. Security settings remain read-only over REST.
+- **Packaged `/ui`.** The built SPA is committed under `src/agent_voice/web/`, served
+  with the documented `/ui` redirect/fallback rules and a strict CSP. `AGENT_VOICE_UI`
+  and `serve --no-ui` disable it without importing UI code. The wheel contains the
+  assets and no frontend source; no Node is needed at install or runtime.
+- **Research and contracts.** `docs/frontend/phase0-studio-research.md`, expanded
+  `docs/api.md`/`docs/config.md`, and this cross-platform ingest/studio test suite.
+
+### Security
+
+- Fixed the pre-v0.7 auto-demux path: crafted HLS/concat/MP4-`dref` input could read
+  local files or open a network URL. The daemon now refuses unknown signatures and
+  insists on the demuxer allowlist rather than silently falling back.
+- Archive import rejects traversal, absolute/drive/backslash names, symlinks,
+  encrypted members, duplicate case-folded names, excessive entries/bytes and extreme
+  compression ratios.
+
 ## [Unreleased]
 
 ### Added

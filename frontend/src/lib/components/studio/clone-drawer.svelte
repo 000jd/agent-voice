@@ -37,7 +37,10 @@
 				name: name.trim(),
 				ref_audio_path: path.trim(),
 				ref_text: refText.trim(),
-				x_vector_only: xVectorOnly
+				x_vector_only: xVectorOnly,
+				language: 'Auto',
+				notes: '',
+				consent: false
 			});
 			await studio.refreshVoices();
 			onSaved?.(voice.id);

@@ -85,6 +85,9 @@ def serve(
     host: str | None = typer.Option(None, help="Bind address (default 127.0.0.1)."),
     port: int | None = typer.Option(None, help="Bind port (default 8000)."),
     reload: bool = typer.Option(False, help="Auto-reload on code change (development)."),
+    no_ui: bool = typer.Option(
+        False, "--no-ui", help="Do not serve the built Studio at /ui."
+    ),
 ) -> None:
     """Run the daemon. Holds no GPU memory until a synthesis request arrives."""
     import uvicorn
@@ -118,6 +121,12 @@ def serve(
 
     pid_file = settings.data_dir / "daemon.pid"
     pid_file.write_text(str(os.getpid()), "utf-8")
+
+    if no_ui:
+        from .config import reset_settings_cache
+
+        os.environ["AGENT_VOICE_UI"] = "off"
+        reset_settings_cache()
 
     uvicorn.run(
         "agent_voice.api.app:create_app",

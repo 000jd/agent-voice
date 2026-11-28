@@ -42,6 +42,14 @@ async def agent_script(
 
     if not (async_ or legacy_async):
         result = await render_script(ctx, payload, agent_id=agent_id)
+        from ..services.history_service import record_script
+
+        record_script(
+            ctx,
+            result=result,
+            beats=[beat.model_dump(mode="json") for beat in payload.beats],
+            request=payload,
+        )
         return result.model_dump(mode="json")
 
     job = ctx.jobs.create("script")
@@ -55,7 +63,17 @@ async def agent_script(
         ctx.jobs.mark_running(job.job_id)
         try:
             result = await render_script(ctx, payload, agent_id=agent_id, on_beat=on_beat)
-            ctx.jobs.succeeded(job.job_id, result.model_dump(mode="json"))
+            from ..services.history_service import record_script
+
+            item = record_script(
+                ctx,
+                result=result,
+                beats=[beat.model_dump(mode="json") for beat in payload.beats],
+                request=payload,
+            )
+            ctx.jobs.succeeded(
+                job.job_id, {**result.model_dump(mode="json"), "history_id": item.id}
+            )
         except AgentVoiceError as exc:
             ctx.jobs.failed(job.job_id, exc.to_response())
         except asyncio.CancelledError:
@@ -73,6 +91,21 @@ async def agent_script(
 
     ctx.jobs.register_task(job.job_id, asyncio.create_task(runner()))
     return JobStartedResponse(job_id=job.job_id, kind="script").model_dump(mode="json")
+
+
+@router.get("/v1/jobs")
+async def list_jobs(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    kind: str | None = None,
+    status: str | None = None,
+):
+    jobs = request.app.state.ctx.jobs.list(limit=limit)
+    if kind:
+        jobs = [job for job in jobs if job.kind == kind]
+    if status:
+        jobs = [job for job in jobs if job.status == status]
+    return {"jobs": [job.model_dump(mode="json") for job in jobs]}
 
 
 @router.get("/v1/jobs/{job_id}")

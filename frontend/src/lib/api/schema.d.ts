@@ -153,6 +153,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/agent/speak/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Agent Speak Job
+         * @description Queue one synthesis and report progress over SSE / GET /v1/jobs.
+         */
+        post: operations["agent_speak_job_v1_agent_speak_jobs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/agent/transcribe": {
         parameters: {
             query?: never;
@@ -277,6 +297,128 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/auth/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Auth Check */
+        get: operations["auth_check_v1_auth_check_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/cache": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Cache Stats */
+        get: operations["cache_stats_v1_cache_get"];
+        put?: never;
+        post?: never;
+        /** Clear Cache */
+        delete: operations["clear_cache_v1_cache_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/captures": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Captures */
+        get: operations["list_captures_v1_captures_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/captures/{capture_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Capture */
+        get: operations["get_capture_v1_captures__capture_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Capture */
+        delete: operations["delete_capture_v1_captures__capture_id__delete"];
+        options?: never;
+        head?: never;
+        /** Patch Capture */
+        patch: operations["patch_capture_v1_captures__capture_id__patch"];
+        trace?: never;
+    };
+    "/v1/captures/{capture_id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Capture Audio */
+        get: operations["capture_audio_v1_captures__capture_id__audio_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/captures/{capture_id}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Export Capture */
+        get: operations["export_capture_v1_captures__capture_id__export_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/captures/{capture_id}/voice-draft": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Capture To Draft */
+        post: operations["capture_to_draft_v1_captures__capture_id__voice_draft_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/clone": {
         parameters: {
             query?: never;
@@ -291,6 +433,23 @@ export interface paths {
          * @description Alias kept for clients that POST /v1/clone rather than /v1/voices.
          */
         post: operations["clone_voice_shortcut_v1_clone_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/diagnostics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Diagnostics */
+        get: operations["diagnostics_v1_diagnostics_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -332,6 +491,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Events */
+        get: operations["events_v1_events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/gpu": {
         parameters: {
             query?: never;
@@ -341,6 +517,92 @@ export interface paths {
         };
         /** Gpu Status */
         get: operations["gpu_status_v1_gpu_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List History */
+        get: operations["list_history_v1_history_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/history/{entry_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get History */
+        get: operations["get_history_v1_history__entry_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete History */
+        delete: operations["delete_history_v1_history__entry_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/history/{entry_id}/favorite": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Favorite History */
+        post: operations["favorite_history_v1_history__entry_id__favorite_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/history/{entry_id}/rerender": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rerender History */
+        post: operations["rerender_history_v1_history__entry_id__rerender_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Jobs */
+        get: operations["list_jobs_v1_jobs_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -377,6 +639,42 @@ export interface paths {
         put?: never;
         /** Cancel Job */
         post: operations["cancel_job_v1_jobs__job_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/lexicon": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Lexicon */
+        get: operations["get_lexicon_v1_lexicon_get"];
+        /** Put Lexicon */
+        put: operations["put_lexicon_v1_lexicon_put"];
+        post?: never;
+        /** Delete Lexicon */
+        delete: operations["delete_lexicon_v1_lexicon_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/mcp-config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Mcp Config */
+        get: operations["mcp_config_v1_mcp_config_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -435,6 +733,127 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/presets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Presets */
+        get: operations["list_presets_v1_presets_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/presets/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Preview Preset */
+        post: operations["preview_preset_v1_presets_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/server_info": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Server Info */
+        get: operations["get_server_info_v1_server_info_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Settings Route */
+        get: operations["get_settings_route_v1_settings_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Patch Settings */
+        patch: operations["patch_settings_v1_settings_patch"];
+        trace?: never;
+    };
+    "/v1/voice-drafts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Upload Draft */
+        post: operations["upload_draft_v1_voice_drafts_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/voice-drafts/{draft_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Draft */
+        get: operations["get_draft_v1_voice_drafts__draft_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Draft */
+        delete: operations["delete_draft_v1_voice_drafts__draft_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/voice-drafts/{draft_id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Draft Audio */
+        get: operations["draft_audio_v1_voice_drafts__draft_id__audio_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/voices": {
         parameters: {
             query?: never;
@@ -445,15 +864,7 @@ export interface paths {
         /** List Voices */
         get: operations["list_voices_v1_voices_get"];
         put?: never;
-        /**
-         * Create Voice
-         * @description Create a voice.
-         *
-         *     ``?overwrite=true`` replaces an existing voice registered under the same name
-         *     when its reference audio differs. Without it, a retry with identical audio is
-         *     idempotent and a differing clip is rejected. ``overwrite`` is a query parameter
-         *     rather than a body field because ``CloneVoiceRequest`` is a frozen contract.
-         */
+        /** Create Voice */
         post: operations["create_voice_v1_voices_post"];
         delete?: never;
         options?: never;
@@ -468,11 +879,81 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** Get Voice */
+        get: operations["get_voice_v1_voices__voice_id__get"];
         put?: never;
         post?: never;
         /** Delete Voice */
         delete: operations["delete_voice_v1_voices__voice_id__delete"];
+        options?: never;
+        head?: never;
+        /** Patch Voice */
+        patch: operations["patch_voice_v1_voices__voice_id__patch"];
+        trace?: never;
+    };
+    "/v1/voices/{voice_id}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Export Voice */
+        get: operations["export_voice_v1_voices__voice_id__export_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/voices/{voice_id}/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Preview Voice */
+        post: operations["preview_voice_v1_voices__voice_id__preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/voices/{voice_id}/samples": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Add Sample */
+        post: operations["add_sample_v1_voices__voice_id__samples_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/voices/{voice_id}/samples/{sample_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Sample */
+        delete: operations["delete_sample_v1_voices__voice_id__samples__sample_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -487,16 +968,25 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /**
-         * Design Voice
-         * @description Design a voice from a natural-language description.
-         *
-         *     No reference clip is needed: the engine renders ``sample_text`` in the
-         *     described timbre and, with ``save_as_clone``, registers that render as a
-         *     normal voice. The preview is an ordinary artifact, so its path is playable
-         *     immediately and ``voice_id`` can be passed as ``voice`` to any later call.
-         */
+        /** Design Voice */
         post: operations["design_voice_v1_voices_design_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/voices/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import Voice */
+        post: operations["import_voice_v1_voices_import_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -507,6 +997,20 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AuthCheckResponse */
+        AuthCheckResponse: {
+            /**
+             * Auth Required
+             * @default false
+             */
+            auth_required: boolean;
+            /**
+             * Authenticated
+             * @default true
+             * @constant
+             */
+            authenticated: true;
+        };
         /** BeatSpec */
         BeatSpec: {
             /** Engine */
@@ -558,6 +1062,11 @@ export interface components {
             /** Voice */
             voice?: string | null;
         };
+        /** Body_import_voice_v1_voices_import_post */
+        Body_import_voice_v1_voices_import_post: {
+            /** File */
+            file: string;
+        };
         /** Body_transcriptions_v1_audio_transcriptions_post */
         Body_transcriptions_v1_audio_transcriptions_post: {
             /** File */
@@ -579,17 +1088,207 @@ export interface components {
             /** Temperature */
             temperature?: number | null;
         };
-        /** CloneVoiceRequest */
+        /** Body_upload_draft_v1_voice_drafts_post */
+        Body_upload_draft_v1_voice_drafts_post: {
+            /** File */
+            file: string;
+            /** Language */
+            language?: string | null;
+        };
+        /** CaptureDetail */
+        CaptureDetail: {
+            /**
+             * Audio Url
+             * @default
+             */
+            audio_url: string;
+            /** Created At */
+            created_at: number;
+            /**
+             * Duration Sec
+             * @default 0
+             */
+            duration_sec: number;
+            /**
+             * Engine Id
+             * @default
+             */
+            engine_id: string;
+            /**
+             * Full Segments Available
+             * @default false
+             */
+            full_segments_available: boolean;
+            /** Id */
+            id: string;
+            /**
+             * Language
+             * @default
+             */
+            language: string;
+            /**
+             * Model Alias
+             * @default
+             */
+            model_alias: string;
+            /** Segments */
+            segments?: components["schemas"]["TranscribeSegment"][];
+            /**
+             * Segments Count
+             * @default 0
+             */
+            segments_count: number;
+            /**
+             * Segments Omitted
+             * @default 0
+             */
+            segments_omitted: number;
+            /**
+             * Source
+             * @default upload
+             * @enum {string}
+             */
+            source: "upload" | "path";
+            /**
+             * Title
+             * @default
+             */
+            title: string;
+            /**
+             * Transcript
+             * @default
+             */
+            transcript: string;
+            /**
+             * Truncated
+             * @default false
+             */
+            truncated: boolean;
+        };
+        /** CaptureListResponse */
+        CaptureListResponse: {
+            /** Items */
+            items?: components["schemas"]["CaptureSummary"][];
+            /** Next Cursor */
+            next_cursor?: string | null;
+        };
+        /** CapturePatchRequest */
+        CapturePatchRequest: {
+            /** Title */
+            title?: string | null;
+            /** Transcript */
+            transcript?: string | null;
+        };
+        /** CaptureSummary */
+        CaptureSummary: {
+            /**
+             * Audio Url
+             * @default
+             */
+            audio_url: string;
+            /** Created At */
+            created_at: number;
+            /**
+             * Duration Sec
+             * @default 0
+             */
+            duration_sec: number;
+            /**
+             * Engine Id
+             * @default
+             */
+            engine_id: string;
+            /** Id */
+            id: string;
+            /**
+             * Language
+             * @default
+             */
+            language: string;
+            /**
+             * Model Alias
+             * @default
+             */
+            model_alias: string;
+            /**
+             * Segments Count
+             * @default 0
+             */
+            segments_count: number;
+            /**
+             * Segments Omitted
+             * @default 0
+             */
+            segments_omitted: number;
+            /**
+             * Source
+             * @default upload
+             * @enum {string}
+             */
+            source: "upload" | "path";
+            /**
+             * Title
+             * @default
+             */
+            title: string;
+            /**
+             * Transcript
+             * @default
+             */
+            transcript: string;
+            /**
+             * Truncated
+             * @default false
+             */
+            truncated: boolean;
+        };
+        /** ClippingReport */
+        ClippingReport: {
+            /**
+             * Clipped Samples
+             * @default 0
+             */
+            clipped_samples: number;
+            /**
+             * Detected
+             * @default false
+             */
+            detected: boolean;
+            /** First At Sec */
+            first_at_sec?: number | null;
+        };
+        /**
+         * CloneVoiceRequest
+         * @description Create a voice from a draft or, for agents/CLI, a confined local path.
+         */
         CloneVoiceRequest: {
+            /**
+             * Consent
+             * @default false
+             */
+            consent: boolean;
+            /** Draft Id */
+            draft_id?: string | null;
+            /**
+             * Language
+             * @default Auto
+             */
+            language: string;
             /** Name */
             name: string;
+            /**
+             * Notes
+             * @default
+             */
+            notes: string;
             /** Ref Audio Path */
-            ref_audio_path: string;
+            ref_audio_path?: string | null;
             /**
              * Ref Text
              * @default
              */
             ref_text: string;
+            trim?: components["schemas"]["DraftTrim"] | null;
             /**
              * X Vector Only
              * @default false
@@ -641,6 +1340,65 @@ export interface components {
             seed?: number | null;
             /** Take */
             take?: number | null;
+        };
+        /** DiagnosticCheck */
+        DiagnosticCheck: {
+            /**
+             * Detail
+             * @default
+             */
+            detail: string;
+            /**
+             * Fix
+             * @default
+             */
+            fix: string;
+            /** Name */
+            name: string;
+            /**
+             * Status
+             * @default INFO
+             * @enum {string}
+             */
+            status: "PASS" | "INFO" | "WARN" | "FAIL";
+        };
+        /** DiagnosticsResponse */
+        DiagnosticsResponse: {
+            /** Checked At */
+            checked_at: number;
+            /** Checks */
+            checks?: components["schemas"]["DiagnosticCheck"][];
+        };
+        /** DraftQuality */
+        DraftQuality: {
+            clipping?: components["schemas"]["ClippingReport"];
+            /** Duration Sec */
+            duration_sec: number;
+            /** Integrated Lufs */
+            integrated_lufs?: number | null;
+            /** Peak Dbfs */
+            peak_dbfs: number;
+            /** Rms Dbfs */
+            rms_dbfs: number;
+            /**
+             * Silence Ratio
+             * @default 0
+             */
+            silence_ratio: number;
+            /** True Peak Dbtp */
+            true_peak_dbtp?: number | null;
+            /** Warnings */
+            warnings?: components["schemas"]["QualityWarning"][];
+        };
+        /** DraftTrim */
+        DraftTrim: {
+            /** End Sec */
+            end_sec: number;
+            /**
+             * Start Sec
+             * @default 0
+             */
+            start_sec: number;
         };
         /** DubPrepareRequest */
         DubPrepareRequest: {
@@ -744,10 +1502,185 @@ export interface components {
             /** Voice */
             voice?: string | null;
         };
+        /**
+         * ErrorCode
+         * @description Single error taxonomy shared by IPC, REST and MCP.
+         * @enum {string}
+         */
+        ErrorCode: "WORKER_BUSY" | "WORKER_CRASHED" | "CUDA_OOM" | "JOB_CANCELLED" | "MODEL_NOT_FOUND" | "ENGINE_NOT_FOUND" | "ENGINE_NOT_INSTALLED" | "VOICE_NOT_FOUND" | "RECORD_NOT_FOUND" | "VOICE_REQUIRED" | "INVALID_REF_AUDIO" | "TEXT_TOO_LONG" | "PATH_OUTSIDE_BASE" | "AGENT_MUTATION_DISABLED" | "INVALID_SLUG" | "MANIFEST_INVALID" | "TIMEOUT" | "BACKPRESSURE" | "UNSUPPORTED_MEDIA_TYPE" | "MEDIA_TOO_LARGE" | "MEDIA_TOO_LONG" | "MEDIA_LIMIT_EXCEEDED" | "DRAFT_EXPIRED" | "QUOTA_EXCEEDED" | "INSUFFICIENT_STORAGE" | "ARCHIVE_UNSAFE" | "ARCHIVE_TOO_LARGE" | "FORBIDDEN_SETTING" | "DAEMON_RESTARTED" | "BAD_REQUEST" | "INTERNAL_ERROR";
+        /**
+         * ErrorResponse
+         * @description Canonical error body. Never a bare string, never a stack trace.
+         */
+        ErrorResponse: {
+            error_code: components["schemas"]["ErrorCode"];
+            /** Message */
+            message: string;
+            /**
+             * Suggestion
+             * @default
+             */
+            suggestion: string;
+        };
+        /** HistoryItem */
+        HistoryItem: {
+            /** Artifact Id */
+            artifact_id?: string | null;
+            /**
+             * Audio Url
+             * @default
+             */
+            audio_url: string;
+            /** Capture Id */
+            capture_id?: string | null;
+            /** Created At */
+            created_at: number;
+            /** Device */
+            device?: string | null;
+            /**
+             * Duration Sec
+             * @default 0
+             */
+            duration_sec: number;
+            /**
+             * Engine Id
+             * @default
+             */
+            engine_id: string;
+            error?: components["schemas"]["ErrorResponse"] | null;
+            /**
+             * Favorite
+             * @default false
+             */
+            favorite: boolean;
+            /**
+             * Format
+             * @default wav
+             */
+            format: string;
+            /** Id */
+            id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "speak" | "script" | "design" | "transcribe";
+            /**
+             * Model Alias
+             * @default
+             */
+            model_alias: string;
+            /**
+             * Rerenderable
+             * @default false
+             */
+            rerenderable: boolean;
+            /** Seed */
+            seed?: number | null;
+            /** Speaker */
+            speaker?: string | null;
+            /**
+             * Status
+             * @default succeeded
+             * @enum {string}
+             */
+            status: "succeeded" | "failed";
+            /** Take */
+            take?: number | null;
+            /**
+             * Text
+             * @default
+             */
+            text: string;
+            /** Voice Id */
+            voice_id?: string | null;
+            /**
+             * Voice Name
+             * @default
+             */
+            voice_name: string;
+        };
+        /** HistoryListResponse */
+        HistoryListResponse: {
+            /** Items */
+            items?: components["schemas"]["HistoryItem"][];
+            /** Next Cursor */
+            next_cursor?: string | null;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** PresetListResponse */
+        PresetListResponse: {
+            /** Presets */
+            presets: components["schemas"]["PresetVoice"][];
+        };
+        /** PresetPreviewRequest */
+        PresetPreviewRequest: {
+            /** Engine */
+            engine: string;
+            /** Model */
+            model: string;
+            /** Speaker */
+            speaker: string;
+            /**
+             * Text
+             * @default This is a preview of the selected voice.
+             */
+            text: string;
+        };
+        /** PresetVoice */
+        PresetVoice: {
+            /** Display Name */
+            display_name: string;
+            /** Engine Id */
+            engine_id: string;
+            /**
+             * Kind
+             * @default preset
+             * @constant
+             */
+            kind: "preset";
+            /** Languages */
+            languages?: string[];
+            /** Model Alias */
+            model_alias: string;
+            /** Preset Id */
+            preset_id: string;
+            /** Speaker */
+            speaker: string;
+        };
+        /** PreviewRequest */
+        PreviewRequest: {
+            /** Engine */
+            engine?: string | null;
+            /** Model */
+            model?: string | null;
+            /**
+             * Text
+             * @default This is a preview of the selected voice.
+             */
+            text: string;
+        };
+        /** QualityWarning */
+        QualityWarning: {
+            /** Code */
+            code: string;
+            /** Message */
+            message: string;
+            /**
+             * Severity
+             * @default warning
+             * @enum {string}
+             */
+            severity: "info" | "warning" | "error";
+            /**
+             * Suggestion
+             * @default
+             */
+            suggestion: string;
         };
         /** RegisterEngineRequest */
         RegisterEngineRequest: {
@@ -789,6 +1722,13 @@ export interface components {
              * @enum {string}
              */
             quality_tier: "high" | "fast";
+        };
+        /** RerenderRequest */
+        RerenderRequest: {
+            /** Seed */
+            seed?: number | null;
+            /** Take */
+            take?: number | null;
         };
         /** ScriptRequest */
         ScriptRequest: {
@@ -837,6 +1777,100 @@ export interface components {
              */
             spell_identifiers: boolean;
         };
+        /** ServerInfoResponse */
+        ServerInfoResponse: {
+            /**
+             * Artifacts Dir
+             * @default
+             */
+            artifacts_dir: string;
+            /**
+             * Captures Count
+             * @default 0
+             */
+            captures_count: number;
+            /**
+             * Data Dir
+             * @default
+             */
+            data_dir: string;
+            /**
+             * Default Asr Engine
+             * @default
+             */
+            default_asr_engine: string;
+            /**
+             * Default Engine
+             * @default
+             */
+            default_engine: string;
+            /**
+             * Default Voice Id
+             * @default
+             */
+            default_voice_id: string;
+            /** Engines */
+            engines?: {
+                [key: string]: unknown;
+            }[];
+            /**
+             * Engines Dir
+             * @default
+             */
+            engines_dir: string;
+            /** Gpu */
+            gpu?: {
+                [key: string]: unknown;
+            };
+            /**
+             * History Count
+             * @default 0
+             */
+            history_count: number;
+            /**
+             * Home
+             * @default
+             */
+            home: string;
+            /**
+             * Inbox Dir
+             * @default
+             */
+            inbox_dir: string;
+            /** Limits */
+            limits?: {
+                [key: string]: unknown;
+            };
+            /** Next Steps */
+            next_steps?: string[];
+            /**
+             * Protocol Version
+             * @default 1
+             */
+            protocol_version: number;
+            /**
+             * Toolset
+             * @default auto
+             */
+            toolset: string;
+            /**
+             * Ui Enabled
+             * @default true
+             */
+            ui_enabled: boolean;
+            /** Version */
+            version: string;
+            /**
+             * Voices Count
+             * @default 0
+             */
+            voices_count: number;
+            /**
+             * Web Available
+             * @default false
+             */
+            web_available: boolean;
+        };
         /** SetBindingRequest */
         SetBindingRequest: {
             /** Engine Id */
@@ -845,6 +1879,83 @@ export interface components {
             model_alias?: string | null;
             /** Voice Id */
             voice_id?: string | null;
+        };
+        /** SettingEntry */
+        SettingEntry: {
+            /** Choices */
+            choices?: string[];
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Editable
+             * @default false
+             */
+            editable: boolean;
+            /**
+             * Group
+             * @default General
+             */
+            group: string;
+            /** Key */
+            key: string;
+            /**
+             * Kind
+             * @default str
+             * @enum {string}
+             */
+            kind: "bool" | "int" | "float" | "str" | "select" | "readonly";
+            /**
+             * Label
+             * @default
+             */
+            label: string;
+            /**
+             * Restart Required
+             * @default true
+             */
+            restart_required: boolean;
+            /**
+             * Shadowed By Env
+             * @default false
+             */
+            shadowed_by_env: boolean;
+            /**
+             * Source
+             * @default default
+             * @enum {string}
+             */
+            source: "env" | "file" | "default" | "readonly";
+            /** Value */
+            value?: unknown;
+        };
+        /** SettingsPatchRequest */
+        SettingsPatchRequest: {
+            /** Values */
+            values: {
+                [key: string]: unknown;
+            };
+        };
+        /** SettingsResponse */
+        SettingsResponse: {
+            /**
+             * Config Path
+             * @default
+             */
+            config_path: string;
+            /**
+             * Restart Required
+             * @default false
+             */
+            restart_required: boolean;
+            /** Settings */
+            settings?: components["schemas"]["SettingEntry"][];
+            /** Values */
+            values?: {
+                [key: string]: unknown;
+            };
         };
         /** SpeakRequest */
         SpeakRequest: {
@@ -965,6 +2076,31 @@ export interface components {
              */
             word_timestamps: boolean;
         };
+        /**
+         * TranscribeSegment
+         * @description One timed span of speech, as ASR engines and dubbing both use it.
+         */
+        TranscribeSegment: {
+            /** End Sec */
+            end_sec: number;
+            /** Index */
+            index: number;
+            /** Start Sec */
+            start_sec: number;
+            /** Text */
+            text: string;
+            /** Words */
+            words?: components["schemas"]["TranscribeWord"][];
+        };
+        /** TranscribeWord */
+        TranscribeWord: {
+            /** End Sec */
+            end_sec: number;
+            /** Start Sec */
+            start_sec: number;
+            /** Word */
+            word: string;
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -977,6 +2113,218 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /** VoiceDetail */
+        VoiceDetail: {
+            /** Samples */
+            samples?: components["schemas"]["VoiceSample"][];
+            voice: components["schemas"]["VoiceSummary"];
+        };
+        /** VoiceDraft */
+        VoiceDraft: {
+            /**
+             * Channels
+             * @default 1
+             */
+            channels: number;
+            /** Created At */
+            created_at: number;
+            /** Draft Id */
+            draft_id: string;
+            /** Duration Sec */
+            duration_sec: number;
+            /** Expires At */
+            expires_at: number;
+            /** Peaks */
+            peaks?: number[];
+            quality: components["schemas"]["DraftQuality"];
+            /**
+             * Sample Rate
+             * @default 24000
+             */
+            sample_rate: number;
+            /** Suggested Transcript */
+            suggested_transcript?: string | null;
+            /** Suggested Transcript Engine */
+            suggested_transcript_engine?: string | null;
+            suggested_transcript_error?: components["schemas"]["ErrorResponse"] | null;
+            /** Suggested Transcript Language */
+            suggested_transcript_language?: string | null;
+        };
+        /** VoiceEngineSupport */
+        VoiceEngineSupport: {
+            /** Engine Id */
+            engine_id: string;
+            /**
+             * Max Ref Samples
+             * @default 1
+             */
+            max_ref_samples: number;
+            /** Model Alias */
+            model_alias: string;
+        };
+        /** VoiceListResponse */
+        VoiceListResponse: {
+            /** Voices */
+            voices: components["schemas"]["VoiceSummary"][];
+        };
+        /** VoicePatchRequest */
+        VoicePatchRequest: {
+            /** Language */
+            language?: string | null;
+            /** Name */
+            name?: string | null;
+            /** Notes */
+            notes?: string | null;
+        };
+        /** VoicePreviewResult */
+        VoicePreviewResult: {
+            /** Artifact Id */
+            artifact_id: string;
+            /**
+             * Cached
+             * @default false
+             */
+            cached: boolean;
+            /** Download Url */
+            download_url: string;
+            /** Duration Sec */
+            duration_sec: number;
+            /** Engine Id */
+            engine_id: string;
+            /** Model Alias */
+            model_alias: string;
+            /** Speaker */
+            speaker?: string | null;
+            /** Voice Id */
+            voice_id?: string | null;
+        };
+        /**
+         * VoiceSample
+         * @description One stored reference clip behind a voice.
+         *
+         *     ``ref.wav`` mirrors the primary sample because IPC v1 carries exactly one
+         *     reference path. Extra samples are retained for provenance and future engines;
+         *     they are never silently mixed into an engine that declares one reference.
+         */
+        VoiceSample: {
+            /** Created At */
+            created_at: number;
+            /** Duration Sec */
+            duration_sec: number;
+            /**
+             * Is Primary
+             * @default false
+             */
+            is_primary: boolean;
+            /**
+             * Ref Text
+             * @default
+             */
+            ref_text: string;
+            /** Sample Id */
+            sample_id: string;
+        };
+        /** VoiceSampleRequest */
+        VoiceSampleRequest: {
+            /**
+             * Consent
+             * @default false
+             */
+            consent: boolean;
+            /** Draft Id */
+            draft_id?: string | null;
+            /**
+             * Make Primary
+             * @default false
+             */
+            make_primary: boolean;
+            /** Ref Audio Path */
+            ref_audio_path?: string | null;
+            /**
+             * Ref Text
+             * @default
+             */
+            ref_text: string;
+            trim?: components["schemas"]["DraftTrim"] | null;
+            /**
+             * X Vector Only
+             * @default false
+             */
+            x_vector_only: boolean;
+        };
+        /**
+         * VoiceSummary
+         * @description A row in the voice library: a voice, never an engine checkpoint.
+         */
+        VoiceSummary: {
+            /** Consent Recorded At */
+            consent_recorded_at?: number | null;
+            /**
+             * Created At
+             * @default 0
+             */
+            created_at: number;
+            /**
+             * Design Instruct
+             * @default
+             */
+            design_instruct: string;
+            /**
+             * Duration Sec
+             * @default 0
+             */
+            duration_sec: number;
+            /** Engine Support */
+            engine_support?: components["schemas"]["VoiceEngineSupport"][];
+            /**
+             * Has Preview
+             * @default false
+             */
+            has_preview: boolean;
+            /**
+             * Kind
+             * @default cloned
+             * @enum {string}
+             */
+            kind: "cloned" | "designed";
+            /**
+             * Language
+             * @default Auto
+             */
+            language: string;
+            /** Name */
+            name: string;
+            /**
+             * Notes
+             * @default
+             */
+            notes: string;
+            /**
+             * Ref Text
+             * @default
+             */
+            ref_text: string;
+            /**
+             * Sample Count
+             * @default 1
+             */
+            sample_count: number;
+            /**
+             * Source
+             * @default cloned
+             * @enum {string}
+             */
+            source: "cloned" | "designed";
+            /** Voice Id */
+            voice_id: string;
+            /** Warnings */
+            warnings?: string[];
+            /**
+             * X Vector Only Mode
+             * @default false
+             */
+            x_vector_only_mode: boolean;
         };
     };
     responses: never;
@@ -1208,6 +2556,39 @@ export interface operations {
             };
         };
     };
+    agent_speak_job_v1_agent_speak_jobs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SpeakRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     agent_transcribe_v1_agent_transcribe_post: {
         parameters: {
             query?: never;
@@ -1400,6 +2781,291 @@ export interface operations {
             };
         };
     };
+    auth_check_v1_auth_check_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthCheckResponse"];
+                };
+            };
+        };
+    };
+    cache_stats_v1_cache_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    clear_cache_v1_cache_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    list_captures_v1_captures_get: {
+        parameters: {
+            query?: {
+                cursor?: string | null;
+                limit?: number;
+                q?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaptureListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_capture_v1_captures__capture_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                capture_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaptureDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_capture_v1_captures__capture_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                capture_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    patch_capture_v1_captures__capture_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                capture_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CapturePatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CaptureDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    capture_audio_v1_captures__capture_id__audio_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                capture_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    export_capture_v1_captures__capture_id__export_get: {
+        parameters: {
+            query?: {
+                format?: string;
+            };
+            header?: never;
+            path: {
+                capture_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    capture_to_draft_v1_captures__capture_id__voice_draft_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                capture_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     clone_voice_shortcut_v1_clone_post: {
         parameters: {
             query?: never;
@@ -1431,6 +3097,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    diagnostics_v1_diagnostics_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiagnosticsResponse"];
                 };
             };
         };
@@ -1523,6 +3209,26 @@ export interface operations {
             };
         };
     };
+    events_v1_events_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
     gpu_status_v1_gpu_get: {
         parameters: {
             query?: never;
@@ -1539,6 +3245,203 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+        };
+    };
+    list_history_v1_history_get: {
+        parameters: {
+            query?: {
+                cursor?: string | null;
+                favorite?: boolean | null;
+                kind?: string | null;
+                limit?: number;
+                q?: string | null;
+                voice?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HistoryListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_history_v1_history__entry_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HistoryItem"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_history_v1_history__entry_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    favorite_history_v1_history__entry_id__favorite_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HistoryItem"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rerender_history_v1_history__entry_id__rerender_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RerenderRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_jobs_v1_jobs_get: {
+        parameters: {
+            query?: {
+                kind?: string | null;
+                limit?: number;
+                status?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -1581,6 +3484,138 @@ export interface operations {
             path: {
                 job_id: string;
             };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_lexicon_v1_lexicon_get: {
+        parameters: {
+            query?: {
+                project?: string | null;
+                voice_id?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_lexicon_v1_lexicon_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_lexicon_v1_lexicon_delete: {
+        parameters: {
+            query: {
+                project?: string | null;
+                scope?: string;
+                voice_id?: string | null;
+                word: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mcp_config_v1_mcp_config_get: {
+        parameters: {
+            query?: {
+                client?: string;
+            };
+            header?: never;
+            path?: never;
             cookie?: never;
         };
         requestBody?: never;
@@ -1732,6 +3767,260 @@ export interface operations {
             };
         };
     };
+    list_presets_v1_presets_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PresetListResponse"];
+                };
+            };
+        };
+    };
+    preview_preset_v1_presets_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PresetPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VoicePreviewResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_server_info_v1_server_info_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServerInfoResponse"];
+                };
+            };
+        };
+    };
+    get_settings_route_v1_settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsResponse"];
+                };
+            };
+        };
+    };
+    patch_settings_v1_settings_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SettingsPatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    upload_draft_v1_voice_drafts_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_upload_draft_v1_voice_drafts_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VoiceDraft"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_draft_v1_voice_drafts__draft_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                draft_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VoiceDraft"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_draft_v1_voice_drafts__draft_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                draft_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    draft_audio_v1_voice_drafts__draft_id__audio_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                draft_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_voices_v1_voices_get: {
         parameters: {
             query?: never;
@@ -1747,7 +4036,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["VoiceListResponse"];
                 };
             };
         };
@@ -1774,6 +4063,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_voice_v1_voices__voice_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                voice_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VoiceDetail"];
                 };
             };
             /** @description Validation Error */
@@ -1818,6 +4138,174 @@ export interface operations {
             };
         };
     };
+    patch_voice_v1_voices__voice_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                voice_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VoicePatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    export_voice_v1_voices__voice_id__export_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                voice_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_voice_v1_voices__voice_id__preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                voice_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VoicePreviewResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    add_sample_v1_voices__voice_id__samples_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                voice_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VoiceSampleRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_sample_v1_voices__voice_id__samples__sample_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sample_id: string;
+                voice_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     design_voice_v1_voices_design_post: {
         parameters: {
             query?: never;
@@ -1833,6 +4321,41 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_voice_v1_voices_import_post: {
+        parameters: {
+            query?: {
+                overwrite?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_import_voice_v1_voices_import_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
                 headers: {
                     [name: string]: unknown;
                 };
