@@ -82,3 +82,22 @@ test('live Studio flow: speak, clone, transcription and library', async ({ page 
 			.first()
 	).toBeVisible();
 });
+
+test('records a microphone clip with Chromium fake media', async ({ page }) => {
+	await page.goto('/ui/voices');
+	await page.getByRole('button', { name: 'Clone voice', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Clone a voice' });
+	await dialog.getByRole('button', { name: 'Record', exact: true }).click();
+	const stop = dialog.getByRole('button', { name: 'Stop', exact: true });
+	await expect(stop).toBeVisible({ timeout: 10_000 });
+	await page.waitForTimeout(2_000);
+	await stop.click();
+	await expect(dialog.getByRole('button', { name: 'Use recording', exact: true })).toBeVisible({
+		timeout: 10_000
+	});
+	await dialog.getByRole('button', { name: 'Use recording', exact: true }).click();
+	await dialog.getByRole('button', { name: 'Check and trim', exact: true }).click();
+	await expect(dialog.locator('#clone-transcript')).toBeVisible({ timeout: 20_000 });
+	await dialog.getByRole('button', { name: 'Close dialog' }).click();
+	await expect(dialog).toBeHidden();
+});
