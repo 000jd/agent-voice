@@ -35,7 +35,7 @@ a 6–10% tint behind an active waveform/selection. Do not turn the app navy.
 - Shot 1’s content column is editorial: large 30–34px lines, dimmed inactive text, one bright
   active line, a large quiet text entry surface, and a right panel of small history cards.
 - The bottom transport in Shot 1 is a multi-track timeline; this app deliberately uses a single
-  docked player at 76px per the product brief.
+  docked player inside the content column, leaving the rail visible.
 - Typography is sans-serif, tightly set, with few weights; timestamps are the only numeric microtype.
 - No decorative illustrations, no emoji labels, no glowing orbs, no stock avatars.
 
@@ -92,16 +92,16 @@ viewport; circular controls only for play and 28–32px monogram avatars.
 
 | Element | Measure |
 |---|---|
-| Rail | 220px expanded / 64px collapsed; 1px right hairline |
-| Top bar | 52px; 1px bottom hairline |
+| Rail | 236px expanded / 64px collapsed; starts below the full-width top bar |
+| Top bar | 52px, full width: brand, Studio/Explore/System, search, primary action, connection, theme |
 | Content | 24px mobile, 32px desktop; 1440px max for prose, full width for studio |
-| Speak inspector | 300px sticky; stacks under 1280px |
+| Speak inspector | 320px sticky; stacks under 1280px |
 | Drawer | 420px desktop / full width mobile; 16px edge radius; overlay `#060606/70` |
 | Buttons | 32px default, 36px primary; 8px radius; 10–12px horizontal padding |
 | Inputs/selects | 32–36px; 8px radius; 1px hairline; 12px text |
 | Cards | 12px radius; 16px padding; 12px internal gaps; 1px hairline |
 | Voice rows | 56–64px; avatar 28px; 1px row divider; hover elevated-hover |
-| Player | 76px desktop; compact wrapped layout on mobile; 1px top hairline; fixed bottom |
+| Player | ~132px desktop, two-tier (controls + time ruler/waveform), left edge aligned to content; compact on mobile; 1px top hairline |
 | Waveform | 96 bars; 3–5px wide; 1–2px gap; 28–36px tall |
 | Focus | 1px accent border + 3px tinted ring; never removed |
 | Motion | 140–180ms ease-out; no bounce, no glow; reduced-motion respected |
@@ -121,7 +121,7 @@ viewport; circular controls only for play and 28–32px monogram avatars.
 - **Range:** 4px track, 12px cobalt thumb; value in mono tabular.
 - **Cards:** one object per card; no fake KPI grids, no sparklines. Cards are separated by value
   and hairlines, not heavy shadows.
-- **Voice library:** dense row-cards/table, not a large 3-column card grid. Avatar monogram (flat
+- **Voice library:** one bordered table surface with divided rows, not a stack of cards. Avatar monogram (flat
   deterministic cobalt/navy/steel tone), name + source chip, 12px description, duration/date,
   Use in Speak and delete. Built-in presets show engine/model/speaker; no invented duration.
 - **Speaker wall:** when a preset model has many speakers, use a compact select or a 2-column
@@ -170,13 +170,13 @@ viewport; circular controls only for play and 28–32px monogram avatars.
 
 ## Screen compositions
 
-- **Shell:** 3 zones; rail, top bar, content, player. Mobile menu replaces the rail.
-- **Speak:** composer + inspector; inspector Settings/Session tabs; primary generate in composer.
-- **Voices:** dense row-card library with search/filter, design/clone drawers; built-in presets
+- **Shell:** full-width studio bar; rail and content below; player docked in the content column. Mobile menu replaces the rail.
+- **Speak:** editorial composer + inspector; underline Setup/Session tabs; primary generate in composer; no dashboard-style page title.
+- **Voices:** one dense table panel with search/filter, design/clone drawers; built-in presets
   are a separate filter.
 - **Models:** grouped TTS/ASR engine cards; model rows with real installed/downloaded/loaded/VRAM.
 - **Transcribe:** drag-drop upload, ASR controls, transcript + timed segments, SRT/VTT downloads.
-- **Dashboard:** status strip, three quick-launch actions, recent session renders.
+- **Dashboard:** editorial “start a take” hero, a quiet system panel, and recent session renders; no KPI tile grid.
 - **History:** session-local only; no fake durable history.
 - **Settings:** read-only runtime/security settings, theme, audio-key explanation.
 

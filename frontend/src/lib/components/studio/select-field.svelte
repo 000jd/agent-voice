@@ -23,16 +23,13 @@
 </script>
 
 <div class="min-w-0">
-	<label
-		for={id}
-		class="mb-1 block text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-	>
+	<label for={id} class="mb-1.5 block text-[11px] text-text-secondary">
 		{label}
 	</label>
 	<div class="relative">
 		<select
 			{id}
-			class="h-8 w-full appearance-none rounded-lg border border-border bg-elevated px-2.5 pr-7 text-[12px] text-foreground transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+			class="h-9 w-full appearance-none rounded-lg border border-border bg-elevated px-2.5 pr-7 text-[12px] text-foreground transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
 			{value}
 			{disabled}
 			aria-describedby={hint ? `${id}-hint` : undefined}

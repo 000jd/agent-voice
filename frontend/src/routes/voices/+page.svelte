@@ -46,11 +46,10 @@
 		{ value: 'preset', label: 'Built-in presets' }
 	];
 
-	function filterCount(option: VoiceFilter): number {
-		if (option === 'all') return items.length + groups.length;
-		if (option === 'preset') return groups.length;
-		return items.filter((item) => item.kind === 'voice' && item.voice.source === option).length;
-	}
+	$effect(() => {
+		const needle = page.url.searchParams.get('q');
+		if (needle !== null) query = needle;
+	});
 
 	$effect(() => {
 		if (page.url.searchParams.get('design') !== '1') return;
@@ -80,10 +79,7 @@
 	}
 </script>
 
-<PageHeader
-	title="Voices"
-	description="Reusable cloned and designed timbres, plus the preset speakers each engine ships."
->
+<PageHeader title="Voices" description="Cloned, designed and engine-preset timbres.">
 	<Button variant="outline" size="sm" onclick={() => (cloneOpen = true)}>
 		<Plus class="size-3.5" aria-hidden="true" />
 		Clone voice
@@ -107,28 +103,25 @@
 			aria-hidden="true"
 		/>
 		<input
-			class="h-8 w-full rounded-lg border border-border bg-elevated pr-2.5 pl-8 text-[12px] text-foreground placeholder:text-text-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none"
+			class="h-9 w-full rounded-lg border border-border bg-elevated pr-2.5 pl-8 text-[12px] text-foreground placeholder:text-text-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none"
 			placeholder="Search voices"
 			bind:value={query}
-			aria-label="Search voices"
+			aria-label="Search the voice library"
 		/>
 	</div>
 	<div class="flex gap-1 overflow-x-auto pb-0.5" role="group" aria-label="Voice filters">
 		{#each filters as option (option.value)}
 			<button
 				type="button"
-				class={`inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none ${
+				class={`inline-flex h-7 shrink-0 items-center rounded-full border px-3 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none ${
 					filter === option.value
-						? 'border-primary/30 bg-primary/10 text-primary'
-						: 'border-border bg-elevated text-text-secondary hover:text-foreground'
+						? 'border-border bg-elevated-hover text-foreground'
+						: 'border-transparent text-text-secondary hover:bg-elevated-hover/50 hover:text-foreground'
 				}`}
 				aria-pressed={filter === option.value}
 				onclick={() => (filter = option.value)}
 			>
 				{option.label}
-				<span class="font-mono text-[10px] text-text-muted tabular-nums">
-					{filterCount(option.value)}
-				</span>
 			</button>
 		{/each}
 	</div>
@@ -162,46 +155,47 @@
 		</Button>
 	</EmptyState>
 {:else}
-	<div
-		class="hidden grid-cols-[minmax(0,1fr)_88px_86px_112px_auto] gap-3 px-3 pb-1 text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase lg:grid"
-	>
-		<span>Voice</span>
-		<span>Duration</span>
-		<span>Added</span>
-		<span>Detail</span>
-		<span class="text-right">Actions</span>
-	</div>
-	<div class="space-y-1.5">
-		{#each filtered as item (item.id)}
-			{#if item.kind === 'voice'}
-				<VoiceCard
-					{item}
-					onUse={() => {
-						studio.useVoice(item.voice);
+	<div class="overflow-hidden rounded-xl border border-border bg-panel">
+		<div
+			class="hidden grid-cols-[minmax(0,1fr)_90px_100px_auto] gap-3 border-b border-border px-3 py-2 text-[11px] text-text-muted lg:grid"
+		>
+			<span>Voice</span>
+			<span>Duration</span>
+			<span>Added</span>
+			<span class="text-right">Actions</span>
+		</div>
+		<div class="divide-y divide-border">
+			{#each filtered as item (item.id)}
+				{#if item.kind === 'voice'}
+					<VoiceCard
+						{item}
+						onUse={() => {
+							studio.useVoice(item.voice);
+							void goto(resolve('speak'));
+						}}
+						onDelete={() => remove(item.voice.id)}
+					/>
+				{/if}
+			{/each}
+			{#each filteredGroups as group (group.id)}
+				<PresetGroupCard
+					{group}
+					onUse={(speaker: string) => {
+						studio.usePreset({
+							kind: 'preset',
+							id: group.id,
+							name: `${speaker} — ${group.engineName}`,
+							engineId: group.engineId,
+							engineName: group.engineName,
+							modelAlias: group.modelAlias,
+							speaker,
+							supportsInstruct: group.supportsInstruct
+						});
 						void goto(resolve('speak'));
 					}}
-					onDelete={() => remove(item.voice.id)}
 				/>
-			{/if}
-		{/each}
-		{#each filteredGroups as group (group.id)}
-			<PresetGroupCard
-				{group}
-				onUse={(speaker: string) => {
-					studio.usePreset({
-						kind: 'preset',
-						id: group.id,
-						name: `${speaker} — ${group.engineName}`,
-						engineId: group.engineId,
-						engineName: group.engineName,
-						modelAlias: group.modelAlias,
-						speaker,
-						supportsInstruct: group.supportsInstruct
-					});
-					void goto(resolve('speak'));
-				}}
-			/>
-		{/each}
+			{/each}
+		</div>
 	</div>
 {/if}
 

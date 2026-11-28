@@ -90,7 +90,7 @@ bun audit --audit-level=high
   syntax. Kit 3 config lives in `vite.config.ts`.
 - Read [`docs/frontend/design-system.md`](docs/frontend/design-system.md). Dark is
   default; cobalt is action/playhead only; no glowing gradients, emoji labels, fake
-  KPIs or invented metadata. The voice library is a dense row-card list.
+  KPIs or invented metadata. The voice library is one dense table surface.
 - `bun run test:e2e` starts an isolated daemon on port 8765 with
   `AGENT_VOICE_DATA_DIR=/tmp/agent-voice-qa-data`; it never touches your real voices.
   Screenshots land in `/tmp/agent-voice-qa/`.

@@ -39,15 +39,15 @@
 	}
 </script>
 
-<div class="flex min-h-[420px] flex-col rounded-xl border border-border bg-elevated">
-	<div class="flex flex-wrap items-center gap-1 border-b border-border px-3 py-2">
-		<span class="mr-1 text-[10px] font-medium tracking-[0.08em] text-text-muted uppercase"
-			>Markup</span
-		>
+<div
+	class="studio-texture flex min-h-[560px] flex-col overflow-hidden rounded-xl border border-border bg-elevated transition-colors focus-within:border-ring/60 xl:min-h-[calc(100dvh-250px)]"
+>
+	<div class="flex flex-wrap items-center gap-1 border-b border-border/60 px-4 py-2.5">
+		<span class="mr-1 text-[11px] text-text-muted">Insert</span>
 		{#each MARKUP_ACTIONS as action (action.id)}
 			<button
 				type="button"
-				class="h-7 rounded-md border border-transparent px-2 font-mono text-[10px] text-text-secondary transition-colors hover:border-border hover:bg-panel hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none"
+				class="h-7 rounded-md px-2 font-mono text-[10px] text-text-muted transition-colors hover:bg-panel hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none"
 				title={`Insert ${action.snippet}`}
 				onclick={() => void insert(action)}
 			>
@@ -59,8 +59,8 @@
 	<textarea
 		bind:this={textarea}
 		bind:value
-		class="min-h-[280px] w-full flex-1 resize-none bg-transparent px-5 py-5 text-[20px] leading-[1.5] text-foreground placeholder:text-text-muted focus:outline-none md:text-[22px]"
-		placeholder="Write the line you want to hear. Markup is available above, or keep it plain."
+		class="min-h-[360px] w-full flex-1 resize-none bg-transparent px-6 py-6 text-[24px] leading-[1.55] tracking-[-0.01em] text-foreground placeholder:text-text-muted focus:outline-none md:text-[27px]"
+		placeholder="Write the line you want to hear."
 		spellcheck="true"
 		aria-label="Speech text"
 		maxlength={maxChars}
@@ -75,15 +75,17 @@
 		</div>
 	{/if}
 
-	<div class="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-3">
+	<div
+		class="flex flex-wrap items-center justify-between gap-3 border-t border-border/60 px-4 py-3"
+	>
 		<div class="flex flex-wrap items-center gap-3">
-			<span class="font-mono text-[10px] text-text-muted tabular-nums">
+			<span class="font-mono text-[11px] text-text-muted tabular-nums">
 				{value.length.toLocaleString()} / {maxChars.toLocaleString()}
 			</span>
-			<span class="text-[10px] text-text-muted">Ctrl/Cmd + Enter to generate</span>
+			<span class="text-[11px] text-text-muted">Ctrl/Cmd + Enter to generate</span>
 		</div>
 		<Button
-			class="h-9 px-4"
+			class="h-10 rounded-xl px-5"
 			disabled={generating || value.trim().length === 0}
 			onclick={onGenerate}
 		>

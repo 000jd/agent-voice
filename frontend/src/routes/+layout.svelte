@@ -47,4 +47,4 @@
 	<link rel="icon" href={favicon} />
 </svelte:head>
 
-<AppShell {groups} {title} {currentPath} {children} />
+<AppShell {groups} {currentPath} {children} />

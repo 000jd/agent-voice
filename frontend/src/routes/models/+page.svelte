@@ -68,7 +68,7 @@
 
 <PageHeader
 	title="Models & Engines"
-	description="What is installed, what is local, and which device each worker reports. Installing stays a CLI action."
+	description="Installed checkpoints, local weights, devices and live memory."
 >
 	<Button variant="outline" size="sm" disabled={!loaded || unloading} onclick={() => void unload()}>
 		{#if unloading}
@@ -99,7 +99,7 @@
 			aria-hidden="true"
 		/>
 		<input
-			class="h-8 w-full rounded-lg border border-border bg-elevated pr-2.5 pl-8 text-[12px] text-foreground placeholder:text-text-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none"
+			class="h-9 w-full rounded-lg border border-border bg-elevated pr-2.5 pl-8 text-[12px] text-foreground placeholder:text-text-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none"
 			placeholder="Search engines or models"
 			bind:value={query}
 			aria-label="Search engines or models"
@@ -111,8 +111,8 @@
 				type="button"
 				class={`h-7 rounded-full border px-3 text-[11px] font-medium transition-colors ${
 					filter === option.value
-						? 'border-primary/30 bg-primary/10 text-primary'
-						: 'border-border bg-elevated text-text-secondary hover:text-foreground'
+						? 'border-border bg-elevated-hover text-foreground'
+						: 'border-transparent text-text-secondary hover:bg-elevated-hover/50 hover:text-foreground'
 				}`}
 				aria-pressed={filter === option.value}
 				onclick={() => (filter = option.value as KindFilter)}
@@ -143,10 +143,8 @@
 {:else}
 	{#if tts.length > 0}
 		<section class="mb-5">
-			<h2 class="mb-2 text-[10px] font-medium tracking-[0.08em] text-text-muted uppercase">
-				TTS engines
-			</h2>
-			<div class="grid min-w-0 gap-3 xl:grid-cols-2">
+			<h2 class="mb-2 text-[11px] font-medium text-text-muted">TTS engines</h2>
+			<div class="divide-y divide-border overflow-hidden rounded-xl border border-border bg-panel">
 				{#each tts as engine (engine.id)}
 					<EngineCard {engine} />
 				{/each}
@@ -155,10 +153,8 @@
 	{/if}
 	{#if asr.length > 0}
 		<section>
-			<h2 class="mb-2 text-[10px] font-medium tracking-[0.08em] text-text-muted uppercase">
-				ASR engines
-			</h2>
-			<div class="grid min-w-0 gap-3 xl:grid-cols-2">
+			<h2 class="mb-2 text-[11px] font-medium text-text-muted">ASR engines</h2>
+			<div class="divide-y divide-border overflow-hidden rounded-xl border border-border bg-panel">
 				{#each asr as engine (engine.id)}
 					<EngineCard {engine} />
 				{/each}

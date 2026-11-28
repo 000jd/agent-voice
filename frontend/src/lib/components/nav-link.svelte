@@ -30,7 +30,7 @@
 		collapsed && 'justify-center px-0',
 		active
 			? 'bg-elevated-hover text-foreground'
-			: 'text-text-secondary hover:bg-elevated-hover/60 hover:text-foreground'
+			: 'text-text-secondary hover:bg-elevated-hover/55 hover:text-foreground'
 	)}
 >
 	{#if active && !collapsed}
@@ -40,7 +40,7 @@
 		></span>
 	{/if}
 	<Icon
-		class={cn('size-4 shrink-0', active ? 'text-primary' : 'text-text-muted')}
+		class={cn('size-4 shrink-0', active ? 'text-foreground' : 'text-text-muted')}
 		aria-hidden="true"
 	/>
 	{#if !collapsed}

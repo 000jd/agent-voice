@@ -70,30 +70,28 @@
 	);
 </script>
 
-<div class="rounded-xl border border-border bg-elevated">
-	<div class="border-b border-border p-3">
-		<SegmentedControl
-			options={[
-				{ value: 'settings', label: 'Settings' },
-				{
-					value: 'session',
-					label: `Session${studio.sessionClips.length ? ` · ${studio.sessionClips.length}` : ''}`
-				}
-			]}
-			value={tab}
-			onchange={(next: Tab) => (tab = next)}
-			label="Inspector view"
-		/>
+<div class="flex min-h-[520px] flex-col rounded-xl border border-border bg-panel">
+	<div class="flex gap-5 border-b border-border px-4">
+		{#each [{ value: 'settings' as const, label: 'Setup' }, { value: 'session' as const, label: `Session${studio.sessionClips.length ? ` · ${studio.sessionClips.length}` : ''}` }] as option (option.value)}
+			<button
+				type="button"
+				class={`-mb-px border-b py-3 text-[11px] font-medium transition-colors focus-visible:outline-none ${
+					tab === option.value
+						? 'border-primary text-foreground'
+						: 'border-transparent text-text-muted hover:text-foreground'
+				}`}
+				aria-pressed={tab === option.value}
+				onclick={() => (tab = option.value)}
+			>
+				{option.label}
+			</button>
+		{/each}
 	</div>
 
 	{#if tab === 'settings'}
-		<div class="space-y-3.5 p-3.5">
+		<div class="space-y-4 p-4">
 			<div>
-				<span
-					class="mb-1 block text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-				>
-					Voice mode
-				</span>
+				<span class="mb-1.5 block text-[11px] text-text-secondary"> Voice mode </span>
 				<SegmentedControl
 					options={modeOptions}
 					value={studio.speak.mode}
@@ -152,10 +150,7 @@
 			{#if showInstruct}
 				<div>
 					<div class="mb-1 flex items-center justify-between gap-2">
-						<label
-							for="speak-instruct"
-							class="text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-						>
+						<label for="speak-instruct" class="text-[11px] text-text-secondary">
 							{studio.speak.mode === 'voice_design' ? 'Voice description' : 'Delivery'}
 						</label>
 						<span class="font-mono text-[10px] text-text-muted tabular-nums">
@@ -175,7 +170,7 @@
 				</div>
 			{/if}
 
-			<div class="grid grid-cols-2 gap-2.5">
+			<div class="grid grid-cols-2 gap-3">
 				<SelectField
 					id="speak-language"
 					label="Language"
@@ -208,17 +203,14 @@
 				oninput={(value: number) => (studio.speak = { ...studio.speak, speed: value })}
 			/>
 
-			<div class="grid grid-cols-2 gap-2.5">
+			<div class="grid grid-cols-2 gap-3">
 				<div>
-					<label
-						for="speak-take"
-						class="mb-1 block text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-					>
+					<label for="speak-take" class="mb-1.5 block text-[11px] text-text-secondary">
 						Take
 					</label>
 					<input
 						id="speak-take"
-						class="h-8 w-full rounded-lg border border-border bg-panel px-2.5 font-mono text-[12px] text-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none"
+						class="h-9 w-full rounded-lg border border-border bg-elevated px-2.5 font-mono text-[12px] text-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none"
 						type="number"
 						min="1"
 						placeholder="1"
@@ -231,15 +223,12 @@
 					/>
 				</div>
 				<div>
-					<label
-						for="speak-seed"
-						class="mb-1 block text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-					>
+					<label for="speak-seed" class="mb-1.5 block text-[11px] text-text-secondary">
 						Seed
 					</label>
 					<input
 						id="speak-seed"
-						class="h-8 w-full rounded-lg border border-border bg-panel px-2.5 font-mono text-[12px] text-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none"
+						class="h-9 w-full rounded-lg border border-border bg-elevated px-2.5 font-mono text-[12px] text-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none"
 						type="number"
 						placeholder="auto"
 						value={studio.speak.seed ?? ''}
@@ -252,13 +241,13 @@
 				</div>
 			</div>
 
-			<details class="group rounded-lg border border-border bg-panel">
+			<details class="group border-t border-border pt-2">
 				<summary
-					class="cursor-pointer list-none px-2.5 py-2 text-[11px] font-medium text-text-secondary hover:text-foreground"
+					class="cursor-pointer list-none py-2 text-[11px] font-medium text-text-secondary hover:text-foreground"
 				>
 					Advanced
 				</summary>
-				<div class="space-y-1 border-t border-border px-2.5 py-1.5">
+				<div class="space-y-1 py-1">
 					<SwitchField
 						label="Markup"
 						description="Interpret [pause], [slow], [emphasis] and [spell]."
@@ -286,7 +275,7 @@
 			</details>
 		</div>
 	{:else}
-		<div class="px-3.5">
+		<div class="px-4">
 			<SessionList clips={studio.sessionClips} />
 		</div>
 	{/if}

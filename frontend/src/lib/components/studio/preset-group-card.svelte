@@ -24,7 +24,7 @@
 </script>
 
 <div
-	class="grid gap-3 rounded-xl border border-border bg-elevated p-3 transition-colors hover:bg-elevated-hover/45 lg:grid-cols-[minmax(0,1fr)_88px_86px_112px_auto] lg:items-center"
+	class="grid gap-3 px-3 py-3.5 transition-colors hover:bg-elevated-hover/35 lg:grid-cols-[minmax(0,1fr)_90px_100px_auto] lg:items-center"
 >
 	<div class="flex min-w-0 items-center gap-3">
 		<span
@@ -35,28 +35,23 @@
 		</span>
 		<div class="min-w-0">
 			<div class="flex min-w-0 items-center gap-1.5">
-				<p class="truncate text-[13px] font-medium text-foreground">{group.modelAlias}</p>
+				<p class="truncate text-[13px] font-medium text-foreground">{group.engineName}</p>
 				<StatusBadge tone="neutral" label="Preset" />
 			</div>
 			<p class="mt-0.5 truncate text-[11px] text-text-secondary">
-				{group.engineName} · {group.speakers.length} preset speakers
+				{group.modelAlias} · {group.speakers.length} preset speakers
 			</p>
 		</div>
 	</div>
 
 	<div class="flex items-center justify-between gap-2 lg:block">
-		<span class="text-[10px] text-text-muted uppercase lg:hidden">Duration</span>
+		<span class="text-[10px] text-text-muted lg:hidden">Duration</span>
 		<span class="font-mono text-[11px] text-text-secondary">—</span>
 	</div>
 	<div class="flex items-center justify-between gap-2 lg:block">
-		<span class="text-[10px] text-text-muted uppercase lg:hidden">Added</span>
+		<span class="text-[10px] text-text-muted lg:hidden">Added</span>
 		<span class="font-mono text-[10px] text-text-secondary">Built-in</span>
 	</div>
-	<div class="flex items-center justify-between gap-2 lg:block">
-		<span class="text-[10px] text-text-muted uppercase lg:hidden">Detail</span>
-		<span class="font-mono text-[10px] text-text-muted">{group.speakers.length}</span>
-	</div>
-
 	<div class="flex flex-wrap items-center justify-end gap-1.5">
 		<div class="relative min-w-0">
 			<select

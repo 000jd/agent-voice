@@ -62,10 +62,7 @@
 		{/if}
 
 		<div>
-			<label
-				for="clone-name"
-				class="mb-1 block text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-			>
+			<label for="clone-name" class="mb-1 block text-[11px] text-text-secondary">
 				Voice name
 			</label>
 			<input
@@ -77,10 +74,7 @@
 		</div>
 
 		<div>
-			<label
-				for="clone-path"
-				class="mb-1 block text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-			>
+			<label for="clone-path" class="mb-1 block text-[11px] text-text-secondary">
 				Reference clip path
 			</label>
 			<input
@@ -98,10 +92,7 @@
 		</div>
 
 		<div>
-			<label
-				for="clone-ref-text"
-				class="mb-1 block text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-			>
+			<label for="clone-ref-text" class="mb-1 block text-[11px] text-text-secondary">
 				Reference transcript <span class="normal-case">(optional)</span>
 			</label>
 			<textarea

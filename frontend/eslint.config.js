@@ -49,7 +49,11 @@ export default defineConfig(
 		}
 	},
 	{
-		files: ['src/lib/components/nav-link.svelte', 'src/routes/+page.svelte'],
+		files: [
+			'src/lib/components/nav-link.svelte',
+			'src/lib/components/app-shell.svelte',
+			'src/routes/+page.svelte'
+		],
 		rules: {
 			'svelte/no-navigation-without-resolve': 'off'
 		}

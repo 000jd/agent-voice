@@ -62,7 +62,7 @@ test('captures a populated studio with a real render', async ({ page, request })
 	});
 
 	await page.locator('aside').getByRole('link', { name: 'Dashboard', exact: true }).click();
-	await expect(page.getByRole('main').getByRole('heading', { name: 'Dashboard' })).toBeVisible();
+	await expect(page.getByRole('main').getByRole('heading', { name: 'Studio' })).toBeVisible();
 	await expect(
 		page
 			.getByRole('main')

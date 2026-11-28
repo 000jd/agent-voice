@@ -40,7 +40,9 @@ Read it before changing tokens, spacing or a screen.
   sparklines or invented metadata. See the design-system document for the full list.
 - Every timestamp, duration, VRAM figure, RTF, seed and character counter is tabular
   (the body already sets `font-variant-numeric: tabular-nums`; keep mono on metrics).
-- The voice library is a dense row-card/table, not a grid of oversized cards. Preset
+- The shell is a full-width studio bar with a 236/64px rail below it; the player is
+  docked in the content column, not over the rail. Dark is default.
+- The voice library is one dense table surface, not a grid of oversized cards. Preset
   speakers are grouped by engine/model; do not render one giant row per speaker.
 - Every screen has loading, empty, error and (where relevant) offline states. Do not
   leave a fake success state.

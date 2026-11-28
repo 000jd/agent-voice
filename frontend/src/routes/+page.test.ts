@@ -69,8 +69,8 @@ beforeEach(() => {
 test('renders the studio status strip and empty session state', async () => {
 	render(Page);
 	await tick();
-	expect(screen.getByRole('heading', { name: 'Dashboard' })).toBeInTheDocument();
-	expect(screen.getByText(/daemon connected/)).toBeInTheDocument();
+	expect(screen.getByRole('heading', { name: 'Studio' })).toBeInTheDocument();
+	expect(screen.getByText(/Connected/)).toBeInTheDocument();
 	expect(screen.getByText('No renders in this session yet.')).toBeInTheDocument();
 });
 

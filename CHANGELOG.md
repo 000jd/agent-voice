@@ -14,7 +14,7 @@ given for every release so a tag can be verified against the history.
 - **Frontend studio preview.** A crafted obsidian/cobalt static Svelte 5 + SvelteKit 3
   SPA in `frontend/`, built for a future `/ui` mount: `adapter-static` with `200.html`,
   `ssr = false`, `/ui` base, Tailwind CSS 4, shadcn-svelte/Bits UI, Inter/Fontsource,
-  a hand-rolled token system and a responsive three-zone shell. Working **Speak**
+  a hand-rolled token system and a responsive studio shell. Working **Speak**
   (markup composer, Clone/Preset/Design inspector, session takes), **Voices**
   (cloned/designed library, grouped engine presets, two-stage design audition/save,
   clone drawer), **Models & Engines**, **Transcribe** (multipart upload, timed
@@ -25,7 +25,7 @@ given for every release so a tag can be verified against the history.
 - **Studio design system.** `docs/frontend/design-system.md` records the exact dark and
   light surface ladders, typography/tabular-number rules, geometry, component
   restraint, accessibility and the anti-AI-slop checklist. The voice library is a
-  dense row-card/table with one grouped preset row per engine/model, not a fake KPI
+  single dense table surface with one grouped preset row per engine/model, not a fake KPI
   grid. No Dribbble assets are committed.
 - **Typed API boundary.** `scripts/export_openapi.py` writes a deterministic
   `frontend/openapi.json` from a temporary app context (`mount_mcp=False`, no workers,

@@ -12,7 +12,7 @@ const routes = [
 test('navigates every studio route from the sidebar', async ({ page }) => {
 	await page.goto('/ui/');
 	const main = page.getByRole('main');
-	await expect(main.getByRole('heading', { name: 'Dashboard', exact: true })).toBeVisible();
+	await expect(main.getByRole('heading', { name: 'Studio', exact: true })).toBeVisible();
 
 	for (const route of routes) {
 		await page.locator('aside').getByRole('link', { name: route.label, exact: true }).click();
@@ -38,16 +38,25 @@ test('shows the dashboard offline state when the daemon is unreachable', async (
 	await page.route('**/v1/engines', (route) => route.abort());
 
 	await page.goto('/ui/');
-	await expect(page.getByText(/daemon offline/i)).toBeVisible();
+	await expect(page.getByText(/daemon is not reachable|Offline/i).first()).toBeVisible();
 });
 
 test('collapses the rail and remembers it', async ({ page }) => {
 	await page.goto('/ui/');
-	const aside = page.locator('aside');
+	const aside = page.locator('aside').first();
 	await page.getByRole('button', { name: 'Collapse navigation rail' }).click();
 	await expect(aside).toHaveClass(/w-16/);
 	await page.reload();
 	await expect(aside).toHaveClass(/w-16/);
 	await page.getByRole('button', { name: 'Expand navigation rail' }).click();
-	await expect(aside).toHaveClass(/w-\[220px\]/);
+	await expect(aside).toHaveClass(/w-\[236px\]/);
+});
+
+test('global search opens the filtered voice library', async ({ page }) => {
+	await page.goto('/ui/speak');
+	const search = page.getByRole('searchbox', { name: 'Search voices' });
+	await search.fill('Kokoro');
+	await search.press('Enter');
+	await expect(page).toHaveURL(/\/ui\/voices\?q=Kokoro$/);
+	await expect(page.getByRole('main').getByText('Kokoro (82M, CPU)')).toBeVisible();
 });

@@ -53,7 +53,7 @@
 </script>
 
 <div
-	class="grid gap-3 rounded-xl border border-border bg-elevated p-3 transition-colors hover:bg-elevated-hover/45 lg:grid-cols-[minmax(0,1fr)_88px_86px_112px_auto] lg:items-center"
+	class="grid gap-3 px-3 py-3.5 transition-colors hover:bg-elevated-hover/35 lg:grid-cols-[minmax(0,1fr)_90px_100px_auto] lg:items-center"
 >
 	<div class="flex min-w-0 items-center gap-3">
 		<span
@@ -78,23 +78,16 @@
 	</div>
 
 	<div class="flex items-center justify-between gap-2 lg:block">
-		<span class="text-[10px] text-text-muted uppercase lg:hidden">Duration</span>
+		<span class="text-[10px] text-text-muted lg:hidden">Duration</span>
 		<span class="font-mono text-[11px] text-text-secondary tabular-nums">
 			{voice ? formatClock(voice.durationSec) : '—'}
 		</span>
 	</div>
 
 	<div class="flex items-center justify-between gap-2 lg:block">
-		<span class="text-[10px] text-text-muted uppercase lg:hidden">Added</span>
+		<span class="text-[10px] text-text-muted lg:hidden">Added</span>
 		<span class="font-mono text-[10px] text-text-secondary tabular-nums">
 			{voice ? formatDate(voice.createdAt) : 'Built-in'}
-		</span>
-	</div>
-
-	<div class="flex items-center justify-between gap-2 lg:block">
-		<span class="text-[10px] text-text-muted uppercase lg:hidden">Detail</span>
-		<span class="font-mono text-[10px] text-text-muted">
-			{voice ? (voice.xVectorOnly ? 'x-vector' : 'reference') : preset?.speaker}
 		</span>
 	</div>
 

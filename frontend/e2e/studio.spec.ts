@@ -29,7 +29,7 @@ function wavBuffer(seconds = 1, rate = 16000): Buffer {
 test('live studio flow', async ({ page }) => {
 	mkdirSync(out, { recursive: true });
 	await page.goto('/ui/');
-	await expect(page.getByText(/daemon connected/i)).toBeVisible();
+	await expect(page.getByText(/Connected/).first()).toBeVisible();
 
 	await page.goto('/ui/speak');
 	await page.locator('#speak-engine').selectOption('mock');

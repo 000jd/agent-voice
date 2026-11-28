@@ -224,10 +224,7 @@
 		{/if}
 
 		<div>
-			<label
-				for="design-name"
-				class="mb-1 block text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-			>
+			<label for="design-name" class="mb-1 block text-[11px] text-text-secondary">
 				Voice name
 			</label>
 			<input
@@ -240,12 +237,7 @@
 
 		<div>
 			<div class="mb-1 flex items-center justify-between gap-2">
-				<label
-					for="design-instruct"
-					class="text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-				>
-					Description
-				</label>
+				<label for="design-instruct" class="text-[11px] text-text-secondary"> Description </label>
 				<span class="font-mono text-[10px] text-text-muted tabular-nums">
 					{instruct.length} / 1000
 				</span>
@@ -260,12 +252,7 @@
 
 		<div>
 			<div class="mb-1 flex items-center justify-between gap-2">
-				<label
-					for="design-sample"
-					class="text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-				>
-					Sample text
-				</label>
+				<label for="design-sample" class="text-[11px] text-text-secondary"> Sample text </label>
 				<span class="font-mono text-[10px] text-text-muted tabular-nums">
 					{sampleText.length} / 500
 				</span>
@@ -327,9 +314,7 @@
 
 		{#if result && result.candidates.length > 0}
 			<div class="space-y-2">
-				<p class="text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase">
-					Audition takes
-				</p>
+				<p class="text-[11px] text-text-secondary">Audition takes</p>
 				{#each result.candidates as candidate (candidate.take)}
 					<div
 						class={`flex items-center gap-2 rounded-lg border p-2 ${selectedTake === candidate.take ? 'border-primary/40 bg-primary/5' : 'border-border bg-panel'}`}

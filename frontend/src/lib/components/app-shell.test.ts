@@ -17,12 +17,12 @@ const groups = NAV_GROUPS.map((group) => ({
 }));
 
 test('renders the grouped navigation and marks the active route', () => {
-	render(AppShell, { groups, title: 'Speak', currentPath: '/ui/speak', children });
+	render(AppShell, { groups, currentPath: '/ui/speak', children });
 
 	expect(screen.getByText('Shell content')).toBeInTheDocument();
 	expect(screen.getByRole('button', { name: /Switch to (light|dark) theme/ })).toBeInTheDocument();
 	expect(screen.getAllByText('Studio').length).toBeGreaterThan(0);
-	expect(screen.getByText('Library')).toBeInTheDocument();
+	expect(screen.getAllByText('Library').length).toBeGreaterThan(0);
 
 	const speakLinks = screen.getAllByRole('link', { name: 'Speak' });
 	expect(speakLinks).toHaveLength(1);

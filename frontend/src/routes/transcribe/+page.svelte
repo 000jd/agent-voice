@@ -6,7 +6,6 @@
 	import Upload from '@lucide/svelte/icons/upload';
 	import { transcribeFile, describeApiError } from '#lib/api/studio.js';
 	import type { ApiErrorPayload, TranscribeResult } from '#lib/api/types.js';
-	import EmptyState from '#lib/components/empty-state.svelte';
 	import PageHeader from '#lib/components/page-header.svelte';
 	import ErrorNotice from '#lib/components/studio/error-notice.svelte';
 	import SelectField from '#lib/components/studio/select-field.svelte';
@@ -39,7 +38,10 @@
 	const installedAsr = $derived(asrEngines(studio.engines).filter((engine) => engine.installed));
 	const engine = $derived(installedAsr.find((item) => item.id === engineId) ?? null);
 	const engineOptions = $derived(
-		installedAsr.map((item) => ({ value: item.id, label: item.displayName }))
+		installedAsr.map((item) => ({
+			value: item.id,
+			label: item.displayName.replace(/\s*\(.*$/, '')
+		}))
 	);
 	const modelOptions = $derived(
 		(engine?.models ?? []).map((model) => ({
@@ -134,7 +136,7 @@
 
 <PageHeader
 	title="Transcribe"
-	description="Upload audio or video to the local daemon. The browser gets text, timed segments and subtitle files; nothing is sent to a cloud service."
+	description="Upload audio or video. Get timed text and subtitle files from the local daemon."
 />
 
 <div class="grid items-start gap-4 xl:grid-cols-[340px_minmax(0,1fr)]">
@@ -212,10 +214,7 @@
 					onchange={(value: string) => (language = value)}
 				/>
 				<div>
-					<label
-						for="transcribe-hotwords"
-						class="mb-1 block text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase"
-					>
+					<label for="transcribe-hotwords" class="mb-1 block text-[11px] text-text-secondary">
 						Hotwords <span class="normal-case">(comma separated, max 25)</span>
 					</label>
 					<input
@@ -244,11 +243,18 @@
 
 	<div class="min-w-0">
 		{#if !result}
-			<EmptyState
-				icon={FileMusic}
-				title="No transcript yet"
-				description="Upload a clip and choose an ASR model. The result will show the full text, timed segments and subtitle exports."
-			/>
+			<div class="flex min-h-[320px] flex-col items-center justify-center px-6 text-center">
+				<span
+					class="mb-3 flex size-10 items-center justify-center rounded-lg bg-elevated text-text-muted"
+				>
+					<FileMusic class="size-5" aria-hidden="true" />
+				</span>
+				<p class="text-[13px] text-text-secondary">No transcript yet</p>
+				<p class="mt-1 max-w-sm text-[11px] leading-5 text-text-muted">
+					Drop a clip on the left. The transcript, timed segments and subtitle exports will appear
+					here.
+				</p>
+			</div>
 		{:else}
 			<div class="space-y-3">
 				<div
@@ -266,9 +272,7 @@
 
 				<section class="rounded-xl border border-border bg-elevated">
 					<header class="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-						<h2 class="text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase">
-							Transcript
-						</h2>
+						<h2 class="text-[11px] text-text-secondary">Transcript</h2>
 						<div class="flex gap-1.5">
 							<Button variant="ghost" size="xs" onclick={() => void copyText()}>
 								<Copy class="size-3" aria-hidden="true" />
@@ -285,9 +289,7 @@
 					<header
 						class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2"
 					>
-						<h2 class="text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase">
-							Timed segments
-						</h2>
+						<h2 class="text-[11px] text-text-secondary">Timed segments</h2>
 						<div class="flex gap-1.5">
 							<Button
 								variant="outline"

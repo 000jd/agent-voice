@@ -22,7 +22,7 @@
 
 <div>
 	<div class="mb-1 flex items-center justify-between gap-2">
-		<label for={id} class="text-[10px] font-medium tracking-[0.06em] text-text-muted uppercase">
+		<label for={id} class="text-[11px] text-text-secondary">
 			{label}
 		</label>
 		<span class="font-mono text-[10px] text-text-secondary tabular-nums">{display}</span>

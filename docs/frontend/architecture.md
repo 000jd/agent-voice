@@ -114,13 +114,15 @@ proxy get the rewrite, and a foreign direct request is still 403.
 
 ## Studio screens
 
-- **Shell:** 220/64px grouped rail, 52px top bar, live connection badge, GPU/VRAM pill
-  with unload, and a fixed docked player. Mobile uses a menu panel instead of the rail.
-- **Speak:** selection-aware markup composer, capability-aware Clone/Preset/Design
-  inspector, session list. `Ctrl/Cmd+Enter` generates; successful renders enter the
+- **Shell:** full-width 52px studio bar (brand, Studio/Explore/System, voice search,
+  primary action), 236/64px grouped rail below it, live connection badge and GPU/VRAM
+  pill with unload. The two-tier player is docked inside the content column so the rail
+  remains visible; mobile uses a menu panel instead of the rail.
+- **Speak:** large editorial markup composer, capability-aware Clone/Preset/Design
+  inspector with underline Setup/Session tabs, session list. `Ctrl/Cmd+Enter` generates; successful renders enter the
   global session store and the player.
-- **Voices:** cloned/designed voices plus preset groups (one row per engine/model, with
-  a speaker selector). Design is two-stage: audition 2–3 takes, then re-render the
+- **Voices:** one table surface. Cloned/designed voices plus preset groups (one row per
+  engine/model, with a speaker selector). Design is two-stage: audition 2–3 takes, then re-render the
   chosen take with `take`/`seed` and `save_as_clone`. Clone accepts a confined inbox
   path; the exact path is not exposed by REST, so the drawer shows the convention and
   the `agent-voice doctor` hint.
