@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
+from .ids import validate_hex_id
 from .schemas import AgentVoiceError, ErrorCode, HistoryItem
 
 HistoryKind = Literal["speak", "script", "design", "transcribe"]
@@ -27,12 +28,11 @@ class HistoryStore:
         self.max_items = max_items
 
     def _path(self, entry_id: str) -> Path:
-        if len(entry_id) != 16 or any(c not in "0123456789abcdef" for c in entry_id):
-            raise AgentVoiceError(
-                ErrorCode.BAD_REQUEST,
-                f"invalid history id: {entry_id}",
-                "Use the id returned by GET /v1/history.",
-            )
+        validate_hex_id(
+            entry_id,
+            noun="history id",
+            hint="Use the id returned by GET /v1/history.",
+        )
         return self.root / f"{entry_id}.json"
 
     def _read(self, path: Path) -> tuple[HistoryItem, dict[str, Any]] | None:
@@ -198,6 +198,14 @@ class HistoryStore:
         page = items[:limit]
         next_cursor = page[-1].id if len(items) > limit and page else None
         return page, next_cursor
+
+    def artifact_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for path in self.root.glob("*.json"):
+            found = self._read(path)
+            if found is not None and found[0].artifact_id:
+                ids.add(found[0].artifact_id)
+        return ids
 
     def count(self) -> int:
         return sum(1 for _ in self.root.glob("*.json"))

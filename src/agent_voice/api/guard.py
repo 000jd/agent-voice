@@ -29,12 +29,14 @@ production default should describe production, and a test harness can add it
 through the same setting every other extra host uses.
 """
 
-PROTECTED_PREFIXES = ("/v1", "/audio")
+PROTECTED_PREFIXES = ("/v1", "/audio", "/docs", "/redoc", "/openapi")
 """/audio is protected too: an artifact holds the user's own speech, or a clone of
-their voice, so it is no less sensitive than the request that produced it."""
+their voice, so it is no less sensitive than the request that produced it. The
+generated API docs describe every route and are protected when a key is set; the
+UI does not need them."""
 
 AUTH_EXEMPT_PATHS = frozenset({"/health"})
-AUTH_EXEMPT_PREFIXES = ("/docs", "/openapi")
+AUTH_EXEMPT_PREFIXES: tuple[str, ...] = ()
 
 WS_POLICY_VIOLATION = 1008
 """RFC 6455 policy violation: the handshake was refused before accept."""

@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
+from .ids import validate_hex_id
 from .schemas import (
     AgentVoiceError,
     CaptureDetail,
@@ -36,12 +37,11 @@ class CaptureStore:
         self.max_transcript_chars = max_transcript_chars
 
     def _dir(self, capture_id: str) -> Path:
-        if len(capture_id) != 16 or any(c not in "0123456789abcdef" for c in capture_id):
-            raise AgentVoiceError(
-                ErrorCode.BAD_REQUEST,
-                f"invalid capture id: {capture_id}",
-                "Use the capture_id returned by a transcription.",
-            )
+        validate_hex_id(
+            capture_id,
+            noun="capture id",
+            hint="Use the capture_id returned by a transcription.",
+        )
         return self.root / capture_id
 
     def audio_path(self, capture_id: str) -> Path:

@@ -40,7 +40,7 @@ cp .env.example .env
 |---|---|---|
 | `AGENT_VOICE_HOST` | `127.0.0.1` | Bind address. A non-loopback value without an API key refuses to start. IPv6 literals (`::1`) work and are bracketed in generated URLs |
 | `AGENT_VOICE_PORT` | `8000` | Bind port, and the base for every generated `download_url` |
-| `AGENT_VOICE_API_KEY` | *(empty)* | When set, `/v1/*`, `/audio/*` and `/mcp/*` require `Authorization: Bearer <key>`; `/health`, `/docs`, `/redoc` and `/openapi.json` stay open. `/audio` artifacts need the header too, so a `download_url` is not a capability. WebSockets accept the same header or `Sec-WebSocket-Protocol: bearer, <key>`. A whitespace-only value counts as unset |
+| `AGENT_VOICE_API_KEY` | *(empty)* | When set, `/v1/*`, `/audio/*`, `/mcp/*`, `/docs`, `/redoc` and `/openapi*` require `Authorization: Bearer <key>`; `/health` stays open. `/audio` artifacts need the header too, so a `download_url` is not a capability. WebSockets accept the same header or `Sec-WebSocket-Protocol: bearer, <key>`. A whitespace-only value counts as unset |
 | `AGENT_VOICE_UI` | `on` | Serve the packaged Studio SPA at `/ui`. `agent-voice serve --no-ui` overrides it. `off` registers no UI route and imports no UI module. The API remains bearer-guarded; UI assets are public on the allowed loopback origin |
 
 ## Defaults

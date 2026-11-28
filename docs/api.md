@@ -27,7 +27,7 @@ rules apply to every route, including the mounted `/mcp` app.
 | `Host` | Must canonicalise to `127.0.0.1`, `localhost`, `[::1]`/`::1`, or a name in `AGENT_VOICE_ALLOWED_HOSTS` | `421` with `{"error_code":"BAD_REQUEST","message":"host not allowed: …"}` |
 | `Origin` | If the header is present, its host must be in the same allowed set (an opaque `null` origin is rejected) | `403` |
 | `Authorization` | Required when `AGENT_VOICE_API_KEY` is set, for `/v1/*`, `/audio/*` and `/mcp/*` | `401` |
-| Exempt paths | `/health`, `/docs`, `/redoc`, `/openapi.json` (and anything not under `/v1`, `/audio`, `/mcp`) | — |
+| Exempt paths | `/health` only (and paths outside `/v1`, `/audio`, `/mcp`, `/docs`, `/redoc`, `/openapi`) | — |
 
 Notes:
 

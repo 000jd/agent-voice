@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import tempfile
 import time
@@ -23,6 +22,7 @@ from typing import Any, Literal
 from filelock import FileLock
 
 from .audio_utils import canonicalise_ref_audio, probe_duration
+from .ids import validate_hex_id, validate_resource_id
 from .schemas import AgentVoiceError, ErrorCode, VoiceMetadata, VoiceSample, validate_voice_name
 from .security import (
     MAX_REF_AUDIO_SECONDS,
@@ -82,6 +82,11 @@ class VoiceStore:
 
     # -- lookup ---------------------------------------------------------
     def voice_dir(self, voice_id: str) -> Path:
+        validate_resource_id(
+            voice_id,
+            noun="voice id",
+            hint="Use a voice_id returned by GET /v1/voices.",
+        )
         return self.voices_dir / voice_id
 
     def ref_wav_path(self, voice_id: str) -> Path:
@@ -132,17 +137,22 @@ class VoiceStore:
     def resolve(self, name_or_id: str | None) -> VoiceMetadata | None:
         if not name_or_id:
             return None
-        if self.exists(name_or_id):
-            return self.get(name_or_id)
+        try:
+            if self.exists(name_or_id):
+                return self.get(name_or_id)
+        except AgentVoiceError:
+            # A human-facing name may contain spaces; it is resolved below by
+            # scanning metadata, never by joining it into a path.
+            pass
         return self.find_by_name(name_or_id)
 
     # -- samples --------------------------------------------------------
     def sample_path(self, voice_id: str, sample_id: str) -> Path:
-        if not re.fullmatch(r"[0-9a-f]{16}|primary", sample_id):
-            raise AgentVoiceError(
-                ErrorCode.BAD_REQUEST,
-                f"invalid sample id: {sample_id}",
-                "Use the sample_id returned by the voice endpoint.",
+        if sample_id != PRIMARY_SAMPLE_ID:
+            validate_hex_id(
+                sample_id,
+                noun="sample id",
+                hint="Use the sample_id returned by the voice endpoint.",
             )
         return self.voice_dir(voice_id) / SAMPLES_DIR / f"{sample_id}.wav"
 

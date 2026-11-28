@@ -15,13 +15,14 @@ from typing import Annotated, Literal
 from pydantic import AliasChoices, Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from .ids import validate_resource_id
 from .pronunciations import (
     MAX_LEXICON_ENTRIES,
     MAX_MERGED_LEXICON_ENTRIES,
     PROJECT_LEXICON_DIR,
     PRONUNCIATION_FILE,
 )
-from .schemas import MAX_HOTWORDS, ComputeDevice, DevicePreference
+from .schemas import MAX_HOTWORDS, AgentVoiceError, ComputeDevice, DevicePreference
 
 
 def default_home() -> Path:
@@ -278,6 +279,20 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return value.strip()
         return value
+
+    @field_validator("default_voice_id")
+    @classmethod
+    def _validate_default_voice_id(cls, value: str) -> str:
+        if not value:
+            return value
+        try:
+            return validate_resource_id(
+                value,
+                noun="default voice id",
+                hint="Use a voice id/name of at most 64 safe characters.",
+            )
+        except AgentVoiceError as exc:
+            raise ValueError(exc.message) from exc
 
     @field_validator("ui_enabled", mode="before")
     @classmethod

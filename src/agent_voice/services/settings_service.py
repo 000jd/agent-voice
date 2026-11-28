@@ -358,9 +358,14 @@ def patch(ctx: Any, values: dict[str, Any]) -> SettingsResponse:
     try:
         envfile.write_env(ctx.settings.config_path, updates)
     except OSError as exc:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "could not write settings file %s: %s", ctx.settings.config_path, exc
+        )
         raise AgentVoiceError(
             ErrorCode.INTERNAL_ERROR,
-            f"could not write {ctx.settings.config_path}: {exc}",
-            "Check the home directory permissions.",
+            "could not write the settings file",
+            "Check the home directory permissions and retry.",
         ) from exc
     return response(ctx, restart_required=True)

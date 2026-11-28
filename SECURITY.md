@@ -152,16 +152,16 @@ Change these only with intent, and prefer `.env` over exporting them ad hoc:
 | `AGENT_VOICE_ALLOW_ANY_PATH` | `false` | Agent reference reads confined to the inbox |
 | `AGENT_VOICE_TOOLSET` | `auto` | `core` for an agent that only needs to make audio |
 
-### Web UI preview
+### Web UI
 
-`frontend/` is a static SPA and the daemon does not mount it yet. When it is served at
-`/ui`, the static assets cannot be bearer-protected: a browser fetching a script or
-font cannot attach `Authorization`. Host/Origin checks still apply, and `/v1`, `/audio`
-and `/mcp` keep their bearer requirement. There is no CORS, no UI login, and no UI
-editor for the Tier-A settings above. The Vite dev proxy injects
-`AGENT_VOICE_DEV_API_KEY` server-side and rewrites `Origin` only for its own proxied
-requests; it does not widen the guard for the browser. Do not expose `/ui` beyond
-loopback without a key.
+The daemon serves the packaged static SPA at `/ui`; `AGENT_VOICE_UI=off` or
+`serve --no-ui` disables it. Static assets cannot be bearer-protected: a browser
+fetching a script or font cannot attach `Authorization`. Host/Origin checks still
+apply, and `/v1`, `/audio`, `/mcp`, `/docs`, `/redoc` and `/openapi*` keep their
+bearer requirement. There is no CORS and no UI editor for the Tier-A settings above.
+The Vite dev proxy injects `AGENT_VOICE_DEV_API_KEY` server-side and rewrites
+`Origin` only for its own proxied requests; it does not widen the guard for the
+browser. Do not expose `/ui` beyond loopback without a key.
 
 If you front the daemon with a reverse proxy, you are outside the supported
 topology: the Host/Origin guard is designed for loopback, and a proxy must pass

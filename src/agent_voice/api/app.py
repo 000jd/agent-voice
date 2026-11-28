@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -106,8 +107,10 @@ class AppContext:
         # A typo in AGENT_VOICE_DEVICES must fail at startup, not on the first
         # request; the registry is available here and the check is torch-free.
         from ..hardware import validate_device_preferences
+        from ..ingest import configure_ingest
 
         validate_device_preferences(settings, self.registry)
+        configure_ingest(settings.ingest_concurrency)
         self.cache = SynthesisCache(settings.cache_dir, max_gb=settings.max_cache_gb)
         self.voices = VoiceStore(
             settings.voices_dir, max_ref_text_chars=settings.max_ref_text_chars
@@ -149,6 +152,21 @@ class AppContext:
             cache=self.cache,
             voices=self.voices,
         )
+
+    def prune_retention(self) -> dict[str, int]:
+        """Prune all bounded stores and unreferenced old artifacts."""
+        from ..artifact_store import prune_artifacts
+
+        self.jobs.prune()
+        self.drafts.prune()
+        self.captures.prune()
+        self.history.prune()
+        removed = prune_artifacts(
+            self.settings.artifacts_dir,
+            referenced_ids=self.history.artifact_ids(),
+            ttl_seconds=self.settings.artifact_ttl_seconds,
+        )
+        return {"artifacts": removed}
 
 
 def _torch_loaded() -> bool:
@@ -247,10 +265,8 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
             logger.info("reconciled %d interrupted job(s) to DAEMON_RESTARTED", reconciled)
         if pruned:
             logger.info("pruned %d stale job record(s)", pruned)
-        ctx.drafts.prune()
-        ctx.captures.prune()
-        ctx.history.prune()
-        ctx.workers.on_reaper_tick = ctx.jobs.prune
+        ctx.prune_retention()
+        ctx.workers.on_reaper_tick = ctx.prune_retention
         try:
             yield
         finally:
@@ -338,13 +354,23 @@ def create_app(*, settings: Settings | None = None, mount_mcp: bool = True) -> F
 
     @app.exception_handler(Exception)
     async def unhandled_error_handler(request: Request, exc: Exception):
+        correlation_id = secrets.token_hex(6)
+        logger.exception(
+            "unhandled error cid=%s path=%s", correlation_id, request.url.path
+        )
         return JSONResponse(
             status_code=500,
-            content=ErrorResponse(
-                error_code="INTERNAL_ERROR",
-                message=str(exc),
-                suggestion="Check the daemon logs for a traceback.",
-            ).model_dump(mode="json"),
+            content={
+                **ErrorResponse(
+                    error_code=ErrorCode.INTERNAL_ERROR,
+                    message="internal server error",
+                    suggestion=(
+                        f"Retry once; if it persists, quote correlation id {correlation_id} "
+                        "when reporting it."
+                    ),
+                ).model_dump(mode="json"),
+                "correlation_id": correlation_id,
+            },
         )
 
     # -- health ----------------------------------------------------------

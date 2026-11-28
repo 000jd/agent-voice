@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .ids import validate_hex_id
 from .schemas import AgentVoiceError, DraftQuality, ErrorCode, VoiceDraft
 
 
@@ -38,12 +39,11 @@ class VoiceDraftStore:
         self.quota_bytes = quota_bytes
 
     def dir(self, draft_id: str) -> Path:
-        if len(draft_id) != 16 or any(c not in "0123456789abcdef" for c in draft_id):
-            raise AgentVoiceError(
-                ErrorCode.BAD_REQUEST,
-                f"invalid draft id: {draft_id}",
-                "Use the draft_id returned by POST /v1/voice-drafts.",
-            )
+        validate_hex_id(
+            draft_id,
+            noun="draft id",
+            hint="Use the draft_id returned by POST /v1/voice-drafts.",
+        )
         return self.root / draft_id
 
     def audio_path(self, draft_id: str) -> Path:

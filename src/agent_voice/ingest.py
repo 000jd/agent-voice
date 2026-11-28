@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -22,6 +23,9 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,10 +34,45 @@ import numpy as np
 
 from .schemas import AgentVoiceError, ClippingReport, DraftQuality, ErrorCode, QualityWarning
 
+logger = logging.getLogger(__name__)
+
 SAMPLE_RATE = 24_000
 READ_HEADER_BYTES = 16 * 1024
 MAX_ID3_BYTES = 1024 * 1024
 UPLOAD_CHUNK = 1024 * 1024
+INGEST_WAIT_SECONDS = 30.0
+
+_gate_lock = threading.Lock()
+_gate = threading.BoundedSemaphore(2)
+
+
+def configure_ingest(concurrency: int) -> None:
+    """Set the process-wide number of allowed ffmpeg/ffprobe children."""
+    global _gate
+    with _gate_lock:
+        _gate = threading.BoundedSemaphore(max(1, int(concurrency)))
+
+
+@contextmanager
+def ingest_slot() -> Iterator[None]:
+    """Bounded admission for every media subprocess.
+
+    A saturated gate is backpressure, not an unbounded queue. The timeout keeps a
+    caller from waiting forever behind another upload's decode.
+    """
+    with _gate_lock:
+        gate = _gate
+    if not gate.acquire(timeout=INGEST_WAIT_SECONDS):
+        raise AgentVoiceError(
+            ErrorCode.BACKPRESSURE,
+            "media ingest is busy",
+            "Retry shortly; raise INGEST_CONCURRENCY only if this host can afford "
+            "more decoders.",
+        )
+    try:
+        yield
+    finally:
+        gate.release()
 
 ALLOWED_FORMATS: tuple[str, ...] = (
     "wav",
@@ -172,7 +211,24 @@ def _run_media(
     stdout_pipe: bool = True,
     stderr_limit: int = 64 * 1024,
 ) -> tuple[int, bytes, bytes]:
-    """Run an argv list with hard bounds; never a shell string.
+    """Run an argv list with hard bounds and global ingest admission."""
+    with ingest_slot():
+        return _run_media_unlocked(
+            argv,
+            timeout=timeout,
+            stdout_pipe=stdout_pipe,
+            stderr_limit=stderr_limit,
+        )
+
+
+def _run_media_unlocked(
+    argv: list[str],
+    *,
+    timeout: float,
+    stdout_pipe: bool = True,
+    stderr_limit: int = 64 * 1024,
+) -> tuple[int, bytes, bytes]:
+    """The process body; callers must hold an ingest slot.
 
     stderr is captured to a temporary file and only its tail is read, so a
     hostile demuxer cannot turn a failure into unbounded daemon memory.
@@ -279,10 +335,11 @@ def probe_untrusted(
     ]
     rc, stdout, stderr = _run_media(argv, timeout=timeout)
     if rc != 0:
+        logger.warning("ffprobe rejected staged media: %s", _tail(stderr))
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"could not probe {Path(path).name}: {_tail(stderr)}",
-            "Provide a file ffmpeg can decode; install a current ffmpeg if it cannot.",
+            "unsupported or corrupt audio",
+            "Provide a WAV/FLAC/Ogg/MP3/MP4 file that opens in a normal player.",
         )
     try:
         payload = json.loads(stdout)
@@ -411,9 +468,10 @@ def extract_wav_untrusted(
     ]
     rc, _, stderr = _run_media(argv, timeout=timeout, stdout_pipe=False)
     if rc != 0:
+        logger.warning("ffmpeg could not decode staged media: %s", _tail(stderr))
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"could not decode {Path(source).name}: {_tail(stderr)}",
+            "unsupported or corrupt audio",
             "Provide a decodable audio or video file with an audio track.",
         )
     if destination.stat().st_size > max_decoded_bytes + 1024:
@@ -479,9 +537,10 @@ def slice_untrusted(
     ]
     rc, _, stderr = _run_media(argv, timeout=timeout, stdout_pipe=False)
     if rc != 0:
+        logger.warning("ffmpeg could not trim the reference clip: %s", _tail(stderr))
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"could not trim the reference clip: {_tail(stderr)}",
+            "unsupported or corrupt audio",
             "Choose a start/end inside the recording and retry.",
         )
     return destination

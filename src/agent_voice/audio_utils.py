@@ -7,6 +7,7 @@ interpolation into a shell anywhere in this project.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import subprocess
@@ -28,6 +29,8 @@ _SPLIT_RE = re.compile(
 
 TARGET_LUFS = -16.0
 
+logger = logging.getLogger(__name__)
+
 
 def _run(argv: list[str], *, timeout: float = 120.0) -> subprocess.CompletedProcess[bytes]:
     """Run an external tool with an argv list. Never a shell string.
@@ -38,22 +41,25 @@ def _run(argv: list[str], *, timeout: float = 120.0) -> subprocess.CompletedProc
     """
     import os
 
+    from .ingest import ingest_slot
+
     env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     }
     try:
-        return subprocess.run(
-            argv,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-            shell=False,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            env=env,
-        )
+        with ingest_slot():
+            return subprocess.run(
+                argv,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=env,
+            )
     except subprocess.TimeoutExpired as exc:
         raise AgentVoiceError(
             ErrorCode.TIMEOUT,
@@ -131,9 +137,10 @@ def probe_duration(path: Path) -> float:
         ]
     )
     if result.returncode != 0:
+        logger.warning("ffprobe failed: %s", _ffmpeg_error_tail(result.stderr))
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"ffprobe failed: {_ffmpeg_error_tail(result.stderr)}",
+            "unsupported or corrupt audio",
             "Provide a decodable audio file.",
         )
     try:
@@ -194,9 +201,10 @@ def canonicalise_ref_audio(
         timeout=120.0,
     )
     if result.returncode != 0:
+        logger.warning("could not decode reference audio: %s", _ffmpeg_error_tail(result.stderr))
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"could not decode reference audio: {_ffmpeg_error_tail(result.stderr)}",
+            "unsupported or corrupt audio",
             "Supply a WAV/MP3/FLAC/OGG file ffmpeg can read.",
         )
 
@@ -709,10 +717,10 @@ def extract_asr_wav(source: Path, destination: Path) -> float:
         timeout=600.0,
     )
     if result.returncode != 0:
+        logger.warning("could not extract ASR audio: %s", _ffmpeg_error_tail(result.stderr))
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"could not extract audio from {Path(source).name}: "
-            f"{_ffmpeg_error_tail(result.stderr)}",
+            "unsupported or corrupt audio",
             "Provide a file with a decodable audio stream.",
         )
     return probe_duration(destination)
@@ -757,10 +765,10 @@ def extract_bed(source: Path, destination: Path) -> float:
         timeout=600.0,
     )
     if result.returncode != 0:
+        logger.warning("could not extract the original bed: %s", _ffmpeg_error_tail(result.stderr))
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"could not extract the original bed from {Path(source).name}: "
-            f"{_ffmpeg_error_tail(result.stderr)}",
+            "unsupported or corrupt audio",
             "Provide a file with a decodable audio stream.",
         )
     return probe_duration(destination)
@@ -813,9 +821,10 @@ def slice_clip(
         timeout=600.0,
     )
     if result.returncode != 0:
+        logger.warning("could not slice media: %s", _ffmpeg_error_tail(result.stderr))
         raise AgentVoiceError(
             ErrorCode.INVALID_REF_AUDIO,
-            f"could not slice {Path(source).name}: {_ffmpeg_error_tail(result.stderr)}",
+            "unsupported or corrupt audio",
             "Check the source is decodable and the window is inside its duration.",
         )
     return probe_duration(destination)

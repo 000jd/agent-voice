@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .clock import Clock, get_clock
+from .ids import validate_hex_id
 from .schemas import ErrorCode, ErrorResponse, Job, JobStatus
 
 JobKind = Literal[
@@ -57,6 +58,14 @@ class JobStore:
 
     # -- persistence ----------------------------------------------------
     def _path(self, job_id: str) -> Path:
+        validate_hex_id(
+            job_id,
+            noun="job id",
+            hint=(
+                "Use a job_id returned by the API; jobs live under data/jobs/ and "
+                "ids are 16 lowercase hex chars."
+            ),
+        )
         return self.jobs_dir / f"{job_id}.json"
 
     def _persist(self, job: Job) -> None:
