@@ -49,10 +49,10 @@ export default defineConfig(
 		}
 	},
 	{
+		// These components receive hrefs that their parent produced with resolve().
 		files: [
-			'src/lib/components/nav-link.svelte',
-			'src/lib/components/app-shell.svelte',
-			'src/routes/+page.svelte'
+			'src/lib/components/shell/rail.svelte',
+			'src/lib/components/library/capture-row.svelte'
 		],
 		rules: {
 			'svelte/no-navigation-without-resolve': 'off'

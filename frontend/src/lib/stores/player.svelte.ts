@@ -1,4 +1,4 @@
-import { ApiError, fetchAudioBlob } from '#lib/api/studio.js';
+import { ApiError, requestBlob } from '#lib/api/client.js';
 import type { ClipSummary } from '#lib/api/types.js';
 import { clamp, sanitizeFilename } from '#lib/format.js';
 
@@ -25,7 +25,7 @@ export type PlayerDeps = {
 function audioErrorMessage(error: unknown): string {
 	if (error instanceof ApiError) {
 		if (error.status === 401) {
-			return 'Audio is protected by the daemon API key. This static UI does not store it. In development, set AGENT_VOICE_DEV_API_KEY in frontend/.env.';
+			return 'Audio is protected by the daemon API key. Enter the key to play it.';
 		}
 		return error.suggestion ? `${error.message} ${error.suggestion}` : error.message;
 	}
@@ -67,7 +67,7 @@ async function decodePeaks(blob: Blob): Promise<number[]> {
 
 function browserDeps(): PlayerDeps {
 	return {
-		fetchAudio: fetchAudioBlob,
+		fetchAudio: requestBlob,
 		createAudio: () => new Audio(),
 		decode: decodePeaks,
 		createObjectURL: (blob) => URL.createObjectURL(blob),

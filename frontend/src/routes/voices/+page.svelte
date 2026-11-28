@@ -2,202 +2,439 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
-	import { page } from '$app/state';
-	import Mic from '@lucide/svelte/icons/mic';
 	import Plus from '@lucide/svelte/icons/plus';
 	import Search from '@lucide/svelte/icons/search';
-	import Sparkles from '@lucide/svelte/icons/sparkles';
-	import { describeApiError } from '#lib/api/studio.js';
-	import type { ApiErrorPayload } from '#lib/api/types.js';
-	import EmptyState from '#lib/components/empty-state.svelte';
-	import PageHeader from '#lib/components/page-header.svelte';
-	import CloneDrawer from '#lib/components/studio/clone-drawer.svelte';
-	import DesignDrawer from '#lib/components/studio/design-drawer.svelte';
-	import ErrorNotice from '#lib/components/studio/error-notice.svelte';
-	import PresetGroupCard from '#lib/components/studio/preset-group-card.svelte';
-	import VoiceCard from '#lib/components/studio/voice-card.svelte';
-	import { Button } from '#lib/components/ui/button/index.js';
-	import { studio } from '#lib/stores/studio.svelte.js';
+	import Upload from '@lucide/svelte/icons/upload';
+	import { describeApiError } from '#lib/api/client.js';
+	import { previewPreset } from '#lib/api/presets.js';
 	import {
-		builtinPresetGroups,
-		filterPresetGroups,
-		filterVoiceItems,
-		voiceItems,
+		deleteVoice,
+		exportVoice,
+		importVoice,
+		patchVoice,
+		previewVoice
+	} from '#lib/api/voices.js';
+	import type { ApiErrorPayload, PresetVoice, VoiceSummary } from '#lib/api/types.js';
+	import { clipFromPreview } from '#lib/clips.js';
+	import ConfirmDialog from '#lib/components/common/confirm-dialog.svelte';
+	import Dialog from '#lib/components/common/dialog.svelte';
+	import Dropzone from '#lib/components/common/dropzone.svelte';
+	import EmptyState from '#lib/components/common/empty-state.svelte';
+	import ErrorNotice from '#lib/components/common/error-notice.svelte';
+	import Segmented from '#lib/components/common/segmented.svelte';
+	import CloneDialog from '#lib/components/voices/clone-dialog.svelte';
+	import DesignDialog from '#lib/components/voices/design-dialog.svelte';
+	import PresetCard from '#lib/components/voices/preset-card.svelte';
+	import VoiceCard from '#lib/components/voices/voice-card.svelte';
+	import { downloadBlob, sanitizeFilename } from '#lib/format.js';
+	import { clone } from '#lib/stores/clone.svelte.js';
+	import { getPlayer } from '#lib/stores/player.svelte.js';
+	import { speak } from '#lib/stores/speak.svelte.js';
+	import { studio } from '#lib/stores/studio.svelte.js';
+	import { toasts } from '#lib/stores/toasts.svelte.js';
+	import {
+		PREVIEW_TEXT,
+		VOICE_FILTER_LABELS,
+		filterPresets,
+		filterVoices,
+		presetAvailability,
+		uniquePresets,
+		voiceCompatibility,
 		type VoiceFilter
 	} from '#lib/voices.js';
 
-	let query = $state('');
 	let filter = $state<VoiceFilter>('all');
+	let query = $state('');
+	let previewingId = $state<string | null>(null);
+	let renameOpen = $state(false);
+	let renameTarget = $state<VoiceSummary | null>(null);
+	let renameValue = $state('');
+	let renameBusy = $state(false);
+	let renameError = $state<ApiErrorPayload | null>(null);
+	let deleteOpen = $state(false);
+	let deleteTarget = $state<VoiceSummary | null>(null);
 	let designOpen = $state(false);
-	let cloneOpen = $state(false);
-	let error = $state<ApiErrorPayload | string>('');
+	let importing = $state(false);
+	let importError = $state<ApiErrorPayload | null>(null);
 
-	const items = $derived(voiceItems(studio.voices, []));
-	const groups = $derived(builtinPresetGroups(studio.engines));
-	const filtered = $derived(filterVoiceItems(items, filter, query));
-	const filteredGroups = $derived(
-		filter === 'preset' || filter === 'all' ? filterPresetGroups(groups, query) : []
-	);
-	const visibleCount = $derived(filtered.length + filteredGroups.length);
-	const filters: readonly { value: VoiceFilter; label: string }[] = [
-		{ value: 'all', label: 'All' },
-		{ value: 'cloned', label: 'Cloned' },
-		{ value: 'designed', label: 'Designed' },
-		{ value: 'preset', label: 'Built-in presets' }
-	];
-
-	$effect(() => {
-		const needle = page.url.searchParams.get('q');
-		if (needle !== null) query = needle;
-	});
-
-	$effect(() => {
-		if (page.url.searchParams.get('design') !== '1') return;
-		designOpen = true;
-		void goto(resolve('voices'), { replaceState: true });
-	});
+	const voices = $derived(filterVoices(studio.voices, filter, query));
+	const presets = $derived(filterPresets(studio.presets, filter, query));
+	const allPresets = $derived(uniquePresets(studio.presets));
+	const filters = $derived([
+		{
+			id: 'all',
+			label: VOICE_FILTER_LABELS.all,
+			count: studio.voices.length + allPresets.length
+		},
+		{
+			id: 'cloned',
+			label: VOICE_FILTER_LABELS.cloned,
+			count: studio.voices.filter((voice) => voice.kind === 'cloned').length
+		},
+		{
+			id: 'designed',
+			label: VOICE_FILTER_LABELS.designed,
+			count: studio.voices.filter((voice) => voice.kind === 'designed').length
+		},
+		{ id: 'preset', label: VOICE_FILTER_LABELS.preset, count: allPresets.length }
+	]);
+	const showVoicesSection = $derived(filter !== 'preset');
+	const showPresetSection = $derived(filter === 'all' || filter === 'preset');
+	const empty = $derived(!studio.catalogLoading && studio.voices.length === 0);
 
 	onMount(() => {
 		if (studio.engines.length === 0) void studio.refreshCatalog();
 	});
 
-	async function remove(voiceId: string): Promise<void> {
-		error = '';
+	function useVoice(voice: VoiceSummary): void {
+		speak.selectVoice(voice);
+		void goto(resolve('speak'));
+	}
+
+	function usePreset(preset: PresetVoice): void {
+		speak.selectPreset(preset);
+		void goto(resolve('speak'));
+	}
+
+	async function previewVoiceCard(voice: VoiceSummary): Promise<void> {
+		previewingId = voice.id;
 		try {
-			await studio.removeVoice(voiceId);
-		} catch (cause) {
-			error = describeApiError(cause);
-			throw cause;
+			const preview = await previewVoice(voice.id, PREVIEW_TEXT);
+			void getPlayer().play(clipFromPreview(preview, voice.name));
+		} catch (error) {
+			toasts.error('Preview failed', describeApiError(error).message);
+		} finally {
+			previewingId = null;
 		}
 	}
 
-	function saved(voiceId: string): void {
-		filter = 'designed';
-		query = '';
-		error = '';
-		void voiceId;
+	async function previewPresetCard(preset: PresetVoice): Promise<void> {
+		previewingId = preset.presetId;
+		try {
+			const preview = await previewPreset({
+				engine: preset.engineId,
+				model: preset.modelAlias,
+				speaker: preset.speaker,
+				text: PREVIEW_TEXT
+			});
+			void getPlayer().play(clipFromPreview(preview, preset.displayName));
+		} catch (error) {
+			toasts.error('Preview failed', describeApiError(error).message);
+		} finally {
+			previewingId = null;
+		}
+	}
+
+	function openRename(voice: VoiceSummary): void {
+		renameTarget = voice;
+		renameValue = voice.name;
+		renameError = null;
+		renameOpen = true;
+	}
+
+	async function submitRename(): Promise<void> {
+		if (!renameTarget) return;
+		renameBusy = true;
+		renameError = null;
+		try {
+			await patchVoice(renameTarget.id, { name: renameValue.trim() });
+			await studio.refreshVoices();
+			renameOpen = false;
+			renameTarget = null;
+		} catch (error) {
+			renameError = describeApiError(error);
+		} finally {
+			renameBusy = false;
+		}
+	}
+
+	async function exportCard(voice: VoiceSummary): Promise<void> {
+		try {
+			const blob = await exportVoice(voice.id);
+			downloadBlob(`${sanitizeFilename(voice.name)}.voice.zip`, blob);
+		} catch (error) {
+			toasts.error('Export failed', describeApiError(error).message);
+		}
+	}
+
+	function askDelete(voice: VoiceSummary): void {
+		deleteTarget = voice;
+		deleteOpen = true;
+	}
+
+	async function confirmDelete(): Promise<void> {
+		const voice = deleteTarget;
+		if (!voice) return;
+		try {
+			await deleteVoice(voice.id);
+			await studio.refreshVoices();
+			if (speak.config.voiceId === voice.id) speak.syncCatalog();
+			toasts.success('Voice deleted', voice.name);
+		} catch (error) {
+			toasts.error('Delete failed', describeApiError(error).message);
+		} finally {
+			deleteOpen = false;
+			deleteTarget = null;
+		}
+	}
+
+	async function onImport(file: File): Promise<void> {
+		importing = true;
+		importError = null;
+		try {
+			const created = await importVoice(file);
+			await studio.refreshVoices();
+			toasts.success('Voice imported', created.name);
+		} catch (error) {
+			importError = describeApiError(error);
+		} finally {
+			importing = false;
+		}
+	}
+
+	function startCloneWithFile(file: File): void {
+		clone.begin('create');
+		void clone.acceptFile(file);
 	}
 </script>
 
-<PageHeader title="Voices" description="Cloned, designed and engine-preset timbres.">
-	<Button variant="outline" size="sm" onclick={() => (cloneOpen = true)}>
-		<Plus class="size-3.5" aria-hidden="true" />
-		Clone voice
-	</Button>
-	<Button size="sm" onclick={() => (designOpen = true)}>
-		<Sparkles class="size-3.5" aria-hidden="true" />
-		Design voice
-	</Button>
-</PageHeader>
+<div class="h-full overflow-y-auto">
+	<div class="mx-auto w-full max-w-[1400px] px-4 py-4 md:px-6 md:py-5">
+		<div class="flex flex-wrap items-center gap-2">
+			<div class="relative min-w-[180px] flex-1">
+				<Search
+					class="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-ink-muted"
+					aria-hidden="true"
+				/>
+				<label class="sr-only" for="voice-search">Search voices</label>
+				<input
+					id="voice-search"
+					class="input h-8 pl-8 text-[12px]"
+					type="search"
+					placeholder="Search voices and presets"
+					bind:value={query}
+				/>
+			</div>
+			<Segmented
+				items={filters}
+				value={filter}
+				label="Filter voices"
+				onchange={(id) => (filter = id as VoiceFilter)}
+			/>
+			<div class="ml-auto flex items-center gap-2">
+				<label
+					class={`btn btn-sm cursor-pointer ${importing ? 'pointer-events-none opacity-50' : ''}`}
+				>
+					<Upload class="size-3.5" aria-hidden="true" />
+					{importing ? 'Importing…' : 'Import'}
+					<input
+						class="sr-only"
+						type="file"
+						accept=".zip,application/zip"
+						onchange={(event) => {
+							const file = event.currentTarget.files?.[0];
+							if (file) void onImport(file);
+							event.currentTarget.value = '';
+						}}
+					/>
+				</label>
+				<button type="button" class="btn btn-sm" onclick={() => (designOpen = true)}>Design</button>
+				<button type="button" class="btn btn-sm btn-primary" onclick={() => clone.begin('create')}>
+					<Plus class="size-3.5" aria-hidden="true" />
+					Clone voice
+				</button>
+			</div>
+		</div>
 
-{#if error}
-	<div class="mb-3">
-		<ErrorNotice {error} />
-	</div>
-{/if}
+		{#if importError}
+			<div class="mt-3">
+				<ErrorNotice
+					error={importError}
+					onRetry={() => (importError = null)}
+					retryLabel="Dismiss"
+				/>
+			</div>
+		{/if}
 
-<div class="mb-4 flex flex-col gap-2.5 lg:flex-row lg:items-center lg:justify-between">
-	<div class="relative w-full lg:max-w-sm">
-		<Search
-			class="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-text-muted"
-			aria-hidden="true"
-		/>
-		<input
-			class="h-9 w-full rounded-lg border border-border bg-elevated pr-2.5 pl-8 text-[12px] text-foreground placeholder:text-text-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/20 focus-visible:outline-none"
-			placeholder="Search voices"
-			bind:value={query}
-			aria-label="Search the voice library"
-		/>
-	</div>
-	<div class="flex gap-1 overflow-x-auto pb-0.5" role="group" aria-label="Voice filters">
-		{#each filters as option (option.value)}
-			<button
-				type="button"
-				class={`inline-flex h-7 shrink-0 items-center rounded-full border px-3 text-[11px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none ${
-					filter === option.value
-						? 'border-border bg-elevated-hover text-foreground'
-						: 'border-transparent text-text-secondary hover:bg-elevated-hover/50 hover:text-foreground'
-				}`}
-				aria-pressed={filter === option.value}
-				onclick={() => (filter = option.value)}
-			>
-				{option.label}
-			</button>
-		{/each}
+		{#if studio.catalogLoading && studio.voices.length === 0}
+			<div class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+				{#each Array.from({ length: 6 }, (_, index) => index) as index (index)}
+					<div class="card h-[176px] p-3">
+						<div class="skeleton size-9"></div>
+						<div class="skeleton mt-3 h-3 w-2/3"></div>
+						<div class="skeleton mt-2 h-3 w-1/2"></div>
+						<div class="skeleton mt-6 h-7 w-full"></div>
+					</div>
+				{/each}
+			</div>
+		{:else}
+			{#if studio.catalogError && studio.voices.length === 0}
+				<div class="mt-4">
+					<ErrorNotice error={studio.catalogError} onRetry={() => void studio.refreshCatalog()} />
+				</div>
+			{/if}
+
+			{#if showVoicesSection}
+				<section class="mt-5" aria-labelledby="your-voices">
+					<div class="mb-2 flex items-baseline justify-between gap-3">
+						<h2 id="your-voices" class="text-[13px] font-medium text-ink">
+							Your voices
+							<span class="metric ml-1 text-[11px] text-ink-muted">{studio.voices.length}</span>
+						</h2>
+						{#if filter !== 'all'}
+							<button
+								type="button"
+								class="text-[11px] text-ink-secondary hover:text-ink"
+								onclick={() => (filter = 'all')}
+							>
+								Show all
+							</button>
+						{/if}
+					</div>
+
+					{#if voices.length === 0}
+						{#if empty}
+							<div class="rounded-panel border border-rule bg-surface p-4">
+								<div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_280px]">
+									<div class="min-w-0">
+										<h3 class="text-[15px] font-semibold text-ink">Clone your first voice</h3>
+										<p class="mt-1 max-w-[52ch] text-[12px] leading-5 text-ink-secondary">
+											Drop a clean recording of a voice you have the right to use. The daemon trims
+											it, measures it and stores it locally; nothing leaves this machine.
+										</p>
+										<ol class="metric mt-3 space-y-1 text-[11px] text-ink-muted">
+											<li>1 · Six to twenty seconds of one speaker</li>
+											<li>2 · No music, no noise, no clipping</li>
+											<li>3 · An accurate transcript improves the clone</li>
+										</ol>
+									</div>
+									<Dropzone
+										id="voices-hero-file"
+										label="Drop a clip or choose a file"
+										hint="WAV, FLAC, Ogg, MP3, M4A"
+										onfile={startCloneWithFile}
+									/>
+								</div>
+							</div>
+						{:else}
+							<EmptyState
+								title="No voices match this filter"
+								description="Clear the search or pick another filter to see your voices again."
+							>
+								<button
+									type="button"
+									class="btn btn-sm"
+									onclick={() => {
+										query = '';
+										filter = 'all';
+									}}
+								>
+									Clear filters
+								</button>
+							</EmptyState>
+						{/if}
+					{:else}
+						<ul class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+							{#each voices as voice (voice.id)}
+								<li>
+									<VoiceCard
+										{voice}
+										compatible={voiceCompatibility(voice, studio.engines) !== null}
+										previewing={previewingId === voice.id}
+										onpreview={() => void previewVoiceCard(voice)}
+										onuse={() => useVoice(voice)}
+										onrename={() => openRename(voice)}
+										onsample={() => clone.begin('add-sample', voice)}
+										onexport={() => void exportCard(voice)}
+										ondelete={() => askDelete(voice)}
+									/>
+								</li>
+							{/each}
+						</ul>
+					{/if}
+				</section>
+			{/if}
+
+			{#if showPresetSection}
+				<section class="mt-6" aria-labelledby="built-in-presets">
+					<div class="mb-2 flex items-baseline justify-between gap-3">
+						<h2 id="built-in-presets" class="text-[13px] font-medium text-ink">
+							Built-in presets
+							<span class="metric ml-1 text-[11px] text-ink-muted">{allPresets.length}</span>
+						</h2>
+						<p class="text-[11px] text-ink-muted">
+							One card per speaker, from the engine manifests.
+						</p>
+					</div>
+					{#if presets.length === 0}
+						<div class="rounded-panel border border-rule bg-surface px-4 py-6">
+							<p class="max-w-[70ch] text-[12px] leading-5 text-ink-secondary">
+								No preset speakers are declared by the installed engines. Presets appear when a
+								manifest lists <code class="metric">preset_speakers</code> for a custom-voice model.
+							</p>
+						</div>
+					{:else}
+						<ul class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+							{#each presets as preset (preset.presetId)}
+								<li>
+									<PresetCard
+										{preset}
+										availability={presetAvailability(studio.engines, preset)}
+										previewing={previewingId === preset.presetId}
+										onpreview={() => void previewPresetCard(preset)}
+										onuse={() => usePreset(preset)}
+									/>
+								</li>
+							{/each}
+						</ul>
+					{/if}
+				</section>
+			{/if}
+		{/if}
 	</div>
 </div>
 
-{#if studio.catalogLoading && items.length === 0 && groups.length === 0}
-	<div class="space-y-2">
-		{#each [0, 1, 2, 3] as row (row)}
-			<div class="h-[72px] animate-pulse rounded-xl border border-border bg-elevated"></div>
-		{/each}
-	</div>
-{:else if studio.catalogError && items.length === 0 && groups.length === 0}
-	<ErrorNotice error={studio.catalogError} onRetry={() => void studio.refreshCatalog()} />
-{:else if visibleCount === 0}
-	<EmptyState
-		icon={Mic}
-		title={query ? 'No voices match' : 'No voices in this filter'}
-		description={query
-			? `Nothing matches “${query}”. Clear the search or try another source.`
-			: 'Clone a clip from the inbox, design a timbre, or show the engine presets.'}
-	>
-		<Button
-			variant="outline"
-			size="sm"
-			onclick={() => {
-				query = '';
-				filter = 'all';
-			}}
-		>
-			Clear filters
-		</Button>
-	</EmptyState>
-{:else}
-	<div class="overflow-hidden rounded-xl border border-border bg-panel">
-		<div
-			class="hidden grid-cols-[minmax(0,1fr)_90px_100px_auto] gap-3 border-b border-border px-3 py-2 text-[11px] text-text-muted lg:grid"
-		>
-			<span>Voice</span>
-			<span>Duration</span>
-			<span>Added</span>
-			<span class="text-right">Actions</span>
-		</div>
-		<div class="divide-y divide-border">
-			{#each filtered as item (item.id)}
-				{#if item.kind === 'voice'}
-					<VoiceCard
-						{item}
-						onUse={() => {
-							studio.useVoice(item.voice);
-							void goto(resolve('speak'));
-						}}
-						onDelete={() => remove(item.voice.id)}
-					/>
-				{/if}
-			{/each}
-			{#each filteredGroups as group (group.id)}
-				<PresetGroupCard
-					{group}
-					onUse={(speaker: string) => {
-						studio.usePreset({
-							kind: 'preset',
-							id: group.id,
-							name: `${speaker} — ${group.engineName}`,
-							engineId: group.engineId,
-							engineName: group.engineName,
-							modelAlias: group.modelAlias,
-							speaker,
-							supportsInstruct: group.supportsInstruct
-						});
-						void goto(resolve('speak'));
-					}}
-				/>
-			{/each}
-		</div>
-	</div>
-{/if}
+<CloneDialog />
+<DesignDialog bind:open={designOpen} />
 
-<DesignDrawer open={designOpen} onclose={() => (designOpen = false)} onSaved={saved} />
-<CloneDrawer open={cloneOpen} onclose={() => (cloneOpen = false)} onSaved={saved} />
+<Dialog
+	bind:open={renameOpen}
+	title="Rename voice"
+	size="sm"
+	onclose={() => {
+		renameTarget = null;
+		renameError = null;
+	}}
+>
+	<div class="space-y-3">
+		<div class="space-y-1">
+			<label class="field-label" for="rename-voice">Name</label>
+			<input id="rename-voice" class="input" type="text" maxlength="64" bind:value={renameValue} />
+		</div>
+		{#if renameError}
+			<ErrorNotice error={renameError} compact />
+		{/if}
+	</div>
+	{#snippet footer()}
+		<button type="button" class="btn" onclick={() => (renameOpen = false)}>Cancel</button>
+		<button
+			type="button"
+			class="btn btn-primary"
+			disabled={renameBusy || renameValue.trim().length === 0}
+			onclick={() => void submitRename()}
+		>
+			{renameBusy ? 'Saving…' : 'Save name'}
+		</button>
+	{/snippet}
+</Dialog>
+
+<ConfirmDialog
+	bind:open={deleteOpen}
+	title="Delete voice"
+	message={`Delete “${deleteTarget?.name ?? ''}”?`}
+	detail="The reference audio, samples and lexicon for this voice are removed from disk. Existing history entries keep their text but lose the audio."
+	confirmLabel="Delete voice"
+	danger
+	onconfirm={() => void confirmDelete()}
+	oncancel={() => (deleteTarget = null)}
+/>

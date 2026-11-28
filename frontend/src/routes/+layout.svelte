@@ -1,50 +1,48 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
-	import { resolve } from '$app/paths';
+	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import '../app.css';
 	import favicon from '#lib/assets/favicon.svg';
-	import AppShell from '#lib/components/app-shell.svelte';
-	import { NAV_GROUPS } from '#lib/nav.js';
+	import AppShell from '#lib/components/shell/app-shell.svelte';
+	import AuthGate from '#lib/components/shell/auth-gate.svelte';
+	import { navLabelFor } from '#lib/nav.js';
+	import { auth } from '#lib/stores/auth.svelte.js';
+	import { events } from '#lib/stores/events.svelte.js';
 	import { studio } from '#lib/stores/studio.svelte.js';
 	import { theme } from '#lib/theme.svelte.js';
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
 
-	const groups = $derived(
-		NAV_GROUPS.map((group) => ({
-			...group,
-			items: group.items.map((item) => ({
-				...item,
-				href: resolve(item.href).replace(/\/+$/, '') || '/'
-			}))
-		}))
-	);
-	const currentPath = $derived(page.url.pathname.replace(/\/+$/, '') || '/');
-	const title = $derived(
-		NAV_GROUPS.flatMap((group) => group.items).find(
-			(item) => (resolve(item.href).replace(/\/+$/, '') || '/') === currentPath
-		)?.label ?? 'Studio'
-	);
-
 	onMount(() => {
 		theme.init();
-		studio.startPolling();
+		void auth.init();
 	});
 
-	onDestroy(() => {
-		studio.stopPolling();
+	$effect(() => {
+		if (auth.state !== 'ready') return;
+		studio.startPolling();
+		events.start();
+		return () => {
+			studio.stopPolling();
+			events.stop();
+		};
 	});
+
+	const title = $derived(navLabelFor(page.url.pathname));
 </script>
 
 <svelte:head>
 	<title>{title} · agent-voice</title>
 	<meta
 		name="description"
-		content="Local studio for the agent-voice headless speech server: synthesis, voices, transcription, models."
+		content="Local Studio for the agent-voice speech daemon: speak, clone voices, transcribe and manage models."
 	/>
 	<link rel="icon" href={favicon} />
 </svelte:head>
 
-<AppShell {groups} {currentPath} {children} />
+{#if auth.state === 'ready'}
+	<AppShell>{@render children()}</AppShell>
+{:else}
+	<AuthGate />
+{/if}

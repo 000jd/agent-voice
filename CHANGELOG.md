@@ -42,6 +42,19 @@ packaged UI without making Python users install Node."
   with the documented `/ui` redirect/fallback rules and a strict CSP. `AGENT_VOICE_UI`
   and `serve --no-ui` disable it without importing UI code. The wheel contains the
   assets and no frontend source; no Node is needed at install or runtime.
+- **Studio UI (Graphite & Brass).** The packaged SPA is now the final six-screen
+  Studio: one rail, session-key gate, voice grid with one card per preset speaker,
+  browser upload/record → trim → transcript → consent cloning, a three-pane Speak
+  workspace with authenticated SSE and durable takes, Transcribe with server-side
+  subtitle export, unified Library, Models, and grouped Settings/diagnostics. The
+  visual system is original; tokens, accessibility and anti-slop rules are documented
+  in `docs/frontend/design-system.md`. Opening a `/ui` screen no longer leaks
+  exception paths; `/docs` and `/openapi*` require the token when a key is configured.
+- **Studio verification.** Daemon-served Playwright covers the live speak/clone/
+  transcribe/library flow, both themes and four viewports, Axe with zero serious or
+  critical findings, and 99 committed screenshots under `docs/frontend/screenshots/`.
+  `scripts/seed_demo.py` populates an isolated mock daemon through the public REST
+  API; `scripts/build_web.py` now writes CSP hashes and strips stale hashed assets.
 - **Research and contracts.** `docs/frontend/phase0-studio-research.md`, expanded
   `docs/api.md`/`docs/config.md`, and this cross-platform ingest/studio test suite.
 
@@ -56,39 +69,12 @@ packaged UI without making Python users install Node."
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- **Frontend studio preview.** A crafted obsidian/cobalt static Svelte 5 + SvelteKit 3
-  SPA in `frontend/`, built for a future `/ui` mount: `adapter-static` with `200.html`,
-  `ssr = false`, `/ui` base, Tailwind CSS 4, shadcn-svelte/Bits UI, Inter/Fontsource,
-  a hand-rolled token system and a responsive studio shell. Working **Speak**
-  (markup composer, Clone/Preset/Design inspector, session takes), **Voices**
-  (cloned/designed library, grouped engine presets, two-stage design audition/save,
-  clone drawer), **Models & Engines**, **Transcribe** (multipart upload, timed
-  segments, SRT/VTT), **Dashboard**, session-local **History** and read-only
-  **Settings**. A global docked player uses `fetch` + Web Audio-decoded SVG peaks,
-  speed, volume, download and a clear 401 path. The daemon, CLI, MCP server, installers
-  and Python package are unchanged, and Python users never need Node or Bun.
-- **Studio design system.** `docs/frontend/design-system.md` records the exact dark and
-  light surface ladders, typography/tabular-number rules, geometry, component
-  restraint, accessibility and the anti-AI-slop checklist. The voice library is a
-  single dense table surface with one grouped preset row per engine/model, not a fake KPI
-  grid. No Dribbble assets are committed.
-- **Typed API boundary.** `scripts/export_openapi.py` writes a deterministic
-  `frontend/openapi.json` from a temporary app context (`mount_mcp=False`, no workers,
-  no torch); `openapi-typescript` generates the committed TypeScript schema and
-  `openapi-fetch`'s path-based client reads it. `/health` and `/v1/engines` are
-  locally type-guarded because those routes still lack response models.
-- **Frontend quality gates.** Vitest + happy-dom unit/component tests for design
-  tokens, formatting, markup, player state, Speak capability/composer/inspector,
-  voices, transcription requests and the shell; a live Playwright suite that starts an
-  isolated `mock` + `mock_asr` daemon, generates and plays a real render, designs/saves
-  a voice, uploads a clip and downloads SRT, and captures desktop/mobile screens in
-  `/tmp/agent-voice-qa/`; ESLint 10 + Prettier; a Svelte 5 blocklist checker; a
-  scoped `tsc` gate alongside `svelte-check`; a static `/ui` fallback check; a separate
-  `frontend-ci.yml` with OpenAPI drift and `bun audit --audit-level=high`; and the
-  Phase 0 research/architecture/design docs. Exact pins, a committed `bun.lock`, and
-  Bun's 14-day release-age/install-script policy apply. No version bump or tag.
+- The initial pre-release Studio preview (cobalt, grouped rail plus top tabs, table
+  library, session-only history, inbox-path cloning) was replaced before release by
+  the Graphite & Brass Studio documented above. The preview was never released; no
+  migration or compatibility shim is retained.
 
 ## [0.6.0] — 2026-11-27 — `fd3ec50`
 

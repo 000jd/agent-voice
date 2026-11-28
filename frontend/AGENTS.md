@@ -31,19 +31,21 @@ Read it before changing tokens, spacing or a screen.
 
 - **Dark is default.** Light mode is a full token set, not an afterthought. Do not
   default from the OS colour scheme.
-- Follow the surface ladder: canvas `#060606`, panel `#0B0B0E`, elevated `#111116`,
-  hover `#16161D`, hairline `rgba(255,255,255,0.08)`. Use tokens, not raw hexes in
-  components.
-- Cobalt `#1721EF` is for primary action, focus, selection and the played waveform.
-  Warning, success and danger are state colours, not decoration.
-- No purple-pink-cyan gradients, glows, glass, emoji labels, fake KPIs, fake
-  sparklines or invented metadata. See the design-system document for the full list.
-- Every timestamp, duration, VRAM figure, RTF, seed and character counter is tabular
-  (the body already sets `font-variant-numeric: tabular-nums`; keep mono on metrics).
-- The shell is a full-width studio bar with a 236/64px rail below it; the player is
-  docked in the content column, not over the rail. Dark is default.
-- The voice library is one dense table surface, not a grid of oversized cards. Preset
-  speakers are grouped by engine/model; do not render one giant row per speaker.
+- Follow the Graphite & Brass tokens in `src/app.css`: `--canvas`, `--panel`,
+  `--surface`, `--rule`, `--text`, `--signal`. Use tokens, not raw hexes.
+- Brass `--signal` is the one accent: primary action, focus, selection and the played
+  waveform. Success, danger and warning are state colours, not decoration.
+- No gradients, glows, glass, emoji labels, fake KPIs, fake sparklines or invented
+  metadata. Voice avatars are flat deterministic monograms, not gradient blobs.
+- Every timestamp, duration, VRAM figure, seed and character counter is tabular
+  (`font-variant-numeric: tabular-nums`; keep mono on metrics).
+- The shell is one 224/64px rail (Speak, Voices, Transcribe, Library, Models,
+  Settings) with a 56px top bar. No top tabs. The player is docked in the content
+  column. Dark is default; light is a full token swap.
+- The voice library is a grid of voice cards; presets are one card per speaker.
+  Never render engine checkpoints as voices.
+- The UI validates `/v1/auth/check` and gates the shell behind a session key
+  (`sessionStorage` only). The key never goes in a URL or localStorage.
 - Every screen has loading, empty, error and (where relevant) offline states. Do not
   leave a fake success state.
 
@@ -51,16 +53,15 @@ Read it before changing tokens, spacing or a screen.
 
 - Do not edit `src/agent_voice/`, `engines/`, or `tests/` from a frontend task.
   The only approved Python-side files are `scripts/export_openapi.py` and its test.
-- The only daemon contract used here is REST. No UI-only endpoint, no UI flag that
-  changes Python behaviour, no auth/login.
+- The only daemon contract used here is REST. No UI-only endpoint and no UI flag
+  that changes Python behaviour. Auth is a key gate over the existing guard.
 - Security-sensitive settings are read-only from the UI: `api_key`, `host`,
   `allowed_hosts`, `allow_any_path`, `mcp_base_path`,
   `allow_agent_engine_mutation`, `require_engine_approval`, `toolset`, and the
   home/data/engines paths.
 - Same origin only. Do not add CORS, a public dev tunnel, or an external request.
-- There is no REST `server_info`; do not fabricate an exact inbox path. Show the
-  `<DATA_DIR>/inbox/` convention and the `agent-voice doctor` hint, then surface the
-  API's own error suggestion.
+- `GET /v1/server_info` provides the display paths, limits and UI state. Do not
+  fabricate metadata the API does not return.
 
 ## API client and stores
 

@@ -4,10 +4,9 @@ A local studio for the `agent-voice` daemon. It is a **static SPA** served at `/
 with no server-side rendering and no backend logic. The v0.7 daemon ships the built
 assets under `src/agent_voice/web/`; Node and Bun remain development-only.
 
-The current preview has working Speak, Voices, Models & Engines, Transcribe,
-History and Settings screens. The backend now supplies drafts, durable history and
-captures, SSE, previews and settings. The original **Graphite & Brass** visual system
-and the new information architecture are the Part 2 rewrite; see
+The v0.7 Studio is the final **Graphite & Brass** design: one navigation rail, a
+session-key gate, durable history, SSE progress and the browser draft/trim clone
+flow. There is no server-path field anywhere in the UI. See
 `docs/frontend/architecture.md` and the design-system document before changing UI.
 
 ## Requirements
@@ -50,15 +49,14 @@ are exposed to the browser bundle. The value stays in the Vite process.
 
 ## Screens
 
-| Screen           | What it does                                                                       |
-| ---------------- | ---------------------------------------------------------------------------------- |
-| Speak            | Markup-aware composer, clone/preset/design inspector, session takes, global player |
-| Voices           | Cloned/designed library, grouped engine preset speakers, design/clone drawers      |
-| Models & Engines | Live install/device/downloaded/loaded/VRAM state; unload all                       |
-| Transcribe       | Multipart upload, transcript, timed segments, SRT/VTT download                     |
-| Dashboard        | Live daemon/GPU state and session renders                                          |
-| History          | Session-local renders; durable job history is not exposed by REST                  |
-| Settings         | Read-only runtime/security view and theme                                          |
+| Screen     | What it does                                                                               |
+| ---------- | ------------------------------------------------------------------------------------------ |
+| Speak      | Three-pane voice → script → inspector workspace, SSE jobs, durable takes, docked player    |
+| Voices     | Voice grid and one-card-per-speaker presets; clone (upload/record/trim/consent) and design |
+| Transcribe | Upload or record, persistent captures, editable transcript, server SRT/VTT/TXT/JSON        |
+| Library    | Unified durable history and captures, filters, favourites, replay, re-render               |
+| Models     | Engine cards, install/device/weights/loaded/VRAM state, unload all                         |
+| Settings   | Safe settings, read-only security keys, diagnostics, MCP config, lexicon, cache            |
 
 The visual system and anti-slop rules are in
 [`docs/frontend/design-system.md`](../docs/frontend/design-system.md). Read it with
@@ -77,7 +75,9 @@ The visual system and anti-slop rules are in
 | `bun run lint`          | Prettier check + ESLint                                     |
 | `bun run format`        | Prettier write                                              |
 | `bun run test`          | Vitest unit/component tests (happy-dom)                     |
-| `bun run test:e2e`      | Playwright live tests + screenshots (Chromium)              |
+| `bun run test:e2e`      | daemon-served Playwright tests, Axe and screenshots         |
+| `bun run build:web`     | rebuild `src/agent_voice/web` + CSP hashes                  |
+| `bun run demo:seed`     | seed a running mock daemon for visual review                |
 | `bun run gen:api`       | export OpenAPI, regenerate `schema.d.ts`                    |
 | `bun run check:api`     | fail if either generated file is stale                      |
 | `bun run preview`       | Vite preview of the production build                        |
@@ -88,14 +88,15 @@ the TS-only gate to make a component compile.
 
 ## Live browser tests and screenshots
 
-`bun run test:e2e` starts a real `agent-voice serve` on `127.0.0.1:8765` with
-`mock` + `mock_asr`, `AGENT_VOICE_DATA_DIR=/tmp/agent-voice-qa-data`, and the real
-plugin manifests from `engines/`. It tests navigation, theme, the offline state, live
-Speak playback, design/save, transcription and SRT download, then captures desktop
-and mobile screens in `/tmp/agent-voice-qa/`.
+`bun run test:e2e` builds the SPA into the package and starts the real daemon at
+`http://127.0.0.1:8765/ui/` with `mock` + `mock_asr`, a temporary data dir and the
+real manifests. It covers navigation, theme, command palette, live Speak playback,
+upload → trim → clone → save, transcription/export, the library, all screens in both
+themes with Axe, and the screenshot matrix under `docs/frontend/screenshots/`.
 
-The QA daemon is isolated: no user voices, cache or GPU state are touched. Delete
-`/tmp/agent-voice-qa-data` to reset it. The screenshots are not committed.
+`bun run demo:seed` adds four voices, preset renders and a capture to a running mock
+daemon. Both the suite and the seed use the public REST API; no user cache or GPU
+state is touched.
 
 ## API types and guards
 
@@ -137,25 +138,27 @@ The host serves `/ui/*` from `build/`, but:
   `build/200.html`;
 - `/ui` redirects to `/ui/`.
 
-`bun run check:spa` proves this locally against the built output. The daemon currently
-does not mount `/ui`; that is the next backend release.
+`bun run check:spa` proves this locally against the built output; the daemon mounts
+`/ui` when `AGENT_VOICE_UI=on` (default) and serves the same contract with a strict
+CSP that includes hashes for SvelteKit's inline bootstrap scripts.
 
 ## Security and offline behaviour
 
-- Same-origin only. The UI is another REST client; it has no auth system and never
-  edits Tier-A settings (`api_key`, bind, allowed hosts, path confinement, engine
-  mutation, toolset, homes/dirs).
+- Same-origin only. The UI is another REST client. A keyed daemon is unlocked with a
+  session key validated by `/v1/auth/check`; it lives in memory/sessionStorage, never
+  localStorage or a URL. The UI never edits Tier-A settings (`api_key`, bind, allowed
+  hosts, path confinement, engine mutation, toolset, homes/dirs).
 - No external runtime requests: Inter is self-hosted via Fontsource, icons are
   bundled from `@lucide/svelte`, and the only network traffic is to the daemon.
 - No telemetry, analytics, service worker or CDN.
 - `/audio/<id>` is bearer-protected. The player fetches it with same-origin
   credentials and uses `URL.createObjectURL`; on a keyed daemon it shows the 401
   explanation instead of a fake player. It never stores the key.
-- WebSocket auth uses `Sec-WebSocket-Protocol: bearer, <key>`; SSE needs `fetch` +
-  `eventsource-parser` because `EventSource` cannot set headers. Neither is wired yet.
-- The clone drawer cannot show an exact inbox path: REST has no `server_info`.
-  It shows `<DATA_DIR>/inbox/` and the `agent-voice doctor` hint, and surfaces the
-  daemon's own rejection suggestion.
+- WebSocket auth uses `Sec-WebSocket-Protocol: bearer, <key>`; SSE uses authenticated
+  `fetch` streaming with `Last-Event-ID`, because `EventSource` cannot set headers.
+  The token never appears in a URL.
+- The clone dialog uses draft upload only. It never asks for a server path; the
+  session manifest, limits and paths come from `/v1/server_info`.
 
 ## Svelte 5 rules
 

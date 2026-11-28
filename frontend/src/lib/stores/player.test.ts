@@ -1,5 +1,5 @@
 import { expect, test, vi } from 'vitest';
-import { ApiError } from '#lib/api/studio.js';
+import { ApiError } from '#lib/api/client.js';
 import { makeClip } from '#lib/test-fixtures.js';
 import { createPlayer, type AudioLike, type PlayerDeps } from './player.svelte.js';
 
@@ -81,7 +81,8 @@ test('turns a 401 into a clear daemon-key message', async () => {
 				status: 401,
 				code: 'UNAUTHORIZED',
 				message: 'Unauthorized',
-				suggestion: ''
+				suggestion: '',
+				correlationId: ''
 			})
 		) as PlayerDeps['fetchAudio']
 	);

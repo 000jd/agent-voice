@@ -1,159 +1,15 @@
-import type {
-	ClipSummary,
-	DesignCandidate,
-	DesignVoiceRequest,
-	EngineSummary,
-	VoiceSource,
-	VoiceSummary
-} from '#lib/api/types.js';
-
-export type BuiltinPreset = {
-	kind: 'preset';
-	id: string;
-	name: string;
-	engineId: string;
-	engineName: string;
-	modelAlias: string;
-	speaker: string;
-	supportsInstruct: boolean;
-};
-
-export type VoiceItem =
-	| { kind: 'voice'; id: string; name: string; voice: VoiceSummary }
-	| { kind: 'preset'; id: string; name: string; preset: BuiltinPreset };
-
-export type PresetGroup = {
-	id: string;
-	engineId: string;
-	engineName: string;
-	modelAlias: string;
-	speakers: string[];
-	supportsInstruct: boolean;
-};
+/** Voice library presentation helpers: monograms, labels, compatibility, search. */
+import type { EngineSummary, ModelSummary, PresetVoice, VoiceSummary } from '#lib/api/types.js';
 
 export const VOICE_FILTERS = ['all', 'cloned', 'designed', 'preset'] as const;
 export type VoiceFilter = (typeof VOICE_FILTERS)[number];
 
-export const DEFAULT_DESIGN_SAMPLE =
-	'Welcome! Today we are going to break down this concept step by step, clearly and intuitively.';
-
-export function builtinPresets(engines: EngineSummary[]): BuiltinPreset[] {
-	const presets: BuiltinPreset[] = [];
-	for (const engine of engines) {
-		if (engine.kind !== 'tts') continue;
-		for (const model of engine.models) {
-			for (const speaker of model.presetSpeakers) {
-				presets.push({
-					kind: 'preset',
-					id: `preset:${engine.id}:${model.alias}:${speaker}`,
-					name: `${speaker} — ${engine.displayName}`,
-					engineId: engine.id,
-					engineName: engine.displayName,
-					modelAlias: model.alias,
-					speaker,
-					supportsInstruct: model.supportsInstruct
-				});
-			}
-		}
-	}
-	return presets;
-}
-
-export function builtinPresetGroups(engines: EngineSummary[]): PresetGroup[] {
-	const groups: PresetGroup[] = [];
-	for (const engine of engines) {
-		if (engine.kind !== 'tts') continue;
-		for (const model of engine.models) {
-			if (model.presetSpeakers.length === 0) continue;
-			groups.push({
-				id: `preset-group:${engine.id}:${model.alias}`,
-				engineId: engine.id,
-				engineName: engine.displayName,
-				modelAlias: model.alias,
-				speakers: model.presetSpeakers,
-				supportsInstruct: model.supportsInstruct
-			});
-		}
-	}
-	return groups;
-}
-
-export function filterPresetGroups(groups: PresetGroup[], query: string): PresetGroup[] {
-	const needle = query.trim().toLowerCase();
-	if (!needle) return groups;
-	return groups.filter(
-		(group) =>
-			group.engineName.toLowerCase().includes(needle) ||
-			group.engineId.toLowerCase().includes(needle) ||
-			group.modelAlias.toLowerCase().includes(needle) ||
-			group.speakers.some((speaker) => speaker.toLowerCase().includes(needle))
-	);
-}
-
-export function voiceItems(voices: VoiceSummary[], engines: EngineSummary[]): VoiceItem[] {
-	const items: VoiceItem[] = voices.map((voice) => ({
-		kind: 'voice',
-		id: voice.id,
-		name: voice.name,
-		voice
-	}));
-	for (const preset of builtinPresets(engines)) {
-		items.push({ kind: 'preset', id: preset.id, name: preset.name, preset });
-	}
-	return items;
-}
-
-export function filterVoiceItems(
-	items: VoiceItem[],
-	filter: VoiceFilter,
-	query: string
-): VoiceItem[] {
-	const needle = query.trim().toLowerCase();
-	return items.filter((item) => {
-		if (filter !== 'all') {
-			if (item.kind === 'preset') {
-				if (filter !== 'preset') return false;
-			} else if (item.voice.source !== filter) {
-				return false;
-			}
-		}
-		if (!needle) return true;
-		if (item.kind === 'preset') {
-			return (
-				item.preset.name.toLowerCase().includes(needle) ||
-				item.preset.engineId.toLowerCase().includes(needle) ||
-				item.preset.modelAlias.toLowerCase().includes(needle)
-			);
-		}
-		return (
-			item.voice.name.toLowerCase().includes(needle) ||
-			item.voice.refText.toLowerCase().includes(needle) ||
-			item.voice.designInstruct.toLowerCase().includes(needle)
-		);
-	});
-}
-
-export function countFilter(items: VoiceItem[], filter: VoiceFilter): number {
-	if (filter === 'all') return items.length;
-	return items.filter((item) =>
-		item.kind === 'preset' ? filter === 'preset' : item.voice.source === filter
-	).length;
-}
-
-export function voiceSourceLabel(source: VoiceSource): string {
-	return source === 'designed' ? 'Designed' : 'Cloned';
-}
-
-const TONES = ['cobalt', 'navy', 'steel', 'amber'] as const;
-export type VoiceTone = (typeof TONES)[number];
-
-export function voiceTone(name: string): VoiceTone {
-	let hash = 0;
-	for (let index = 0; index < name.length; index += 1) {
-		hash = (hash * 31 + name.charCodeAt(index)) >>> 0;
-	}
-	return TONES[hash % TONES.length] ?? 'cobalt';
-}
+export const VOICE_FILTER_LABELS: Record<VoiceFilter, string> = {
+	all: 'All',
+	cloned: 'Cloned',
+	designed: 'Designed',
+	preset: 'Presets'
+};
 
 export function initials(name: string): string {
 	const words = name
@@ -161,77 +17,137 @@ export function initials(name: string): string {
 		.split(/\s+/)
 		.filter(Boolean);
 	if (words.length === 0) return 'AV';
-	if (words.length === 1) return words[0]!.slice(0, 2).toUpperCase();
-	return `${words[0]![0] ?? ''}${words[1]![0] ?? ''}`.toUpperCase();
+	if (words.length === 1) return (words[0] ?? '').slice(0, 2).toUpperCase();
+	return `${(words[0] ?? '')[0] ?? ''}${(words[1] ?? '')[0] ?? ''}`.toUpperCase();
 }
 
-export function designRequest(input: {
-	name: string;
-	instruct: string;
-	sampleText: string;
-	language: string;
-	candidates: number;
-	engineId: string;
-	modelAlias: string;
-	take?: number | null;
-	seed?: number | null;
-	saveAsClone: boolean;
-}): DesignVoiceRequest {
-	return {
-		name: input.name.trim(),
-		instruct: input.instruct.trim(),
-		sample_text: input.sampleText.trim() || DEFAULT_DESIGN_SAMPLE,
-		language: input.language,
-		save_as_clone: input.saveAsClone,
-		candidates: input.candidates,
-		take: input.take ?? null,
-		seed: input.seed ?? null,
-		overwrite: false,
-		engine: input.engineId || null,
-		model: input.modelAlias || null,
-		quality: 'high'
-	};
+export function voiceKindLabel(voice: VoiceSummary): string {
+	return voice.kind === 'designed' ? 'Designed' : 'Cloned';
 }
 
-export function findDesignEngine(engines: EngineSummary[]): EngineSummary | null {
+export function voiceLanguageLabel(voice: VoiceSummary): string {
+	return voice.language && voice.language.trim() ? voice.language : 'Auto';
+}
+
+export function matchesQuery(voice: VoiceSummary, query: string): boolean {
+	const needle = query.trim().toLowerCase();
+	if (!needle) return true;
 	return (
-		engines.find(
-			(engine) =>
-				engine.kind === 'tts' && engine.models.some((model) => model.mode === 'voice_design')
-		) ?? null
+		voice.name.toLowerCase().includes(needle) ||
+		voice.refText.toLowerCase().includes(needle) ||
+		voice.designInstruct.toLowerCase().includes(needle) ||
+		voice.language.toLowerCase().includes(needle)
 	);
 }
 
-export function findDesignModel(engine: EngineSummary | null): string {
-	if (!engine) return '';
+export function filterVoices(
+	voices: VoiceSummary[],
+	filter: VoiceFilter,
+	query: string
+): VoiceSummary[] {
+	if (filter === 'preset') return [];
+	return voices.filter((voice) => {
+		if (filter !== 'all' && voice.kind !== filter) return false;
+		return matchesQuery(voice, query);
+	});
+}
+
+export function cloneModel(engine: EngineSummary): ModelSummary | null {
 	return (
-		engine.models.find((model) => model.mode === 'voice_design' && model.downloaded)?.alias ??
-		engine.models.find((model) => model.mode === 'voice_design')?.alias ??
-		''
+		engine.models.find((model) => model.mode === 'clone' && model.downloaded) ??
+		engine.models.find((model) => model.mode === 'clone') ??
+		null
 	);
 }
 
-export function clipFromCandidate(
-	candidate: DesignCandidate,
-	name: string,
-	engineId: string,
-	modelAlias: string
-): ClipSummary {
-	return {
-		id: `design:${engineId}:${modelAlias}:${candidate.take}:${candidate.seed ?? 'auto'}`,
-		title: `${name} · take ${candidate.take}`,
-		subtitle: `${engineId} · ${modelAlias}`,
-		url: candidate.downloadUrl || candidate.filePath,
-		durationSec: candidate.durationSec,
-		engineId,
-		modelAlias,
-		cached: false,
-		elapsedMs: 0,
-		realtimeMultiple: null,
-		format: 'wav',
-		createdAt: Date.now(),
-		voiceId: null,
-		speaker: null,
-		mode: 'voice_design'
-	};
+/** TTS engines that can speak a cloned reference, installed first. */
+export function cloneCapableEngines(engines: EngineSummary[]): EngineSummary[] {
+	return engines
+		.filter((engine) => engine.kind === 'tts' && cloneModel(engine) !== null)
+		.sort((left, right) => Number(right.installed) - Number(left.installed));
+}
+
+export function voiceCompatibility(
+	voice: VoiceSummary,
+	engines: EngineSummary[]
+): { engineId: string; modelAlias: string } | null {
+	const capable = cloneCapableEngines(engines);
+	if (capable.length === 0) return null;
+	for (const support of voice.engineSupport) {
+		const engine = capable.find((item) => item.id === support.engineId);
+		if (!engine) continue;
+		const model = engine.models.find((item) => item.alias === support.modelAlias);
+		if (model) return { engineId: engine.id, modelAlias: model.alias };
+	}
+	const engine = capable[0];
+	if (!engine) return null;
+	const model = cloneModel(engine);
+	if (!model) return null;
+	return { engineId: engine.id, modelAlias: model.alias };
+}
+
+/** Presets arrive one row per speaker; the UI shows exactly one card per speaker. */
+export function uniquePresets(presets: PresetVoice[]): PresetVoice[] {
+	const seen = new Set<string>();
+	const result: PresetVoice[] = [];
+	for (const preset of presets) {
+		const key = `${preset.engineId}:${preset.speaker}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		result.push(preset);
+	}
+	return result;
+}
+
+export function filterPresets(
+	presets: PresetVoice[],
+	filter: VoiceFilter,
+	query: string
+): PresetVoice[] {
+	if (filter !== 'all' && filter !== 'preset') return [];
+	const needle = query.trim().toLowerCase();
+	const unique = uniquePresets(presets);
+	if (!needle) return unique;
+	return unique.filter(
+		(preset) =>
+			preset.displayName.toLowerCase().includes(needle) ||
+			preset.speaker.toLowerCase().includes(needle) ||
+			preset.engineId.toLowerCase().includes(needle) ||
+			preset.modelAlias.toLowerCase().includes(needle) ||
+			preset.languages.some((language) => language.toLowerCase().includes(needle))
+	);
+}
+
+export function presetId(preset: PresetVoice): string {
+	return `${preset.engineId}:${preset.modelAlias}:${preset.speaker}`;
+}
+
+export function presetModel(
+	engines: EngineSummary[],
+	preset: PresetVoice
+): { engine: EngineSummary; model: ModelSummary } | null {
+	const engine = engines.find((item) => item.id === preset.engineId);
+	if (!engine) return null;
+	const model = engine.models.find((item) => item.alias === preset.modelAlias);
+	if (!model) return null;
+	return { engine, model };
+}
+
+export function presetAvailability(
+	engines: EngineSummary[],
+	preset: PresetVoice
+): 'ready' | 'needs-download' | 'unavailable' {
+	const found = presetModel(engines, preset);
+	if (!found) return 'unavailable';
+	if (!found.engine.installed) return 'unavailable';
+	return found.model.downloaded ? 'ready' : 'needs-download';
+}
+
+export const PREVIEW_TEXT = 'The room is quiet. Here is how this voice sounds.';
+
+export function totalDurationSeconds(voices: VoiceSummary[]): number {
+	return voices.reduce(
+		(sum, voice) => sum + (Number.isFinite(voice.durationSec) ? voice.durationSec : 0),
+		0
+	);
 }

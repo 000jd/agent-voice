@@ -1,0 +1,1 @@
+import{t as e}from"../chunks/DK3Fl9T5.js";import{t}from"../chunks/uPVjYJmJ.js";import{t as n}from"../chunks/DTh65f6t.js";import"../chunks/570dATS7.js";var r=e({load:()=>i});function i(){n(307,t(`speak`))}export{r as universal};

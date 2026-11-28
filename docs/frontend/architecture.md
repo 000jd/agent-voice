@@ -1,16 +1,16 @@
 # Frontend architecture and `/ui` serving contract
 
-Status: **v0.7 backend wired, studio visual rewrite pending**. `frontend/` builds the
-static SPA and the daemon now serves the packaged copy at `/ui`; `AGENT_VOICE_UI` and
-`serve --no-ui` disable it. The v0.7 backend adds drafts, persistent history/captures,
-SSE, settings and previews. The original Graphite & Brass visual system and the new
-information architecture are Part 2 work; the current preview shell is not the final
-design.
+Status: **v0.7 Studio shipped**. `frontend/` builds the static SPA and the daemon
+serves the packaged copy at `/ui`; `AGENT_VOICE_UI` and `serve --no-ui` disable it.
+The final UI is the original Graphite & Brass system: one rail, six screens, a
+session-key gate, durable history/captures, authenticated SSE and browser-only draft
+cloning. The design tokens live in `docs/frontend/design-system.md`.
 
 ## Boundaries
 
-- The UI is one more REST client of the local daemon. There is no UI-only endpoint,
-  no UI-side auth, and no UI flag that changes Python behaviour.
+- The UI is one more REST client of the local daemon. There is no UI-only endpoint
+  and no UI flag that changes Python behaviour. A keyed daemon is unlocked by a
+  session key validated through `/v1/auth/check` and held in memory/sessionStorage.
 - The daemon stays headless-capable. CLI and MCP users never need Node, Bun or a
   browser. Python installation never runs a JavaScript toolchain.
 - Same origin. The UI calls `/health`, `/v1/...` and `/audio/...`; the daemon serves
@@ -51,7 +51,7 @@ frontend/build/
 There is no `build/index.html` and no `/ui` prefix inside the output tree. Asset URLs
 inside `200.html` are absolute `/ui/_app/...`.
 
-## Serving contract (for the future daemon mount)
+## Serving contract (implemented by `routes_ui.py`)
 
 The host must implement this exactly:
 
@@ -72,11 +72,16 @@ error envelope. Use an explicit `/ui` route (or a dedicated static subclass) so 
 SPA route and a missing asset remain distinguishable.
 
 `/ui` is deliberately **not** under the guard's bearer prefixes (`/v1`, `/audio`,
-`/mcp`), because a browser fetching static assets cannot attach `Authorization`.
-Host and Origin checks still apply. The API calls the page makes remain protected
-when `AGENT_VOICE_API_KEY` is set; the UI never stores that key and never adds a
-login form. Audio on a keyed deployment reports the 401 instead of pretending it can
-play.
+`/mcp`), because static assets must load before the key is entered. Host and Origin
+checks still apply. The API calls the page makes remain protected when
+`AGENT_VOICE_API_KEY` is set; the UI validates the key with `/v1/auth/check`, stores
+it in memory/sessionStorage (never localStorage or a URL), and clears it on any 401.
+
+The CSP is strict (`default-src 'self'`, no object/frame embedding) and includes
+SHA-256 hashes for SvelteKit's inline bootstrap scripts. `scripts/build_web.py`
+computes those hashes into `csp-sha256.json`; `routes_ui.py` appends them to
+`script-src` when the app starts. Rebuild the web assets after changing the app
+shell, or the browser will reject the inline bootstrap.
 
 ## Development proxy
 
@@ -117,25 +122,25 @@ proxy get the rewrite, and a foreign direct request is still 403.
 
 ## Studio screens
 
-- **Shell:** full-width 52px studio bar (brand, Studio/Explore/System, voice search,
-  primary action), 236/64px grouped rail below it, live connection badge and GPU/VRAM
-  pill with unload. The two-tier player is docked inside the content column so the rail
-  remains visible; mobile uses a menu panel instead of the rail.
-- **Speak:** large editorial markup composer, capability-aware Clone/Preset/Design
-  inspector with underline Setup/Session tabs, session list. `Ctrl/Cmd+Enter` generates; successful renders enter the
-  global session store and the player.
-- **Voices:** one table surface. Cloned/designed voices plus preset groups (one row per
-  engine/model, with a speaker selector). Design is two-stage: audition 2–3 takes, then re-render the
-  chosen take with `take`/`seed` and `save_as_clone`. Clone accepts a confined inbox
-  path; the exact path is not exposed by REST, so the drawer shows the convention and
-  the `agent-voice doctor` hint.
-- **Models & Engines:** live installed/device/downloaded/loaded/VRAM state, grouped
-  TTS/ASR, unload; no install/download mutation UI.
-- **Transcribe:** multipart upload to `/v1/audio/transcriptions` with
-  `response_format=verbose_json`; transcript, timed segments, client-side SRT/VTT.
-  Inline truncation is stated, including the daemon-side JSON path.
-- **Dashboard/History/Settings:** live status and recent session renders; History is
-  explicitly session-local; Settings is read-only except theme.
+- **Shell:** one 224/64px rail (Speak, Voices, Transcribe, Library, Models, Settings),
+  a 56px top bar with title, command palette (Ctrl/Cmd+K), connection + GPU chip,
+  theme and help, and one docked player. Mobile uses a two-row bottom rail.
+- **Speak:** three independent panes — searchable voice/preset picker, markup script
+  editor with takes, and a voice-derived inspector. Jobs stream over authenticated
+  SSE; takes are durable history and can be compared, favourited, downloaded,
+  re-rolled or deleted.
+- **Voices:** a voice grid plus one card per preset speaker. Clone is a three-step
+  browser flow (upload/record → trim + quality + transcript → name + consent) that
+  sends only a draft id; design auditions takes. There is no server-path field.
+- **Models:** real engine/model state, device variants, install/reinstall, load/unload
+  and unload-all. A multi-GB download is confirmed before it starts.
+- **Transcribe:** upload or record, server-side ASR, editable persisted transcript,
+  timed segments and server-generated SRT/VTT/TXT/JSON; a capture can become a draft.
+- **Library:** unified durable history and captures with search, filters, favourites,
+  replay, re-render and delete.
+- **Settings:** grouped safe settings with source/shadow display, read-only security
+  keys, diagnostics, MCP config, lexicon and cache controls; restart-required is
+  stated. Auth is a session-key gate, not a stored credential UI.
 
 ## Audio player
 
@@ -159,12 +164,13 @@ path is mandatory.
   export types from `.svelte` are excluded from tsc and stay under svelte-check.
 - `bun run check:svelte5` — line-level Svelte 4 / Kit 2 blocklist.
 - `bun run lint` — Prettier + ESLint 10.
-- `bun run test` — Vitest 5, happy-dom, Testing Library; design tokens, format,
-  markup, player state, Speak capability/composer/inspector, voices, transcription
-  request, shell and dashboard.
-- `bun run test:e2e` — Playwright 1.65 starts an isolated mock daemon and Vite, then
-  runs navigation/theme/error, live Speak playback, design/save, transcribe upload/SRT,
-  models, and desktop/mobile visual captures. It needs `uv` and `ffmpeg`.
+- `bun run test` — Vitest 5, happy-dom; format, markup, player, SSE parsing, voice
+  compatibility, preset deduplication and Speak request construction.
+- `bun run test:e2e` — Playwright 1.65 builds the SPA and starts an isolated daemon
+  serving `/ui` with mock TTS/ASR. It covers navigation/theme/palette, live Speak,
+  upload → trim → clone → save, transcription/export, the library, both themes with
+  Axe (0 serious/critical), and the committed screenshot matrix in
+  `docs/frontend/screenshots/`. It needs `uv` and `ffmpeg`.
 - `bun run build` then `bun run check:spa` — static `/ui/` fallback and `_app` 404.
 - `bun run check:api` — exporter + OpenAPI types are current.
 - `bun audit --audit-level=high` — blocking supply-chain gate.
@@ -178,9 +184,9 @@ Node/Bun and copies the result to `src/agent_voice/web/` with a content manifest
 mounts that directory with the serving contract above. `uv build` includes the assets
 and excludes frontend source; a tagged clone + `uv sync` needs no Node.
 
-## Deferred screens
+## Honest limits
 
-The v0.7 backend now supplies drafts, durable history/captures, SSE, diagnostics,
-lexicon/cache, settings and auth-check. Still deferred: a microphone capture flow,
-the token-entry UI, a real WebSocket studio stream, and any UI-only backend route.
-Do not add them by inventing an endpoint.
+Microphone recording works through `MediaRecorder` in Chromium and Firefox; WebKitGTK
+and Safari recording are not verified. The Studio uses authenticated fetch streaming,
+not a WebSocket. No UI-only backend route exists; add a backend contract first rather
+than inventing one in the client.

@@ -1,75 +1,35 @@
-import {
-	ApiError,
-	deleteVoice,
-	describeApiError,
-	getEngines,
-	getGpu,
-	getHealth,
-	getVoices,
-	unloadModels
-} from '#lib/api/studio.js';
+/**
+ * Catalog and liveness: health, GPU, engines, voices and presets.
+ *
+ * Polling lives here (started by the shell) so no page owns a timer.
+ */
+import { describeApiError, ApiError } from '#lib/api/client.js';
+import { listPresets } from '#lib/api/presets.js';
+import { getEngines, getGpu, getHealth, unloadModels } from '#lib/api/studio.js';
+import { listVoices } from '#lib/api/voices.js';
 import type {
 	ApiErrorPayload,
-	ClipSummary,
 	EngineSummary,
 	GpuStatus,
+	HealthState,
 	HealthSummary,
-	SpeakConfig,
-	SpeakResult,
+	PresetVoice,
 	UnloadResult,
 	VoiceSummary
 } from '#lib/api/types.js';
-import {
-	configForEngine,
-	configForMode,
-	createDefaultSpeakConfig,
-	defaultSpeakConfig,
-	presetForSpeak,
-	voiceForSpeak
-} from '#lib/speak.js';
-import type { BuiltinPreset } from '#lib/voices.js';
-import { shortText } from '#lib/format.js';
 
-type Connection = 'checking' | 'connected' | 'offline';
+const POLL_MS = 5000;
 
-function readRailCollapsed(): boolean {
-	if (typeof localStorage === 'undefined') return false;
-	return localStorage.getItem('agent-voice-rail-collapsed') === '1';
-}
-
-export function clipFromSpeak(result: SpeakResult, text: string): ClipSummary {
-	return {
-		id: result.artifactId,
-		title: shortText(text, 48) || 'Untitled render',
-		subtitle: `${result.engineId} · ${result.modelAlias}`,
-		url: result.downloadUrl || `/audio/${result.artifactId}`,
-		durationSec: result.durationSec,
-		engineId: result.engineId,
-		modelAlias: result.modelAlias,
-		cached: result.cached,
-		elapsedMs: result.elapsedMs,
-		realtimeMultiple: result.realtimeMultiple,
-		format: result.format,
-		createdAt: Date.now(),
-		voiceId: result.voiceId,
-		speaker: result.speaker,
-		mode: result.mode
-	};
-}
-
-class Studio {
-	connection = $state<Connection>('checking');
+class StudioCatalog {
+	connection = $state<HealthState>('checking');
 	health = $state<HealthSummary | null>(null);
 	gpu = $state<GpuStatus | null>(null);
 	gpuError = $state('');
 	engines = $state<EngineSummary[]>([]);
 	voices = $state<VoiceSummary[]>([]);
+	presets = $state<PresetVoice[]>([]);
 	catalogLoading = $state(true);
 	catalogError = $state<ApiErrorPayload | null>(null);
-	speak = $state<SpeakConfig>(defaultSpeakConfig());
-	sessionClips = $state<ClipSummary[]>([]);
-	railCollapsed = $state(readRailCollapsed());
-	mobileNavOpen = $state(false);
 	unloading = $state(false);
 
 	private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -97,10 +57,14 @@ class Studio {
 		this.catalogLoading = true;
 		this.catalogError = null;
 		try {
-			const [engines, voices] = await Promise.all([getEngines(), getVoices()]);
+			const [engines, voices, presets] = await Promise.all([
+				getEngines(),
+				listVoices(),
+				listPresets()
+			]);
 			this.engines = engines;
 			this.voices = voices;
-			this.ensureSpeakConfig();
+			this.presets = presets;
 		} catch (error) {
 			this.catalogError = describeApiError(error);
 		} finally {
@@ -110,7 +74,7 @@ class Studio {
 
 	async refreshVoices(): Promise<void> {
 		try {
-			this.voices = await getVoices();
+			this.voices = await listVoices();
 		} catch (error) {
 			this.catalogError = describeApiError(error);
 		}
@@ -124,16 +88,23 @@ class Studio {
 		}
 	}
 
+	async refreshPresets(): Promise<void> {
+		try {
+			this.presets = await listPresets();
+		} catch (error) {
+			this.catalogError = describeApiError(error);
+		}
+	}
+
 	startPolling(): void {
 		if (this.pollTimer !== null) return;
 		void this.refreshConnection();
 		void this.refreshGpu();
-		void this.refreshCatalog();
 		this.pollTimer = setInterval(() => {
 			if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
 			void this.refreshConnection();
 			void this.refreshGpu();
-		}, 5000);
+		}, POLL_MS);
 	}
 
 	stopPolling(): void {
@@ -141,91 +112,6 @@ class Studio {
 			clearInterval(this.pollTimer);
 			this.pollTimer = null;
 		}
-	}
-
-	ensureSpeakConfig(): void {
-		const current = this.engines.find((engine) => engine.id === this.speak.engineId);
-		const modelStillExists =
-			current?.models.some(
-				(model) => model.alias === this.speak.modelAlias && model.mode === this.speak.mode
-			) ?? false;
-		if (!current || !modelStillExists) {
-			this.speak = createDefaultSpeakConfig(this.engines, this.voices);
-		}
-	}
-
-	selectEngine(engineId: string): void {
-		const engine = this.engines.find((item) => item.id === engineId);
-		if (!engine) return;
-		this.speak = configForEngine(this.speak, engine, this.voices);
-	}
-
-	selectMode(mode: SpeakConfig['mode']): void {
-		const engine = this.engines.find((item) => item.id === this.speak.engineId);
-		if (!engine) return;
-		this.speak = configForMode(this.speak, engine, mode, this.voices);
-	}
-
-	selectModel(alias: string): void {
-		const engine = this.engines.find((item) => item.id === this.speak.engineId);
-		const model = engine?.models.find((item) => item.alias === alias);
-		if (!model) return;
-		this.speak = {
-			...this.speak,
-			mode: model.mode,
-			modelAlias: model.alias,
-			voiceId: model.mode === 'clone' ? this.speak.voiceId : '',
-			speaker:
-				model.mode === 'custom_voice'
-					? model.presetSpeakers.includes(this.speak.speaker)
-						? this.speak.speaker
-						: (model.presetSpeakers[0] ?? '')
-					: ''
-		};
-	}
-
-	toggleRail(): void {
-		this.railCollapsed = !this.railCollapsed;
-		try {
-			localStorage.setItem('agent-voice-rail-collapsed', this.railCollapsed ? '1' : '0');
-		} catch {
-			return;
-		}
-	}
-
-	openMobile(): void {
-		this.mobileNavOpen = true;
-	}
-
-	closeMobile(): void {
-		this.mobileNavOpen = false;
-	}
-
-	addClip(result: SpeakResult, text: string): ClipSummary {
-		const clip = clipFromSpeak(result, text);
-		this.sessionClips = [clip, ...this.sessionClips].slice(0, 50);
-		return clip;
-	}
-
-	clearSession(): void {
-		this.sessionClips = [];
-	}
-
-	useVoice(voice: VoiceSummary): void {
-		this.speak = voiceForSpeak(this.speak, voice, this.engines);
-	}
-
-	usePreset(preset: BuiltinPreset): void {
-		const engine = this.engines.find((item) => item.id === preset.engineId);
-		const model = engine?.models.find((item) => item.alias === preset.modelAlias);
-		if (!engine || !model) return;
-		this.speak = presetForSpeak(this.speak, engine, model, preset.speaker);
-	}
-
-	async removeVoice(voiceId: string): Promise<void> {
-		await deleteVoice(voiceId);
-		if (this.speak.voiceId === voiceId) this.speak = { ...this.speak, voiceId: '' };
-		await this.refreshVoices();
 	}
 
 	async unloadAll(): Promise<UnloadResult> {
@@ -241,6 +127,14 @@ class Studio {
 			this.unloading = false;
 		}
 	}
+
+	get ttsEngines(): EngineSummary[] {
+		return this.engines.filter((engine) => engine.kind === 'tts');
+	}
+
+	get asrEngines(): EngineSummary[] {
+		return this.engines.filter((engine) => engine.kind === 'asr');
+	}
 }
 
-export const studio = new Studio();
+export const studio = new StudioCatalog();

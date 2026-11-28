@@ -1,180 +1,59 @@
-import { api } from './client.js';
+/** Health, GPU, engine and model discovery plus engine self-management. */
+import { api, unwrap } from './client.js';
 import {
-	ApiShapeError,
-	parseDesignResult,
 	parseEnginesPayload,
-	parseErrorPayload,
 	parseGpu,
 	parseHealth,
-	parseSpeakResult,
-	parseTranscribeResult,
-	parseUnloadResult,
-	parseVoicesPayload
+	parseJobStarted,
+	parseModelsPayload,
+	parseUnloadResult
 } from './guards.js';
 import type {
-	ApiErrorPayload,
-	CloneVoiceRequest,
-	DesignResult,
-	DesignVoiceRequest,
 	EngineSummary,
 	GpuStatus,
 	HealthSummary,
-	SpeakRequest,
-	SpeakResult,
-	TranscribeResult,
-	UnloadResult,
-	VoiceSummary
+	JobStarted,
+	ModelSummary,
+	UnloadResult
 } from './types.js';
 
-type RawResult = {
-	data?: unknown;
-	error?: unknown;
-	response: Response;
-};
-
-export class ApiError extends Error {
-	readonly status: number;
-	readonly code: string;
-	readonly suggestion: string;
-
-	constructor(payload: ApiErrorPayload) {
-		super(payload.message);
-		this.name = 'ApiError';
-		this.status = payload.status;
-		this.code = payload.code;
-		this.suggestion = payload.suggestion;
-	}
-}
-
-function unwrap(result: RawResult, endpoint: string): unknown {
-	if (result.error || result.data === undefined) {
-		throw new ApiError(parseErrorPayload(result.error, result.response.status));
-	}
-	try {
-		return result.data;
-	} catch (error) {
-		if (error instanceof ApiShapeError) throw error;
-		throw new ApiShapeError(endpoint, 'could not read the response body.');
-	}
-}
-
-function errorMessage(error: unknown): string {
-	if (error instanceof ApiError) {
-		return error.suggestion ? `${error.message} ${error.suggestion}` : error.message;
-	}
-	if (error instanceof Error) return error.message;
-	return 'The daemon returned an unknown error.';
-}
-
-export function describeApiError(error: unknown): ApiErrorPayload {
-	if (error instanceof ApiError) {
-		return {
-			status: error.status,
-			code: error.code,
-			message: error.message,
-			suggestion: error.suggestion
-		};
-	}
-	return {
-		status: 0,
-		code: 'CLIENT_ERROR',
-		message: errorMessage(error),
-		suggestion: ''
-	};
-}
-
-async function parseJsonResponse(response: Response): Promise<unknown> {
-	const text = await response.text();
-	if (!text) return null;
-	try {
-		return JSON.parse(text) as unknown;
-	} catch {
-		return text;
-	}
-}
-
 export async function getHealth(): Promise<HealthSummary> {
-	const result = (await api['/health'].GET()) as RawResult;
+	const result = (await api['/health'].GET()) as Parameters<typeof unwrap>[0];
 	return parseHealth(unwrap(result, '/health'));
 }
 
 export async function getGpu(): Promise<GpuStatus> {
-	const result = (await api['/v1/gpu'].GET()) as RawResult;
+	const result = (await api['/v1/gpu'].GET()) as Parameters<typeof unwrap>[0];
 	return parseGpu(unwrap(result, '/v1/gpu'));
 }
 
 export async function getEngines(): Promise<EngineSummary[]> {
-	const result = (await api['/v1/engines'].GET()) as RawResult;
+	const result = (await api['/v1/engines'].GET()) as Parameters<typeof unwrap>[0];
 	return parseEnginesPayload(unwrap(result, '/v1/engines'));
 }
 
-export async function getVoices(): Promise<VoiceSummary[]> {
-	const result = (await api['/v1/voices'].GET()) as RawResult;
-	return parseVoicesPayload(unwrap(result, '/v1/voices'));
-}
-
-export async function speak(request: SpeakRequest): Promise<SpeakResult> {
-	const result = (await api['/v1/agent/speak'].POST({ body: request })) as RawResult;
-	return parseSpeakResult(unwrap(result, '/v1/agent/speak'));
-}
-
-export async function designVoice(request: DesignVoiceRequest): Promise<DesignResult> {
-	const result = (await api['/v1/voices/design'].POST({ body: request })) as RawResult;
-	return parseDesignResult(unwrap(result, '/v1/voices/design'));
-}
-
-export async function cloneVoice(request: CloneVoiceRequest): Promise<VoiceSummary> {
-	const result = (await api['/v1/voices'].POST({ body: request })) as RawResult;
-	const payload = unwrap(result, '/v1/voices');
-	if (typeof payload !== 'object' || payload === null) {
-		throw new ApiShapeError('/v1/voices', 'expected a voice object.');
-	}
-	const voices = parseVoicesPayload({ voices: [payload] });
-	const voice = voices[0];
-	if (!voice) throw new ApiShapeError('/v1/voices', 'missing created voice.');
-	return voice;
-}
-
-export async function deleteVoice(voiceId: string): Promise<void> {
-	const result = (await api['/v1/voices/{voice_id}'].DELETE({
-		params: { path: { voice_id: voiceId } }
-	})) as RawResult;
-	unwrap(result, `/v1/voices/${voiceId}`);
+export async function getModels(engineId?: string): Promise<ModelSummary[]> {
+	const result = (await api['/v1/models'].GET({
+		params: { query: engineId ? { engine_id: engineId } : {} }
+	})) as Parameters<typeof unwrap>[0];
+	return parseModelsPayload(unwrap(result, '/v1/models'));
 }
 
 export async function unloadModels(): Promise<UnloadResult> {
-	const result = (await api['/v1/models/unload'].POST()) as RawResult;
+	const result = (await api['/v1/models/unload'].POST()) as Parameters<typeof unwrap>[0];
 	return parseUnloadResult(unwrap(result, '/v1/models/unload'));
 }
 
-export async function transcribeFile(
-	file: File,
-	options: { model: string; language?: string; hotwords?: string }
-): Promise<TranscribeResult> {
-	const form = new FormData();
-	form.set('file', file);
-	form.set('model', options.model);
-	form.set('response_format', 'verbose_json');
-	if (options.language && options.language !== 'auto') form.set('language', options.language);
-	if (options.hotwords?.trim()) form.set('prompt', options.hotwords.trim());
-
-	const response = await fetch('/v1/audio/transcriptions', {
-		method: 'POST',
-		body: form,
-		credentials: 'same-origin',
-		headers: { Accept: 'application/json' }
-	});
-	if (!response.ok) {
-		throw new ApiError(parseErrorPayload(await parseJsonResponse(response), response.status));
-	}
-	return parseTranscribeResult(await response.json());
+export async function installEngine(engineId: string, device: string): Promise<JobStarted> {
+	const result = (await api['/v1/engines/{engine_id}/install'].POST({
+		params: { path: { engine_id: engineId }, query: { device } }
+	})) as Parameters<typeof unwrap>[0];
+	return parseJobStarted(unwrap(result, `/v1/engines/${engineId}/install`));
 }
 
-export async function fetchAudioBlob(url: string): Promise<Blob> {
-	const response = await fetch(url, { credentials: 'same-origin' });
-	if (!response.ok) {
-		const payload = parseErrorPayload(await parseJsonResponse(response), response.status);
-		throw new ApiError(payload);
-	}
-	return response.blob();
+export async function downloadModel(engineId: string, modelAlias: string): Promise<JobStarted> {
+	const result = (await api['/v1/models/{engine_id}/{model_alias}/download'].POST({
+		params: { path: { engine_id: engineId, model_alias: modelAlias } }
+	})) as Parameters<typeof unwrap>[0];
+	return parseJobStarted(unwrap(result, `/v1/models/${engineId}/${modelAlias}/download`));
 }

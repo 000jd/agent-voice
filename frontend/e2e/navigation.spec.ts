@@ -4,59 +4,47 @@ const routes = [
 	{ label: 'Speak', heading: 'Speak' },
 	{ label: 'Voices', heading: 'Voices' },
 	{ label: 'Transcribe', heading: 'Transcribe' },
-	{ label: 'Models & Engines', heading: 'Models & Engines' },
-	{ label: 'History', heading: 'History' },
+	{ label: 'Library', heading: 'Library' },
+	{ label: 'Models', heading: 'Models' },
 	{ label: 'Settings', heading: 'Settings' }
 ];
 
-test('navigates every studio route from the sidebar', async ({ page }) => {
+test('one rail navigates every Studio screen', async ({ page }) => {
 	await page.goto('/ui/');
-	const main = page.getByRole('main');
-	await expect(main.getByRole('heading', { name: 'Studio', exact: true })).toBeVisible();
+	await expect(page).toHaveURL(/\/ui\/speak$/);
+	await expect(page.getByTestId('top-bar').getByRole('heading', { name: 'Speak' })).toBeVisible();
 
 	for (const route of routes) {
-		await page.locator('aside').getByRole('link', { name: route.label, exact: true }).click();
-		await expect(main.getByRole('heading', { name: route.heading, exact: true })).toBeVisible();
+		await page.getByTestId('rail').getByRole('link', { name: route.label, exact: true }).click();
+		await expect(
+			page.getByTestId('top-bar').getByRole('heading', { name: route.heading })
+		).toBeVisible();
 	}
 });
 
-test('starts dark and toggles to light across reloads', async ({ page }) => {
-	await page.goto('/ui/');
-
+test('theme defaults dark and survives reload', async ({ page }) => {
+	await page.goto('/ui/speak');
 	const html = page.locator('html');
 	await expect(html).toHaveClass(/dark/);
-
 	await page.getByRole('button', { name: 'Switch to light theme' }).click();
 	await expect(html).not.toHaveClass(/dark/);
-
 	await page.reload();
 	await expect(html).not.toHaveClass(/dark/);
 });
 
-test('shows the dashboard offline state when the daemon is unreachable', async ({ page }) => {
-	await page.route('**/health', (route) => route.abort());
-	await page.route('**/v1/engines', (route) => route.abort());
-
-	await page.goto('/ui/');
-	await expect(page.getByText(/daemon is not reachable|Offline/i).first()).toBeVisible();
-});
-
-test('collapses the rail and remembers it', async ({ page }) => {
-	await page.goto('/ui/');
-	const aside = page.locator('aside').first();
-	await page.getByRole('button', { name: 'Collapse navigation rail' }).click();
-	await expect(aside).toHaveClass(/w-16/);
-	await page.reload();
-	await expect(aside).toHaveClass(/w-16/);
-	await page.getByRole('button', { name: 'Expand navigation rail' }).click();
-	await expect(aside).toHaveClass(/w-\[236px\]/);
-});
-
-test('global search opens the filtered voice library', async ({ page }) => {
+test('command palette navigates with the keyboard', async ({ page }) => {
 	await page.goto('/ui/speak');
-	const search = page.getByRole('searchbox', { name: 'Search voices' });
-	await search.fill('Kokoro');
-	await search.press('Enter');
-	await expect(page).toHaveURL(/\/ui\/voices\?q=Kokoro$/);
-	await expect(page.getByRole('main').getByText('Kokoro (82M, CPU)')).toBeVisible();
+	await expect(page.getByTestId('top-bar')).toBeVisible();
+	await page.keyboard.press('Control+K');
+	const palette = page.getByRole('dialog', { name: 'Command palette' });
+	await expect(palette).toBeVisible();
+	await palette.getByRole('combobox', { name: 'Search commands and voices' }).fill('Go to Voices');
+	await page.keyboard.press('Enter');
+	await expect(page).toHaveURL(/\/ui\/voices$/);
+});
+
+test('help is available without leaving the Studio', async ({ page }) => {
+	await page.goto('/ui/speak');
+	await page.getByRole('button', { name: 'Keyboard shortcuts and privacy' }).click();
+	await expect(page.getByRole('dialog', { name: 'Shortcuts and privacy' })).toBeVisible();
 });

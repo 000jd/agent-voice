@@ -7,8 +7,10 @@ checks that the committed `src/agent_voice/web` is current.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
 TARGET = ROOT / "src" / "agent_voice" / "web"
 MANIFEST = "web-build.json"
+CSP_FILE = "csp-sha256.json"
+INLINE_SCRIPT = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", re.DOTALL)
 
 
 def _hash_tree(root: Path) -> dict[str, str]:
@@ -41,6 +45,14 @@ def main() -> int:
     try:
         destination = temp / "web"
         shutil.copytree(build, destination)
+        html = (destination / "200.html").read_text("utf-8")
+        hashes = [
+            "sha256-" + base64.b64encode(hashlib.sha256(match.group(1).encode()).digest()).decode()
+            for match in INLINE_SCRIPT.finditer(html)
+        ]
+        (destination / CSP_FILE).write_text(
+            json.dumps({"script_hashes": hashes}, indent=2) + "\n", encoding="utf-8"
+        )
         (destination / MANIFEST).write_text(
             json.dumps({"files": _hash_tree(destination)}, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

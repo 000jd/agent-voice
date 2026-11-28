@@ -221,6 +221,7 @@ published tarballs; `https://pnpm.io/cli/audit`, `https://bun.com/docs/pm/cli/au
 | @testing-library/jest-dom | 7.0.1 | 2026-08-09 | 109.0d | MIT |
 | happy-dom | 21.0.4 | 2026-10-20 | 37.2d | MIT |
 | @playwright/test | 1.65.0 | 2026-11-05 | 21.2d | Apache-2.0 |
+| @axe-core/playwright | 4.14.0 | 2026-10-15 | 44.4d | MPL-2.0 |
 | eslint | 10.14.0 | 2026-10-30 | 27.4d | MIT |
 | @eslint/js | 10.0.1 | 2026-02-06 | 293.1d | MIT |
 | eslint-plugin-svelte | 3.24.1 | 2026-11-07 | 19.6d | MIT |
@@ -299,11 +300,11 @@ Install-time scripts and telemetry:
 | Font | Inter variable, self-hosted | Zero external requests; OFL-1.1. |
 | Icons | `@lucide/svelte@0.561.0` | shadcn target; avoids the same-day 1.82.0. |
 | Dark mode | Hand-rolled theme + inline pre-paint script | Avoids stale mode-watcher; no FOUC. |
-| Unit tests | Vitest 5 + happy-dom + Testing Library | Browser-free gate; 4 tests passed. |
-| E2E | Playwright 1.65.0 + Chromium shell | Live mock-daemon suite: navigation, playback, design/save, transcription and visual captures; CI uses `--with-deps`. |
+| Unit tests | Vitest 5 + happy-dom + Testing Library | Browser-free gate; 15 tests passed. |
+| E2E | Playwright 1.65.0 + Chromium shell | Daemon-served `/ui` suite: navigation, playback, upload→trim→clone→save, transcription, both-theme Axe and 99 screenshots; CI uses `--with-deps`. |
 | API types | openapi-typescript 7.13 + openapi-fetch 0.17 path-based | Generated schema; method form infers `never` under TS 6. |
-| Dev auth | Vite proxy rewrites Origin + injects key | Guard unchanged; key never public. |
-| Dist | Not committed in this scaffold | UI-readiness release builds in CI and ships package data; no Node at install. |
+| Dev auth | Session key + optional Vite proxy | Guard unchanged; key stays in memory/sessionStorage, never public. |
+| Dist | Committed package data + manifest/CSP hashes | Release rebuilds in CI; no Node at install. |
 | CI | Separate `frontend-ci.yml` | Do not disturb Python CI surfaces. |
 
 ### Age-gate exceptions
